@@ -28,6 +28,7 @@ from pathlib import Path
 # 适配 UniHiker 平台
 from unihiker import GUI
 from pinpong.board import Board, Pin
+from dfrobot_huskylensv2 import *
 
 # ============== 配置区 ==============
 BASE_URL = "https://my-website.ccwu.cc/eating-medication/family"
@@ -53,8 +54,8 @@ WIFI_PASSWORD = "15756491077"
 # 硬件引脚
 BUZZER_PIN = Pin.P25      # 蜂鸣器
 BUTTON_TAKE_PIN = Pin.P21  # 已吃药按钮（~A，按下高电平，松开低电平）
-BUTTON_EMERGENCY_PIN = Pin.P27  # A键：紧急呼叫
-BUTTON_REMIND_PIN = Pin.P28      # B键：直接启动吃药提醒
+BUTTON_REMIND_PIN = Pin.P27  # B键：直接启动吃药提醒（按下低电平）
+BUTTON_EMERGENCY_PIN = Pin.P28  # A键：紧急呼叫（按下低电平，仅记录日志）
 
 # 提醒音量递增参数（每 10 分钟递增一次）
 VOLUME_INITIAL = 30
@@ -71,6 +72,12 @@ TTS_RATE = 200
 # 定时循环间隔（秒）
 CHECK_INTERVAL = 1
 
+# 固定服药提醒时间（每天触发，HH:MM 格式）
+FIXED_REMINDER_TIMES = ["09:00", "13:00", "17:00"]
+
+# 主界面时钟刷新间隔（秒）
+CLOCK_REFRESH_INTERVAL = 1
+
 # ============== 全局状态 ==============
 state = {
     "online": False,
@@ -80,6 +87,8 @@ state = {
     "active_alerts": {},      # 当前活跃的提醒 {reminder_id: info}
     "current_volume": VOLUME_INITIAL,
     "camera_available": False,
+    "triggered_fixed_times": set(),  # 当天已触发的固定提醒时间，避免重复触发
+    "current_date": None,     # 当天日期字符串 YYYY-MM-DD，用于跨天重置触发记录
 }
 
 lock = threading.Lock()
@@ -450,6 +459,34 @@ def notify_emergency(contact="120"):
 
 # ============== 提醒核心 ==============
 
+def reset_fixed_trigger_if_new_day():
+    """跨天时清空当日已触发固定提醒记录，避免第二天漏触发"""
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    if state["current_date"] != today:
+        state["current_date"] = today
+        state["triggered_fixed_times"] = set()
+        log(f"日期切换到 {today}，已重置固定提醒触发记录")
+
+
+def check_fixed_reminders():
+    """检查固定服药提醒时间（9:00 / 13:00 / 17:00），每天每个时间点仅触发一次"""
+    reset_fixed_trigger_if_new_day()
+    now_str = datetime.datetime.now().strftime("%H:%M")
+    for t in FIXED_REMINDER_TIMES:
+        if t == now_str and t not in state["triggered_fixed_times"]:
+            state["triggered_fixed_times"].add(t)
+            reminder = {
+                "id": f"fixed_{t}",
+                "user_name": "老人",
+                "medicine_name": "药品",
+                "dose": "请按医嘱服用",
+                "medicine_id": None,
+                "dose_count": 1,
+            }
+            log(f"触发固定时间提醒: {t}")
+            trigger_alert(reminder)
+
+
 def check_reminders():
     now = datetime.datetime.now()
     now_str = now.strftime("%H:%M")
@@ -605,10 +642,28 @@ def calculate_remaining_days():
 
 # ============== GUI 更新 ==============
 
+# GUI 模式与可刷新时钟对象（仅主页模式刷新，避免与提醒/状态界面冲突）
+_gui_mode = "home"            # home / status / reminder
+_clock_date_obj = None        # 主页日期文本对象（可 config 更新）
+_clock_time_obj = None        # 主页时分秒文本对象（可 config 更新）
+_clock_stop_event = threading.Event()
+
+
+def _format_date(now):
+    return now.strftime("%Y-%m-%d")
+
+
+def _format_time(now):
+    return now.strftime("%H:%M:%S")
+
+
 def update_gui_status(text, alert=False):
+    """临时状态界面（不显示时钟，时钟线程会跳过非 home 模式）"""
+    global _gui_mode
     if not gui:
         return
     try:
+        _gui_mode = "status"
         color = "#FF4444" if alert else "#333333"
         gui.clear()
         gui.draw_text(x=120, y=40, text="智能服药提醒", font_size=20, color="#000000", origin="center")
@@ -620,23 +675,41 @@ def update_gui_status(text, alert=False):
 
 
 def update_gui_home():
-    """返回主页界面"""
+    """返回主页界面，绘制日期与时分秒（由 clock_thread 每秒刷新）"""
+    global _gui_mode, _clock_date_obj, _clock_time_obj
     if not gui:
         return
     try:
         gui.clear()
-        gui.draw_text(x=120, y=40, text="智能服药提醒", font_size=20, color="#000000", origin="center")
+        _clock_date_obj = None
+        _clock_time_obj = None
+        gui.draw_text(x=120, y=30, text="智能服药提醒", font_size=18, color="#000000", origin="center")
         status = "在线" if state["online"] else "离线模式"
-        gui.draw_text(x=120, y=200, text=status, font_size=14, color="#666666", origin="center")
+        gui.draw_text(x=120, y=65, text=status, font_size=12, color="#666666", origin="center")
+        now = datetime.datetime.now()
+        # 日期行
+        _clock_date_obj = gui.draw_text(
+            x=120, y=120, text=_format_date(now),
+            font_size=16, color="#333333", origin="center",
+        )
+        # 时分秒行（醒目蓝色）
+        _clock_time_obj = gui.draw_text(
+            x=120, y=165, text=_format_time(now),
+            font_size=24, color="#0050FF", origin="center",
+        )
+        gui.draw_text(x=120, y=220, text="B键启动提醒 A键紧急", font_size=11, color="#666666", origin="center")
+        _gui_mode = "home"
     except Exception as e:
         log(f"GUI 更新失败: {e}", "ERROR")
 
 
 def update_gui_reminder(name, drug, dose):
     """显示吃药提醒界面（分两行避免文字过长换行）"""
+    global _gui_mode
     if not gui:
         return
     try:
+        _gui_mode = "reminder"
         gui.clear()
         gui.draw_text(x=120, y=40, text="该吃药了", font_size=20, color="#FF0000", origin="center")
         gui.draw_text(x=120, y=100, text=f"{name}，该吃 {drug}", font_size=16, color="#FF4444", origin="center")
@@ -644,6 +717,27 @@ def update_gui_reminder(name, drug, dose):
         gui.draw_text(x=120, y=220, text="按~A键确认已吃药", font_size=12, color="#666666", origin="center")
     except Exception as e:
         log(f"GUI 更新失败: {e}", "ERROR")
+
+
+def clock_thread():
+    """后台时钟刷新线程：仅在主页模式时每秒更新日期与时分秒文本对象"""
+    while not _clock_stop_event.is_set():
+        try:
+            if gui and _gui_mode == "home":
+                now = datetime.datetime.now()
+                if _clock_time_obj is not None:
+                    try:
+                        _clock_time_obj.config(text=_format_time(now))
+                    except Exception:
+                        pass
+                if _clock_date_obj is not None:
+                    try:
+                        _clock_date_obj.config(text=_format_date(now))
+                    except Exception:
+                        pass
+        except Exception as e:
+            log(f"时钟刷新失败: {e}", "WARNING")
+        time.sleep(CLOCK_REFRESH_INTERVAL)
 
 
 # ============== 按钮处理 ==============
@@ -657,16 +751,13 @@ def on_take_button_pressed():
 
 
 def on_emergency_button_pressed():
-    """P27 A键：紧急呼叫"""
-    log("紧急按钮被按下")
-    update_gui_status("正在呼叫紧急联系人...", alert=True)
-    buzzer_beep(times=5, duration=0.5)
-    tts_speak("正在为您联系家属并准备拨打 120")
-    notify_emergency("120")
+    """P28 A键：紧急呼叫（仅记录日志，不鸣叫，联网功能后续再接入）"""
+    log("紧急按钮被按下（仅记录日志，联网呼叫功能待后续接入）", "WARNING")
+    update_gui_status("已记录紧急呼叫", alert=True)
 
 
 def on_remind_button_pressed():
-    """P28 B键：直接启动吃药提醒"""
+    """P27 B键：直接启动吃药提醒"""
     log("提醒按钮被按下，直接启动吃药提醒")
     test_reminder = {
         "id": "test_reminder",
@@ -735,14 +826,14 @@ def button_thread():
         if button_take and button_take.read_digital() == 1 and now - last_take > 2:
             last_take = now
             on_take_button_pressed()
-        # P27 A键紧急呼叫：按下低电平（0）
-        if button_emergency and button_emergency.read_digital() == 0 and now - last_emergency > 3:
-            last_emergency = now
-            on_emergency_button_pressed()
-        # P28 B键启动吃药提醒：按下低电平（0）
+        # P27 B键启动吃药提醒：按下低电平（0）
         if button_remind and button_remind.read_digital() == 0 and now - last_remind > 3:
             last_remind = now
             on_remind_button_pressed()
+        # P28 A键紧急呼叫：按下低电平（0），仅记录日志
+        if button_emergency and button_emergency.read_digital() == 0 and now - last_emergency > 3:
+            last_emergency = now
+            on_emergency_button_pressed()
         time.sleep(0.1)
 
 
@@ -757,10 +848,11 @@ def main_loop():
         now = datetime.datetime.now()
         now_str = now.strftime("%H:%M")
 
-        # 每分钟检查提醒
+        # 每分钟检查提醒（含固定时间提醒 9:00/13:00/17:00）
         if now_str != last_minute:
             last_minute = now_str
             check_reminders()
+            check_fixed_reminders()
 
         # 每小时同步一次数据
         if now.hour != last_hour:
@@ -800,8 +892,10 @@ def main():
     init_network()
 
     threading.Thread(target=button_thread, daemon=True).start()
+    # 启动主界面时钟刷新线程（每秒更新年月日时分秒）
+    threading.Thread(target=clock_thread, daemon=True).start()
 
-    update_gui_status("系统运行中")
+    update_gui_home()
     tts_speak("智能服药提醒已启动")
 
     main_loop()
