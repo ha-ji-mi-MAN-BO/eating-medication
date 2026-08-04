@@ -59,3 +59,4 @@ SHA256SUMS.txt
 # ==== 其他文件 ===
 !/.github
 !.gitignore
+!/dist-packages
