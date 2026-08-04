@@ -29,6 +29,7 @@ from pathlib import Path
 from unihiker import GUI
 from pinpong.board import Board, Pin
 from dfrobot_huskylensv2 import *
+from unihiker_connet_wifi import *
 
 # ============== 配置区 ==============
 BASE_URL = "https://my-website.ccwu.cc/eating-medication/family"
@@ -75,8 +76,17 @@ CHECK_INTERVAL = 1
 # 固定服药提醒时间（每天触发，HH:MM 格式）
 FIXED_REMINDER_TIMES = ["09:00", "13:00", "17:00"]
 
+# 人脸识别触发吃药提醒的 ID（HuskylensV2 识别到该 ID 时自动启动提醒）
+FACE_TRIGGER_ID = 1
+
 # 主界面时钟刷新间隔（秒）
 CLOCK_REFRESH_INTERVAL = 1
+
+# 人脸识别轮询间隔（秒）
+FACE_POLL_INTERVAL = 0.3
+
+# 同一人脸 ID 触发提醒的最短间隔（秒），避免重复触发
+FACE_TRIGGER_COOLDOWN = 30
 
 # ============== 全局状态 ==============
 state = {
@@ -89,6 +99,7 @@ state = {
     "camera_available": False,
     "triggered_fixed_times": set(),  # 当天已触发的固定提醒时间，避免重复触发
     "current_date": None,     # 当天日期字符串 YYYY-MM-DD，用于跨天重置触发记录
+    "current_face_id": None,  # 当前识别到的人脸 ID（None 表示未识别到）
 }
 
 lock = threading.Lock()
@@ -98,6 +109,7 @@ buzzer = None
 button_take = None
 button_emergency = None
 button_remind = None
+huskylens = None  # HuskylensV2 I2C 人脸识别模块
 
 # ============== 工具函数 ==============
 
@@ -134,15 +146,14 @@ def save_config(cfg):
 
 
 def connect_wifi(ssid, password):
-    """连接 WiFi，返回是否成功"""
+    """使用 unihiker_connet_wifi.WiFiManager 连接 WiFi，返回是否成功"""
     if not ssid:
         return False
     try:
-        cmd = f'nmcli dev wifi connect "{ssid}" password "{password}"'
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
-        ok = r.returncode == 0 or "successfully" in r.stdout.lower() or "已激活" in r.stdout
-        log(f"WiFi 连接: {r.stdout.strip()}")
-        return ok
+        wifi_manager = WiFiManager()
+        ok = wifi_manager.connect_wifi(ssid, password)
+        log(f"WiFi 连接: ssid={ssid}, success={ok}")
+        return bool(ok)
     except Exception as e:
         log(f"WiFi 连接异常: {e}", "ERROR")
         return False
@@ -479,7 +490,7 @@ def check_fixed_reminders():
                 "id": f"fixed_{t}",
                 "user_name": "老人",
                 "medicine_name": "药品",
-                "dose": "请按医嘱服用",
+                "dose": "1次",
                 "medicine_id": None,
                 "dose_count": 1,
             }
@@ -514,9 +525,15 @@ def trigger_alert(reminder):
             "volume": VOLUME_INITIAL,
             "reminder": reminder,
         }
-    msg = f"{name}，该吃 {drug} 了，每次 {dose}"
-    log(f"触发提醒: {msg}")
+    # 启动提醒时按当前识别到的人脸 ID 呼叫：id{X}老人来吃药
+    face_id = state.get("current_face_id")
+    if face_id is not None:
+        call_msg = f"id{face_id}老人来吃药"
+    else:
+        call_msg = f"{name}来吃药"
+    log(f"触发提醒: {call_msg}")
     update_gui_reminder(name, drug, dose)
+    tts_speak(call_msg)
     threading.Thread(target=alert_loop, args=(tid,), daemon=True).start()
 
 
@@ -525,7 +542,9 @@ def alert_loop(tid):
         info = state["active_alerts"][tid]
         volume = info["volume"]
         reminder = info["reminder"]
-        msg = f"{reminder.get('user_name', '老人')}，该吃 {reminder.get('medicine_name', '药品')} 了"
+        drug = reminder.get("medicine_name", "药品")
+        dose = reminder.get("dose", "")
+        msg = f"吃{drug}{dose}"
         buzzer_beep(times=3, duration=0.3)
         tts_speak(msg, volume=volume)
         # 每 10 分钟增大音量
@@ -648,6 +667,10 @@ _clock_date_obj = None        # 主页日期文本对象（可 config 更新）
 _clock_time_obj = None        # 主页时分秒文本对象（可 config 更新）
 _clock_stop_event = threading.Event()
 
+# 人脸 ID 右下角显示对象（所有界面均显示，由 face_thread 更新内容）
+_face_id_obj = None
+_face_id_stop_event = threading.Event()
+
 
 def _format_date(now):
     return now.strftime("%Y-%m-%d")
@@ -655,6 +678,34 @@ def _format_date(now):
 
 def _format_time(now):
     return now.strftime("%H:%M:%S")
+
+
+def _draw_face_id_label():
+    """在屏幕右下角绘制人脸 ID 文本对象（小字号），供 face_thread 实时更新。
+    无识别到人脸时文本为空（不显示）。每次 gui.clear() 后需重新调用。"""
+    global _face_id_obj
+    if not gui:
+        return
+    try:
+        face_id = state.get("current_face_id")
+        text = f"id{face_id}" if face_id is not None else ""
+        _face_id_obj = gui.draw_text(
+            x=238, y=238, text=text, font_size=10,
+            color="#0066CC", origin="bottom_right",
+        )
+    except Exception as e:
+        log(f"绘制人脸 ID 标签失败: {e}", "WARNING")
+
+
+def _update_face_id_display(face_id):
+    """更新屏幕右下角人脸 ID 显示（无 ID 时清空文本）"""
+    if not gui or _face_id_obj is None:
+        return
+    try:
+        text = f"id{face_id}" if face_id is not None else ""
+        _face_id_obj.config(text=text)
+    except Exception:
+        pass
 
 
 def update_gui_status(text, alert=False):
@@ -670,6 +721,7 @@ def update_gui_status(text, alert=False):
         gui.draw_text(x=120, y=100, text=text, font_size=16, color=color, origin="center")
         status = "在线" if state["online"] else "离线模式"
         gui.draw_text(x=120, y=200, text=status, font_size=14, color="#666666", origin="center")
+        _draw_face_id_label()
     except Exception as e:
         log(f"GUI 更新失败: {e}", "ERROR")
 
@@ -698,6 +750,7 @@ def update_gui_home():
             font_size=24, color="#0050FF", origin="center",
         )
         gui.draw_text(x=120, y=220, text="B键启动提醒 A键紧急", font_size=11, color="#666666", origin="center")
+        _draw_face_id_label()
         _gui_mode = "home"
     except Exception as e:
         log(f"GUI 更新失败: {e}", "ERROR")
@@ -715,6 +768,7 @@ def update_gui_reminder(name, drug, dose):
         gui.draw_text(x=120, y=100, text=f"{name}，该吃 {drug}", font_size=16, color="#FF4444", origin="center")
         gui.draw_text(x=120, y=140, text=f"每次 {dose}", font_size=16, color="#FF4444", origin="center")
         gui.draw_text(x=120, y=220, text="按~A键确认已吃药", font_size=12, color="#666666", origin="center")
+        _draw_face_id_label()
     except Exception as e:
         log(f"GUI 更新失败: {e}", "ERROR")
 
@@ -740,6 +794,43 @@ def clock_thread():
         time.sleep(CLOCK_REFRESH_INTERVAL)
 
 
+def face_thread():
+    """后台人脸识别线程：持续读取 HuskylensV2 人脸识别结果，
+    更新屏幕右下角 ID 显示，并在识别到 FACE_TRIGGER_ID 时触发吃药提醒。"""
+    last_trigger_time = 0
+    while not _face_id_stop_event.is_set():
+        face_id = None
+        try:
+            if huskylens:
+                huskylens.getResult(ALGORITHM_FACE_RECOGNITION)
+                if huskylens.available(ALGORITHM_FACE_RECOGNITION):
+                    center = huskylens.getCachedCenterResult(ALGORITHM_FACE_RECOGNITION)
+                    if center:
+                        rid = getattr(center, "ID", -1)
+                        if rid and rid > 0:
+                            face_id = rid
+        except Exception as e:
+            log(f"人脸识别读取失败: {e}", "WARNING")
+        # 更新状态与屏幕右下角显示
+        state["current_face_id"] = face_id
+        _update_face_id_display(face_id)
+        # 识别到指定 ID 时触发吃药提醒（冷却时间内不重复触发）
+        now = time.time()
+        if face_id == FACE_TRIGGER_ID and now - last_trigger_time > FACE_TRIGGER_COOLDOWN:
+            if not state["active_alerts"]:
+                last_trigger_time = now
+                log(f"识别到 id{face_id}，触发吃药提醒")
+                trigger_alert({
+                    "id": f"face_{face_id}",
+                    "user_name": f"id{face_id}老人",
+                    "medicine_name": "测试药品",
+                    "dose": "1粒",
+                    "medicine_id": None,
+                    "dose_count": 1,
+                })
+        time.sleep(FACE_POLL_INTERVAL)
+
+
 # ============== 按钮处理 ==============
 
 def on_take_button_pressed():
@@ -763,7 +854,7 @@ def on_remind_button_pressed():
         "id": "test_reminder",
         "user_name": "老人",
         "medicine_name": "测试药品",
-        "dose": "1片",
+        "dose": "1粒",
         "medicine_id": None,
         "dose_count": 1,
     }
@@ -773,7 +864,7 @@ def on_remind_button_pressed():
 # ============== 初始化与主循环 ==============
 
 def init_hardware():
-    global buzzer, button_take, button_emergency, button_remind, gui
+    global buzzer, button_take, button_emergency, button_remind, gui, huskylens
     try:
         Board().begin()
         # 优先使用 pinpong 板载蜂鸣器（支持音效），回退到数字引脚
@@ -787,6 +878,15 @@ def init_hardware():
         button_take = Pin(BUTTON_TAKE_PIN, Pin.IN)
         button_emergency = Pin(BUTTON_EMERGENCY_PIN, Pin.IN)
         button_remind = Pin(BUTTON_REMIND_PIN, Pin.IN)
+        # HuskylensV2 I2C 人脸识别初始化
+        try:
+            huskylens = HuskylensV2_I2C()
+            huskylens.knock()
+            huskylens.switchAlgorithm(ALGORITHM_FACE_RECOGNITION)
+            log("HuskylensV2 人脸识别初始化成功（I2C, FACE_RECOGNITION）")
+        except Exception as e:
+            log(f"HuskylensV2 初始化失败，人脸识别不可用: {e}", "WARNING")
+            huskylens = None
         try:
             gui = GUI()
             log("GUI 初始化成功")
@@ -894,6 +994,8 @@ def main():
     threading.Thread(target=button_thread, daemon=True).start()
     # 启动主界面时钟刷新线程（每秒更新年月日时分秒）
     threading.Thread(target=clock_thread, daemon=True).start()
+    # 启动人脸识别线程（持续读取 HuskylensV2 人脸 ID 并更新屏幕右下角显示）
+    threading.Thread(target=face_thread, daemon=True).start()
 
     update_gui_home()
     tts_speak("智能服药提醒已启动")
