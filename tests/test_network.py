@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, mock_open
 import json
 
 from m10 import (
@@ -52,14 +52,17 @@ class TestNetwork(unittest.TestCase):
         self.assertEqual(state["medicines"][0]["name"], "阿莫西林")
         self.assertIsNotNone(state["last_sync"])
 
+    @patch('m10.log')
     @patch('m10.http_request')
     @patch('m10.os.path.exists')
     @patch('m10.json.load')
     @patch('m10.json.dump')
-    def test_flush_local_logs(self, mock_dump, mock_load, mock_exists, mock_http):
+    @patch('builtins.open', new_callable=mock_open)
+    def test_flush_local_logs(self, mock_open_func, mock_dump, mock_load, mock_exists, mock_http, mock_log):
         mock_exists.return_value = True
         mock_load.return_value = [{"event": "test"}]
         mock_http.return_value = {"code": 0}
         flush_local_logs()
         mock_http.assert_called_once()
-        mock_dump.assert_called_once()
+        mock_dump.assert_called_once_with([], unittest.mock.ANY)
+        mock_open_func.assert_called_once_with('/root/medication_log_queue.json', 'w', encoding='utf-8')
