@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch, MagicMock, mock_open
+from unittest.mock import patch, MagicMock, mock_open, ANY
 import json
 
 from m10 import (
@@ -64,5 +64,5 @@ class TestNetwork(unittest.TestCase):
         mock_http.return_value = {"code": 0}
         flush_local_logs()
         mock_http.assert_called_once()
-        mock_dump.assert_called_once_with([], unittest.mock.ANY)
+        mock_dump.assert_called_once_with([], ANY)  # 第二个参数是 indent，ANY 匹配任意
         mock_open_func.assert_called_once_with('/root/medication_log_queue.json', 'w', encoding='utf-8')
