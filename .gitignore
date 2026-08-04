@@ -60,3 +60,4 @@ SHA256SUMS.txt
 !/.github
 !.gitignore
 !/dist-packages
+!requirements.txt
