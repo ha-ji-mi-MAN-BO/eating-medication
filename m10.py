@@ -3,7 +3,6 @@
 """
 UniHiker M10 智能服药提醒终端主程序
 项目地址适配: https://my-website.ccwu.cc/eating-medication/family/
-设备配对码: 275527387791320
 
 本程序使用 Python 标准库 + UniHiker 原生 API (unihiker/pinpong) + pyttsx3 TTS,
 不依赖 cv2、requests、schedule 等第三方库。
