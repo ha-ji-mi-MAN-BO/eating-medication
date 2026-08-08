@@ -103,6 +103,11 @@ import traceback
 import urllib.request
 import urllib.error
 from pathlib import Path
+import uuid
+import pingpong
+from dfrobot_huskylensv2 import *
+from pinpong.extension.unihiker import *
+
 
 # 可选依赖：pyttsx3（用于 TTS，缺失时自动回退到 espeak）
 try:
