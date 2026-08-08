@@ -5,10 +5,14 @@ UniHiker M10 智能服药提醒终端主程序
 项目地址适配: https://my-website.ccwu.cc/eating-medication/server/
 设备配对码: 234099521894527
 API 版本: v2.28.0（对应 openapi.json）
-当前代码版本: v2.29.8
+当前代码版本: v2.29.9
 
 本程序使用 Python 标准库 + UniHiker 原生 API (unihiker/pinpong) + pyttsx3 TTS,
 不依赖 cv2、requests、schedule 等第三方库。
+
+v2.29.9 修复记录（共 2 项 bug 修复，涵盖网络通信、注册逻辑）：
+- 【致命】_auth_headers() 缺少 User-Agent 头，导致 Cloudflare 返回 403 error code:1010 拦截所有 API 请求（注册、同步、上传均失败）
+- 【严重】_do_network_recovery_sync() 网络恢复时重复调用 register_device()，改为本地有 token 时仅同步用药计划，注册只跑一次
 
 v2.29.8 修复记录（共 12 项 bug 修复，涵盖安全、并发、健壮性、可维护性）：
 - 【致命】模块加载时 WiFi 连接阻塞，移至 init_network() 延迟执行，添加 3 次重试
@@ -770,7 +774,11 @@ def image_to_base64(path):
 
 def _auth_headers(extra=None):
     """构建请求头，自动携带 X-Device-Token（已注册时）"""
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        # 添加 User-Agent 避免 Cloudflare 1010 拦截（urllib 默认 UA 被封禁）
+        "User-Agent": "Mozilla/5.0 (compatible; M10MedicationChecker/1.0)",
+    }
     token = _get_device_token()
     if token:
         headers["X-Device-Token"] = token
@@ -2410,12 +2418,21 @@ def main_loop():
     _sync_thread = None  # 网络恢复同步线程引用
 
     def _do_network_recovery_sync():
-        """网络恢复后的数据同步操作（仅定义一次，复用闭包）"""
+        """网络恢复后的数据同步操作（仅定义一次，复用闭包）
+
+        注册只跑一次：本地已有 token 时不再重复注册，仅同步用药计划。
+        """
         try:
-            # 尝试恢复 token，否则重新注册
-            if not load_device_token():
-                register_device()
-            sync_reminders()
+            token_exists = load_device_token()
+            if not token_exists:
+                # 本地无 token，尝试注册（仅首次或 token 丢失时）
+                if register_device():
+                    sync_reminders()
+                else:
+                    log("注册失败，跳过用药计划同步", "WARNING")
+            else:
+                # 已有 token（之前注册成功），仅同步用药计划
+                sync_reminders()
             flush_local_logs()
             log("网络恢复数据同步完成", "INFO")
         except Exception as e:
