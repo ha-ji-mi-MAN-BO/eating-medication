@@ -175,7 +175,7 @@ SERVER_BASE_URL = "https://my-website.ccwu.cc/eating-medication/server"
 PAIR_CODE = "234099521894527"
 DEVICE_ID = "m10_" + PAIR_CODE
 
-# API 端点（v2.28.0，对应 openapi.json，m10.py 当前版本 v2.29.3）
+# API 端点（v2.28.0，对应 openapi.json，m10.py 当前版本 v2.29.6）
 API_REGISTER = f"{SERVER_BASE_URL}/api/v1/public/device/register"
 API_SCHEDULE = f"{SERVER_BASE_URL}/api/v1/public/device/schedule/{DEVICE_ID}"
 API_MESSAGE = f"{SERVER_BASE_URL}/api/v1/public/device/message"
@@ -1146,7 +1146,14 @@ def upload_log(event_type, detail, photo_path=None):
     # 检查是否为业务错误（含 _error 标记）或 HTTP 错误
     msg_ok = msg_resp is not None and not (isinstance(msg_resp, dict) and msg_resp.get("_error"))
 
+    # 消息发送失败时直接写入离线队列，无需尝试上传照片
+    if not msg_ok:
+        log(f"日志消息发送失败，写入本地队列: {event_type}")
+        queue_local_log(msg_payload, photo_base64)
+        return False
+
     # 2. 如有照片，单独上传
+    photo_ok = True
     if photo_base64:
         upload_payload = {
             "device_id": DEVICE_ID,
@@ -1155,13 +1162,13 @@ def upload_log(event_type, detail, photo_path=None):
         }
         upload_resp = http_request(API_UPLOAD, upload_payload)
         photo_ok = upload_resp is not None and not (isinstance(upload_resp, dict) and upload_resp.get("_error"))
-    else:
-        photo_ok = True
+        if not photo_ok:
+            log(f"照片上传失败，但消息已发送成功: {event_type}")
 
     if msg_ok and photo_ok:
         log(f"日志上传成功: {event_type}")
         return True
-    # 离线时写入本地队列
+    # 照片上传失败时仍写入本地队列（消息已发送，但照片需要重试）
     queue_local_log(msg_payload, photo_base64)
     return False
 
@@ -1253,58 +1260,58 @@ def flush_local_logs():
                     pass
             return
 
-    remain = []
-    success_count = 0
-    fail_count = 0
+        remain = []
+        success_count = 0
+        fail_count = 0
 
-    for entry in queue:
-        try:
-            photo = entry.get("_photo")
-            msg_payload = {k: v for k, v in entry.items() if k != "_photo"}
+        for entry in queue:
+            try:
+                photo = entry.get("_photo")
+                msg_payload = {k: v for k, v in entry.items() if k != "_photo"}
 
-            # 验证 entry 有效性
-            if not isinstance(msg_payload, dict) or not msg_payload.get("device_id"):
-                log(f"跳过无效日志条目: {entry}", "WARNING")
-                fail_count += 1
-                continue
+                # 验证 entry 有效性
+                if not isinstance(msg_payload, dict) or not msg_payload.get("device_id"):
+                    log(f"跳过无效日志条目: {entry}", "WARNING")
+                    fail_count += 1
+                    continue
 
-            msg_resp = http_request(API_MESSAGE, msg_payload)
-            # 修复 F1：检查 HTTP 错误和业务错误（_error 标记）
-            msg_ok = msg_resp is not None and not (isinstance(msg_resp, dict) and msg_resp.get("_error"))
-            photo_ok = True
+                msg_resp = http_request(API_MESSAGE, msg_payload)
+                # 检查 HTTP 错误和业务错误（_error 标记）
+                msg_ok = msg_resp is not None and not (isinstance(msg_resp, dict) and msg_resp.get("_error"))
+                photo_ok = True
 
-            if photo:
-                upload_resp = http_request(API_UPLOAD, {
-                    "device_id": DEVICE_ID,
-                    "image_base64": photo,
-                    "note": "offline upload",
-                })
-                # 修复 F1：同样检查业务错误
-                photo_ok = upload_resp is not None and not (isinstance(upload_resp, dict) and upload_resp.get("_error"))
+                if photo:
+                    upload_resp = http_request(API_UPLOAD, {
+                        "device_id": DEVICE_ID,
+                        "image_base64": photo,
+                        "note": "offline upload",
+                    })
+                    # 同样检查业务错误
+                    photo_ok = upload_resp is not None and not (isinstance(upload_resp, dict) and upload_resp.get("_error"))
 
-            if msg_ok and photo_ok:
-                success_count += 1
-            else:
-                # 上传失败（无论是 HTTP 错误还是业务错误），保留条目等待下次刷新
+                if msg_ok and photo_ok:
+                    success_count += 1
+                else:
+                    # 上传失败（无论是 HTTP 错误还是业务错误），保留条目等待下次刷新
+                    remain.append(entry)
+                    fail_count += 1
+            except Exception as e:
+                log(f"刷新日志条目异常: {e}", "ERROR")
                 remain.append(entry)
                 fail_count += 1
-        except Exception as e:
-            log(f"刷新日志条目异常: {e}", "ERROR")
-            remain.append(entry)
-            fail_count += 1
 
-    # 写回阶段：在锁内写回剩余队列（原子写入）
-    with _queue_lock:
-        try:
-            tmp_path = QUEUE_FILE + ".tmp"
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(remain, f, ensure_ascii=False)
-                f.flush()
-            os.replace(tmp_path, QUEUE_FILE)
-        except Exception as e:
-            log(f"写回本地日志队列失败: {e}", "ERROR")
+        # 写回阶段：在锁内写回剩余队列（原子写入）
+        with _queue_lock:
+            try:
+                tmp_path = QUEUE_FILE + ".tmp"
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(remain, f, ensure_ascii=False)
+                    f.flush()
+                os.replace(tmp_path, QUEUE_FILE)
+            except Exception as e:
+                log(f"写回本地日志队列失败: {e}", "ERROR")
 
-    log(f"刷新本地日志: 成功 {success_count}, 失败 {fail_count}, 剩余 {len(remain)}")
+        log(f"刷新本地日志: 成功 {success_count}, 失败 {fail_count}, 剩余 {len(remain)}")
     finally:
         # 释放互斥锁，确保下次可以调用
         _flush_in_progress.release()
