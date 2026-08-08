@@ -335,6 +335,21 @@ m10.py
 - 旧版 `sync_reminders()` 接收 `{code, data: {reminders, medicines}}`
 - 新版 `sync_reminders()` 接收 `FamilyMedicationPlan[]`，通过 `_convert_plans_to_reminders()` / `_convert_plans_to_medicines()` 自动转换为兼容的内部格式
 
+### 已完成的 Bug 修复（v2.28.1）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `recognize_medicine()` 用旧格式 `resp.get("code") == 0` 检查 AI 问答响应 | 改为检查 `resp.get("answer")` |
+| 2 | 🔴 | `low_stock_alert()` 用旧格式 `resp.get("data")` 读取 AI 问答结果 | 改为检查 `resp.get("answer")` |
+| 3 | 🔴 | 多线程读写 `state["triggered_fixed_times"]` / `state["active_alerts"]` 未加锁 | 全部加 `with lock:` 保护；`threading.Lock` → `threading.RLock` 支持嵌套获取 |
+| 4 | 🟡 | `update_stock()` 使用不存在的 `daily_count` 字段 | 改为 `frequency_per_day` |
+| 5 | 🟡 | `upload_log()` 中 dict 类型 detail 产生 Python repr 作为 content | 改用 `json.dumps(detail)` |
+| 6 | 🟡 | 网络恢复检查仅在 `second % 30 == 0` 时触发，窗口极窄 | 改用 `time.time()` 间隔计时器（30 秒） |
+| 7 | 🟡 | 网络恢复时直接 `register_device()` 不检查已有 token | 加入 `load_device_token()` 优先恢复逻辑 |
+| 8 | 🟡 | `finally` 中 `device_offline()` 无异常保护，可能阻断 `stop_speech()` | 包裹 try/except |
+| 9 | 🟡 | `confirm_take()` 读取 `state["active_alerts"]` 未加锁 | 加 `with lock:` 保护 |
+| 10 | 🟡 | `check_network()` 硬编码旧域名 | 改用 `SERVER_BASE_URL` 常量 |
+
 ## 版本与更新
 
 本仓库 [`ha-ji-mi-MAN-BO/eating-medication`](https://github.com/ha-ji-mi-MAN-BO/eating-medication) 维护 `m10.py` 单文件版及其文档。配套网页端位于 [`diaoyunxi/eating-medication`](https://github.com/diaoyunxi/eating-medication)，建议二者同步更新以确保接口协议一致。

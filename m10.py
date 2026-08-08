@@ -93,7 +93,7 @@ state = {
     "current_date": None,     # 当天日期字符串 YYYY-MM-DD，用于跨天重置触发记录
 }
 
-lock = threading.Lock()
+lock = threading.RLock()
 
 gui = None
 buzzer = None
@@ -137,7 +137,7 @@ def save_config(cfg):
 
 def check_network():
     try:
-        urllib.request.urlopen("https://my-website.ccwu.cc", timeout=5)
+        urllib.request.urlopen(SERVER_BASE_URL, timeout=5)
         return True
     except Exception:
         return False
@@ -448,7 +448,7 @@ def upload_log(event_type, detail, photo_path=None):
     msg_payload = {
         "device_id": DEVICE_ID,
         "message_type": event_type,
-        "content": str(detail) if isinstance(detail, (str, int, float)) else "",
+        "content": str(detail) if isinstance(detail, (str, int, float)) else json.dumps(detail, ensure_ascii=False),
         "data": detail if isinstance(detail, dict) else {"detail": str(detail)},
     }
     photo_base64 = None
@@ -562,29 +562,34 @@ def device_offline():
 def reset_fixed_trigger_if_new_day():
     """跨天时清空当日已触发固定提醒记录，避免第二天漏触发"""
     today = datetime.datetime.now().strftime("%Y-%m-%d")
-    if state["current_date"] != today:
-        state["current_date"] = today
-        state["triggered_fixed_times"] = set()
-        log(f"日期切换到 {today}，已重置固定提醒触发记录")
+    with lock:
+        if state["current_date"] != today:
+            state["current_date"] = today
+            state["triggered_fixed_times"] = set()
+            log(f"日期切换到 {today}，已重置固定提醒触发记录")
 
 
 def check_fixed_reminders():
     """检查固定服药提醒时间（9:00 / 13:00 / 17:00），每天每个时间点仅触发一次"""
     reset_fixed_trigger_if_new_day()
     now_str = datetime.datetime.now().strftime("%H:%M")
-    for t in FIXED_REMINDER_TIMES:
-        if t == now_str and t not in state["triggered_fixed_times"]:
-            state["triggered_fixed_times"].add(t)
-            reminder = {
-                "id": f"fixed_{t}",
-                "user_name": "老人",
-                "medicine_name": "药品",
-                "dose": "请按医嘱服用",
-                "medicine_id": None,
-                "dose_count": 1,
-            }
-            log(f"触发固定时间提醒: {t}")
-            trigger_alert(reminder)
+    to_trigger = None
+    with lock:
+        for t in FIXED_REMINDER_TIMES:
+            if t == now_str and t not in state["triggered_fixed_times"]:
+                state["triggered_fixed_times"].add(t)
+                to_trigger = {
+                    "id": f"fixed_{t}",
+                    "user_name": "老人",
+                    "medicine_name": "药品",
+                    "dose": "请按医嘱服用",
+                    "medicine_id": None,
+                    "dose_count": 1,
+                }
+                log(f"触发固定时间提醒: {t}")
+                break
+    if to_trigger:
+        trigger_alert(to_trigger)
 
 
 def check_reminders():
@@ -592,15 +597,22 @@ def check_reminders():
     now_str = now.strftime("%H:%M")
     weekday = now.weekday() + 1
 
-    for r in state["reminders"]:
-        tid = r.get("id")
-        times = r.get("times", [])
-        days = r.get("days", [1, 2, 3, 4, 5, 6, 7])
-        if weekday not in days:
-            continue
-        for t in times:
-            if t == now_str and tid not in state["active_alerts"]:
-                trigger_alert(r)
+    to_trigger = None
+    with lock:
+        for r in state["reminders"]:
+            tid = r.get("id")
+            times = r.get("times", [])
+            days = r.get("days", [1, 2, 3, 4, 5, 6, 7])
+            if weekday not in days:
+                continue
+            for t in times:
+                if t == now_str and tid not in state["active_alerts"]:
+                    to_trigger = r
+                    break
+            if to_trigger:
+                break
+    if to_trigger:
+        trigger_alert(to_trigger)
 
 
 def trigger_alert(reminder):
@@ -639,9 +651,13 @@ def confirm_take(tid=None):
     photo_path = None
     if state.get("camera_available"):
         photo_path = capture_photo(filename=f"take_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
-    if tid and tid in state["active_alerts"]:
-        reminder = state["active_alerts"][tid]["reminder"]
-        del state["active_alerts"][tid]
+    if tid:
+        with lock:
+            if tid in state["active_alerts"]:
+                reminder = state["active_alerts"][tid]["reminder"]
+                del state["active_alerts"][tid]
+            else:
+                reminder = {}
     else:
         reminder = {}
 
@@ -667,23 +683,26 @@ def update_stock(medicine_id, used_count):
                 cfg = load_config()
                 cfg["medicines"] = state["medicines"]
                 save_config(cfg)
-                threshold = m.get("threshold", 5) * m.get("daily_count", 1)
+                threshold = m.get("threshold", 5) * m.get("frequency_per_day", 1)
                 if m["remaining"] < threshold:
                     threading.Thread(target=low_stock_alert, args=(m,), daemon=True).start()
                 break
 
 
 def low_stock_alert(medicine):
-    msg = f"{medicine.get('name')} 余量不足，请及时补药"
+    name = medicine.get('name', '')
+    msg = f"{name} 余量不足，请及时补药"
     log(msg)
     tts_speak(msg)
     update_gui_status(msg, alert=True)
     if state["online"]:
         resp = query_refill(medicine.get("id"))
-        if resp and resp.get("data"):
-            cheapest = resp["data"]
-            buy_msg = f"最优购: {cheapest.get('name')}，价格 {cheapest.get('price')} 元"
-            tts_speak(buy_msg)
+        if resp:
+            answer = resp.get("answer", "")
+            if answer:
+                buy_msg = f"购药建议: {answer}"
+                tts_speak(buy_msg)
+                update_gui_status(buy_msg, alert=True)
 
 
 # ============== AI 药物识别 ==============
@@ -714,12 +733,13 @@ def recognize_medicine():
 
     if state["online"] and text.strip():
         resp = query_drug_by_ocr(text.strip())
-        if resp and resp.get("code") == 0:
-            info = resp.get("data", {})
-            speak = f"这是 {info.get('name')}，{info.get('usage')}，每次 {info.get('dose')}"
-            update_gui_status(speak)
-            tts_speak(speak)
-            return
+        if resp:
+            answer = resp.get("answer", "")
+            if answer:
+                speak = f"AI 识别结果: {answer}"
+                update_gui_status(speak)
+                tts_speak(speak)
+                return
     tts_speak("未能识别药品，请手动核对说明书")
 
 
@@ -845,8 +865,12 @@ def clock_thread():
 def on_take_button_pressed():
     """P21 已吃药按钮（~A）：仅在吃药提醒时确认已吃药"""
     log("已吃药按钮被按下")
-    if state["active_alerts"]:
-        tid = next(iter(state["active_alerts"]))
+    with lock:
+        if state["active_alerts"]:
+            tid = next(iter(state["active_alerts"]))
+        else:
+            tid = None
+    if tid:
         confirm_take(tid)
 
 
@@ -947,6 +971,7 @@ def main_loop():
     last_hour = -1
     last_stock_check = 0
     last_flush = 0
+    last_reconnect_check = 0
 
     while True:
         now = datetime.datetime.now()
@@ -975,11 +1000,14 @@ def main_loop():
             if state["online"]:
                 flush_local_logs()
 
-        # 定期检查网络恢复
-        if not state["online"] and now.second % 30 == 0:
+        # 每 30 秒检查网络恢复
+        if not state["online"] and time.time() - last_reconnect_check > 30:
+            last_reconnect_check = time.time()
             if check_network():
                 state["online"] = True
-                register_device()
+                # 尝试恢复 token，否则重新注册
+                if not load_device_token():
+                    register_device()
                 sync_reminders()
                 flush_local_logs()
                 update_gui_status("网络已恢复")
@@ -1013,5 +1041,8 @@ if __name__ == "__main__":
     except Exception as e:
         log(f"主程序异常: {traceback.format_exc()}", "CRITICAL")
     finally:
-        device_offline()
+        try:
+            device_offline()
+        except Exception:
+            pass
         stop_speech()
