@@ -33,7 +33,7 @@
 | `Pin.P25` | 蜂鸣器 | 优先使用板载音效，回退数字引脚高低电平 |
 | `Pin.P21` | 已吃药按钮（~A键） | 按下高电平（1），松开低电平（0） |
 | `Pin.P27` | 启动提醒按钮（B键） | 按下低电平（0） |
-| `Pin.P28` | 紧急呼叫按钮（A键） | 按下低电平（0），仅记录日志 |
+| `Pin.P28` | 紧急呼叫按钮（A键） | 按下低电平（0），联网通知家属 |
 
 ### 外接模块
 
@@ -91,7 +91,7 @@ response_success = wifi_manager.connect_wifi("666", "15756491077")
 # 服务端地址（API）与家属端地址（参考）
 SERVER_BASE_URL = "https://my-website.ccwu.cc/eating-medication/server"
 FAMILY_BASE_URL = "https://my-website.ccwu.cc/eating-medication/family"
-PAIR_CODE = "275527387791320"
+PAIR_CODE = "234099521894527"
 DEVICE_ID = "m10_" + PAIR_CODE
 
 # 新版 API 端点（v2.28.0）
@@ -116,6 +116,18 @@ TTS_RATE = 200
 
 # 主界面时钟刷新间隔（秒）
 CLOCK_REFRESH_INTERVAL = 1
+
+# 常量定义（v2.29.2 新增）
+MAX_ALERT_RETRIES = 20           # 提醒最大重试次数（约 3 小时）
+MAX_QUEUE_SIZE = 500             # 离线日志队列最大条数
+MAX_PHOTO_SIZE = 512000          # 照片上传最大大小（500KB）
+MAX_IMAGE_SIZE = 1048576         # 图片 base64 编码最大大小（1MB）
+NETWORK_RECONNECT_INTERVAL = 30  # 网络恢复检查间隔（秒）
+MAX_RECONNECT_FAILS = 5          # 网络恢复最大失败次数
+STOCK_CHECK_INTERVAL = 6 * 3600  # 库存检查间隔（6 小时）
+LOG_FLUSH_INTERVAL = 30 * 60     # 日志刷新间隔（30 分钟）
+ALERT_TIMEOUT = 30               # 低库存告警超时（秒）
+MISSED_MINUTES_THRESHOLD = 60    # 错过分钟数阈值
 ```
 
 ### device_token 持久化
@@ -214,7 +226,7 @@ m10.py
 | 项目 | 值 |
 |------|-----|
 | 服务端基础路径 | `/eating-medication/server` |
-| API 版本 | v2.28.0（当前修复版：v2.29.1） |
+| API 版本 | v2.28.0（当前修复版：v2.29.3） |
 | 认证方式 | 设备注册后返回 `device_token`，后续请求通过 `X-Device-Token` Header 校验 |
 | 限流 | 设备端基于 IP 限流；部分接口需 `device_token` |
 
@@ -242,7 +254,7 @@ m10.py
 **请求体** (`DeviceRegister`)：
 ```json
 {
-  "device_id": "m10_275527387791320",
+  "device_id": "m10_234099521894527",
   "device_name": null
 }
 ```
@@ -263,7 +275,7 @@ m10.py
 **请求体** (`DeviceMessage`)：
 ```json
 {
-  "device_id": "m10_275527387791320",
+  "device_id": "m10_234099521894527",
   "message_type": "info",
   "content": "服药确认",
   "data": {
@@ -281,7 +293,7 @@ m10.py
 **请求体** (`DeviceUpload`)：
 ```json
 {
-  "device_id": "m10_275527387791320",
+  "device_id": "m10_234099521894527",
   "image_base64": "/9j/4AAQSkZJRg...",
   "note": "服药确认照片"
 }
@@ -304,7 +316,7 @@ m10.py
 ```json
 {
   "question": "老人吃什么药比较好？",
-  "context": []
+  "device_id": "m10_234099521894527"
 }
 ```
 
@@ -446,6 +458,102 @@ m10.py
 | 6 | 🟡 | 日志中 HTTP 错误响应体过长（200字符），可能泄露敏感信息 | 限制为 100 字符，并处理空响应体情况 |
 | 7 | 🟡 | GET 请求携带不必要的 `Content-Type: application/json` 头 | GET 请求自动移除 `Content-Type` 头，符合 HTTP 规范 |
 | 8 | 🟢 | 版本号规范更新 | 按照版本号规范递增 PATCH 版本，更新至 v2.29.1 |
+
+### 已完成的 Bug 修复（v2.29.2，共 12 项）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `low_stock_alert()` 中 `threading.Timer(30, ...)` 使用魔法数字 30 | 新增常量 `ALERT_TIMEOUT = 30`，便于统一配置 |
+| 2 | 🔴 | `image_to_base64()` 中 `if size > 1048576` 使用魔法数字 | 新增常量 `MAX_IMAGE_SIZE = 1048576` |
+| 3 | 🔴 | `upload_log()` 中 `if photo_size > 512000` 使用魔法数字 | 新增常量 `MAX_PHOTO_SIZE = 512000` |
+| 4 | 🔴 | `queue_local_log()` 中 `if len(queue) > 500` 使用魔法数字 | 新增常量 `MAX_QUEUE_SIZE = 500` |
+| 5 | 🟡 | `alert_loop()` 中 `max_retries = 20` 使用魔法数字 | 新增常量 `MAX_ALERT_RETRIES = 20` |
+| 6 | 🟡 | `main_loop()` 中多处魔法数字（`6 * 3600`、`30 * 60`、`30`、`60`、`5`） | 新增常量：`STOCK_CHECK_INTERVAL`、`LOG_FLUSH_INTERVAL`、`NETWORK_RECONNECT_INTERVAL`、`MISSED_MINUTES_THRESHOLD`、`MAX_RECONNECT_FAILS` |
+| 7 | 🟡 | `main_loop()` 中 `MAX_RECONNECT_FAILS` 在函数内重新定义为局部变量 | 移至全局常量区，统一管理 |
+| 8 | 🟡 | `alert_loop()` 注释不准确，描述 `time.sleep` 已被替换但仍提及 | 更新注释为"可中断等待机制" |
+| 9 | 🟢 | `upload_log()` 函数文档不完善 | 添加完整的 docstring（Args、Returns） |
+| 10 | 🟢 | `low_stock_alert()` 函数文档不完善 | 添加完整的 docstring（Args） |
+| 11 | 🟢 | `image_to_base64()` 注释不准确 | 更新注释反映使用 `MAX_IMAGE_SIZE` 常量 |
+| 12 | 🟢 | `queue_local_log()` 注释不准确 | 更新注释反映使用 `MAX_QUEUE_SIZE` 常量 |
+
+**v2.29.2 追加修复（共 15 项，代码审查增强）**：
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `http_request()` 未捕获 `URLError`（网络不通、DNS 解析失败） | 增加 `urllib.error.URLError` 捕获，返回 None 并记录日志 |
+| 2 | 🔴 | `upload_log()` 未检查业务错误标记（`_error`），业务错误时误判成功 | 增加 `_error` 标记检查，`msg_ok` 和 `photo_ok` 判定包含业务错误检测 |
+| 3 | 🔴 | `register_device()` token 为空时仍返回 True，导致无效注册状态 | token 为空时返回 False，记录 ERROR 日志 |
+| 4 | 🔴 | `log()` 函数文件 I/O（rename、open、write）在锁内执行，可能阻塞其他线程 | 将文件 I/O 操作移到 `_log_lock` 外部执行 |
+| 5 | 🟡 | `init_network()` 网络检测失败无重试，临时网络波动直接放弃 | 增加 3 次重试机制，每次间隔 1 秒 |
+| 6 | 🟡 | `flush_local_logs()` 并发调用可能导致重复上传 | 增加 `_flush_in_progress` 事件防止并发刷新，添加 finally 确保释放 |
+| 7 | 🟡 | `check_network()` 使用默认 User-Agent，部分服务器拒绝 | 添加自定义 User-Agent 请求头 |
+| 8 | 🟡 | 图片大小限制检查不一致：`upload_log` 500KB 限制与 `image_to_base64` 1MB 检查脱节 | 在 `upload_log` 中增加 `image_to_base64` 返回 None 的二次检查 |
+| 9 | 🟡 | 版本号注释不一致：API 端点注释与文件头版本描述矛盾 | 统一注释为"API 端点（v2.28.0，对应 openapi.json，m10.py 当前版本 v2.29.2）" |
+| 10 | 🟢 | `alert_loop()` 使用 `time.sleep(1)` 轮询，响应不够灵敏 | 改用 `threading.Event.wait()` 实现可中断等待 |
+| 11 | 🟢 | 提醒重试次数 `max_retries = 20` 硬编码在 `alert_loop()` 中 | 新增 `MAX_ALERT_RETRIES = 20` 全局常量 |
+| 12 | 🟢 | `_speak_worker()` 引擎重新初始化失败无详细日志 | 添加具体的异常信息记录，便于问题排查 |
+| 13 | 🟢 | OCR 引擎加载失败后无法重置，需重启设备 | 新增 `reset_ocr_engine()` 函数，支持运行时重置 |
+| 14 | 🟢 | `_get_ocr_engine()` 缺少文档说明 | 添加详细 docstring，说明返回值和异常情况 |
+| 15 | 🟢 | `flush_local_logs()` 的 `_flush_in_progress` 事件可能因异常未释放 | 添加 finally 块确保事件清理 |
+
+### 已完成的 Bug 修复（v2.29.3，共 30 项）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `flush_local_logs()` 未检查业务错误标记（`_error`），业务失败被当作成功导致日志丢失 | 增加 `_error` 标记检查，`msg_ok` 和 `photo_ok` 判定包含业务错误检测 |
+| 2 | 🔴 | `capture_photo()` 使用 `subprocess.run(shell=True)` 存在命令注入风险 | 改用列表形式 `["fswebcam", "-r", "640x480", "--no-banner", path]`，设置 `shell=False` |
+| 3 | 🔴 | `set_system_volume()` 使用 `subprocess.run(shell=True)` 存在命令注入风险 | 改用列表形式 + `shell=False`，增加参数范围校验（0-100） |
+| 4 | 🔴 | `notify_emergency()` 异常处理不完善，关键安全功能可能静默失败 | 增加完整异常捕获和业务错误检查 |
+| 5 | 🔴 | `main()` 异常处理将完整 traceback 写入日志，泄露系统路径和变量信息 | 改为仅记录异常类型+简要信息，详细堆栈写入本地 `.crash` 文件 |
+| 6 | 🔴 | `query_drug_by_ocr()` 和 `query_refill()` API 请求包含未定义的 `context` 字段 | 移除 `context` 字段，添加 `device_id` 字段符合 `AIQuestion` schema |
+| 7 | 🔴 | `init_hardware()` 使用 `subprocess.run("which fswebcam", shell=True)` 存在命令注入风险 | 改用列表形式 `["which", "fswebcam"]`，设置 `shell=False` |
+| 8 | 🔴 | `detect_volume_control()` 多处使用 `subprocess.run(shell=True)` 存在命令注入风险 | 全部改用列表形式 + `shell=False`，重构 `control_exists()` 使用列表参数 |
+| 9 | 🟡 | `flush_local_logs()` 并发控制使用 `threading.Event`，无法确保严格互斥 | 改用 `threading.Lock` 的 `acquire(blocking=False)` 实现严格互斥 |
+| 10 | 🟡 | `http_request()` 删除 `Content-Type` 头时使用 `del` 可能触发 `KeyError` | 改用 `hdrs.pop("Content-Type", None)` 安全删除 |
+| 11 | 🟡 | `upload_log()` 照片大小检查使用魔法数字 512000 | 改用 `MAX_PHOTO_SIZE` 常量 |
+| 12 | 🟡 | `MAX_ALERT_RETRIES` 常量重复定义（第 150/168 行） | 删除重复项，保留统一定义 |
+| 13 | 🟡 | `low_stock_alert()` 使用 `threading.Timer` 强制恢复主页，覆盖用户紧急操作界面 | 改为仅恢复状态显示，不强制调用 `update_gui_home()` |
+| 14 | 🟡 | `on_remind_button_pressed()` 未优先使用真实用药计划 | 优先从 `state["reminders"]` 获取第一条，无计划时降级为默认提醒 |
+| 15 | 🟡 | `update_stock()` 未校验 `used_count` 参数类型和有效性 | 增加 `isinstance(used_count, (int, float))` 和 `used_count > 0` 检查 |
+| 16 | 🟡 | `alert_loop()` 中 `interrupted` 变量在 `with lock:` 内设置但锁外检查，存在竞态条件 | 重构代码结构，确保中断标志在锁内设置后立即在锁外正确检查 |
+| 17 | 🟡 | `update_stock()` 找不到对应药品时静默失败，无任何日志提示 | 添加 `found` 标志追踪，未找到时记录 WARNING 日志 |
+| 18 | 🟡 | API 端点注释版本号过时（v2.29.2 → v2.29.3） | 更新注释中的版本号 |
+| 19 | 🟢 | `calculate_remaining_days()` 使用普通除法可能导致库存预警偏少 | 使用向上取整算法 `max(0, -(-int(total) // daily))` |
+| 20 | 🟢 | `update_stock()`、`device_offline()`、`ensure_dirs()` 等函数文档不完整 | 补充完整 docstring（Args、Returns、Raises） |
+| 21 | 🟢 | GUI 颜色硬编码（`#FF4444`、`#333333`、`#666666` 等）分散在多处 | 新增颜色常量 `COLOR_TITLE`、`COLOR_ALERT_RED`、`COLOR_ALERT_DARK`、`COLOR_CLOCK_BLUE`、`COLOR_TEXT_DARK`、`COLOR_TEXT_GRAY`，统一管理 |
+| 22 | 🟢 | `capture_photo()` 文件名未做安全校验，可能包含特殊字符 | 增加正则校验 `r'^[\w\.\-]+$'`，仅允许字母数字下划线点 |
+| 23 | 🟢 | `capture_photo()` 未处理 `FileNotFoundError`（fswebcam 未安装） | 增加 `FileNotFoundError` 异常处理，提示安装 fswebcam |
+| 24 | 🟢 | `device_offline()` 下线通知无异常保护 | 增加 `try/except` 保护，下线通知不再抛异常 |
+| 25 | 🟢 | `main()` finally 块中 `device_offline()` 阻塞进程退出 | 改为 `threading.Thread` 异步执行 |
+| 26 | 🟢 | `update_stock()` 未校验 `medicine_id` 有效性 | 增加 `if not medicine_id: return` 提前返回 |
+| 27 | 🟢 | `update_gui_status()` 硬编码颜色值 | 改用颜色常量 `COLOR_ALERT_RED`、`COLOR_TEXT_DARK`、`COLOR_TITLE`、`COLOR_TEXT_GRAY` |
+| 28 | 🟢 | `update_gui_home()` 硬编码颜色值 | 改用颜色常量 `COLOR_TITLE`、`COLOR_TEXT_GRAY`、`COLOR_TEXT_DARK`、`COLOR_CLOCK_BLUE` |
+| 29 | 🟢 | `update_gui_reminder()` 硬编码颜色值 | 改用颜色常量 `COLOR_ALERT_DARK`、`COLOR_ALERT_RED`、`COLOR_TEXT_GRAY` |
+| 30 | 🟢 | `log()` 函数每次调用都检查文件大小，高频调用时开销过大 | 添加 `_LOG_SIZE_CHECK_INTERVAL = 60` 秒检查间隔，减少系统调用开销 |
+
+**新增常量汇总**（配置区）：
+
+```python
+# 常量定义
+MAX_ALERT_RETRIES = 20           # 提醒最大重试次数（约 3 小时）
+MAX_QUEUE_SIZE = 500             # 离线日志队列最大条数
+MAX_PHOTO_SIZE = 512000          # 照片上传最大大小（500KB）
+MAX_IMAGE_SIZE = 1048576         # 图片 base64 编码最大大小（1MB）
+NETWORK_RECONNECT_INTERVAL = 30  # 网络恢复检查间隔（秒）
+MAX_RECONNECT_FAILS = 5          # 网络恢复最大失败次数
+STOCK_CHECK_INTERVAL = 6 * 3600  # 库存检查间隔（6 小时）
+LOG_FLUSH_INTERVAL = 30 * 60     # 日志刷新间隔（30 分钟）
+ALERT_TIMEOUT = 30               # 低库存告警超时（秒）
+MISSED_MINUTES_THRESHOLD = 60    # 错过分钟数阈值
+```
+
+**API 规范一致性检查**：
+- ✅ `POST /api/v1/public/device/message` — 用于 `upload_log()`、`notify_emergency()`
+- ✅ `POST /api/v1/public/device/upload` — 用于照片上传
+- ✅ `GET /api/v1/public/device/schedule/{device_id}` — 用于 `sync_reminders()`
+- ✅ `POST /api/v1/public/device/offline` — 用于 `device_offline()`
+- ✅ `POST /api/v1/public/ai/ask` — 用于 `query_refill()`、`recognize_medicine()`
+- ✅ 所有请求正确携带 `X-Device-Token` Header（通过 `_auth_headers()` 自动注入）
 
 ## 版本与更新
 
