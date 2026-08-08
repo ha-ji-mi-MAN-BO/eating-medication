@@ -9,13 +9,13 @@ API 版本: v2.28.0（对应 openapi.json）
 本程序使用 Python 标准库 + UniHiker 原生 API (unihiker/pinpong) + pyttsx3 TTS,
 不依赖 cv2、requests、schedule 等第三方库。
 
-v2.28.4 修复记录（共 40 项 bug 修复）：
-- state["device_token"] 全面加锁保护（_get_device_token/_set_device_token 辅助函数）
-- 新增 _queue_lock 保护离线日志队列文件，flush_local_logs 读锁内/网络锁外/写锁内
-- 新增 _log_lock 保护日志写入与 10MB 自动轮转
-- pyttsx3 预导入设 _PYTTSX3_AVAILABLE 标志，消除异常分支内动态 import
-- trigger_alert 存储 reminder 副本，消除引用风险
-- sync_reminders 增加完善的 API 响应校验
+v2.28.5 修复记录（共 47 项 bug 修复）：
+- 新增 _gui_draw_lock 保护所有 GUI 绘制操作，防止多线程画面撕裂
+- 新增 _camera_lock 串行化摄像头访问，防止多线程冲突
+- _speak_queue 改为有界队列(maxsize=100)，tts_speak 满时丢弃旧消息
+- clock_thread 在 _gui_draw_lock 保护下操作 GUI 对象
+- _convert_plans_to_reminders 支持 API 传入的 days/weekdays 字段
+- _get_ocr_engine 新增 _ocr_lock + DCLP 双重检查锁定模式
 """
 
 import os
@@ -111,9 +111,11 @@ state = {
 
 lock = threading.RLock()
 _gui_lock = threading.Lock()
+_gui_draw_lock = threading.Lock()  # 保护 gui.clear/draw_text 等绘制操作，防多线程画面撕裂
 _config_lock = threading.Lock()  # 保护配置文件的读写，避免多线程同时写入导致 JSON 损坏
 _queue_lock = threading.Lock()   # 保护离线日志队列文件的读写
 _log_lock = threading.Lock()      # 保护日志文件写入与轮转
+_camera_lock = threading.Lock()  # 保护摄像头访问，避免多线程并发拍照冲突
 
 gui = None
 buzzer = None
@@ -256,7 +258,7 @@ def set_system_volume(vol):
 # ============== TTS 语音播报（pyttsx3 + 队列，参考老年端 speech.py） ==============
 
 _speech_engine = None
-_speak_queue = queue.Queue()
+_speak_queue = queue.Queue(maxsize=100)  # 有界队列，最多 100 条排队
 _speech_stop_event = threading.Event()
 _speech_thread = None
 _speech_lock = threading.Lock()
@@ -333,8 +335,16 @@ def _speak_worker():
 
 
 def tts_speak(text, volume=None):
-    """语音播报（非阻塞，加入队列由后台线程处理）"""
-    _speak_queue.put((text, volume))
+    """语音播报（非阻塞，加入队列由后台线程处理）。队列满时丢弃最旧的一条"""
+    try:
+        _speak_queue.put((text, volume), timeout=0.1)
+    except queue.Full:
+        # 队列已满，丢弃最旧的（后台还在大量堆积时，优先保证新消息播送）
+        try:
+            _speak_queue.get_nowait()
+            _speak_queue.put((text, volume), timeout=0.1)
+        except queue.Empty:
+            pass  # 极端情况下丢弃旧消息
 
 
 def stop_speech():
@@ -369,19 +379,20 @@ def buzzer_beep(times=1, duration=0.2):
 
 
 def capture_photo(filename=None, timeout=10):
-    """使用系统 fswebcam 命令拍照，不依赖 cv2"""
+    """使用系统 fswebcam 命令拍照，不依赖 cv2。线程安全：多线程并发拍照时串行化"""
     if filename is None:
         filename = f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
     path = os.path.join(PHOTO_DIR, filename)
-    try:
-        # 优先使用 fswebcam（Linux 下 USB/CSI 摄像头通用）
-        cmd = f"fswebcam -r 640x480 --no-banner {path}"
-        r = subprocess.run(cmd, shell=True, capture_output=True, timeout=timeout)
-        if r.returncode == 0 and os.path.exists(path) and os.path.getsize(path) > 0:
-            return path
-        log(f"fswebcam 失败: {r.stderr.decode('utf-8', errors='ignore')}", "WARNING")
-    except Exception as e:
-        log(f"拍照失败: {e}", "ERROR")
+    with _camera_lock:
+        try:
+            # 优先使用 fswebcam（Linux 下 USB/CSI 摄像头通用）
+            cmd = f"fswebcam -r 640x480 --no-banner {path}"
+            r = subprocess.run(cmd, shell=True, capture_output=True, timeout=timeout)
+            if r.returncode == 0 and os.path.exists(path) and os.path.getsize(path) > 0:
+                return path
+            log(f"fswebcam 失败: {r.stderr.decode('utf-8', errors='ignore')}", "WARNING")
+        except Exception as e:
+            log(f"拍照失败: {e}", "ERROR")
     return None
 
 
@@ -509,12 +520,20 @@ def _convert_plans_to_reminders(plans):
         drug_name = p.get("drug_name", "")
         plan_id = p.get("id")
         freq = p.get("frequency", "每日")
+        # 解析 days：优先使用 API 传入的 weekday/days 字段，默认全周
+        days = p.get("days") or p.get("weekdays") or p.get("day_of_week")
+        if not days:
+            days = [1, 2, 3, 4, 5, 6, 7]
+        elif isinstance(days, (list, tuple)):
+            days = [int(d) for d in days if str(d).isdigit()] or [1, 2, 3, 4, 5, 6, 7]
+        elif isinstance(days, int):
+            days = [days]
         reminders.append({
             "id": plan_id if plan_id is not None else drug_name,
             "medicine_name": drug_name,
             "dose": p.get("dosage", "1片"),
             "times": times if isinstance(times, list) else [times],
-            "days": [1, 2, 3, 4, 5, 6, 7],
+            "days": days,
             "medicine_id": plan_id,
             "dose_count": 1,
             "user_name": "老人",
@@ -845,6 +864,7 @@ def low_stock_alert(medicine):
 # ============== AI 药物识别 ==============
 
 _ocr_engine = None  # (pytesseract, Image) tuple, 延迟初始化
+_ocr_lock = threading.Lock()
 
 
 def _get_ocr_engine():
@@ -852,14 +872,18 @@ def _get_ocr_engine():
     global _ocr_engine
     if _ocr_engine is not None:
         return _ocr_engine
-    try:
-        import pytesseract
-        from PIL import Image
-        _ocr_engine = (pytesseract, Image)
-        return _ocr_engine
-    except Exception as e:
-        log(f"OCR 引擎加载失败: {e}", "WARNING")
-        return None
+    with _ocr_lock:
+        # Double-check after acquiring lock
+        if _ocr_engine is not None:
+            return _ocr_engine
+        try:
+            import pytesseract
+            from PIL import Image
+            _ocr_engine = (pytesseract, Image)
+            return _ocr_engine
+        except Exception as e:
+            log(f"OCR 引擎加载失败: {e}", "WARNING")
+            return None
 
 
 def recognize_medicine():
@@ -943,12 +967,13 @@ def update_gui_status(text, alert=False):
     try:
         with _gui_lock:
             _gui_mode = "status"
-        color = "#FF4444" if alert else "#333333"
-        gui.clear()
-        gui.draw_text(x=120, y=40, text="智能服药提醒", font_size=20, color="#000000", origin="center")
-        gui.draw_text(x=120, y=100, text=text, font_size=16, color=color, origin="center")
-        status = "在线" if _get_online() else "离线模式"
-        gui.draw_text(x=120, y=200, text=status, font_size=14, color="#666666", origin="center")
+        with _gui_draw_lock:
+            color = "#FF4444" if alert else "#333333"
+            gui.clear()
+            gui.draw_text(x=120, y=40, text="智能服药提醒", font_size=20, color="#000000", origin="center")
+            gui.draw_text(x=120, y=100, text=text, font_size=16, color=color, origin="center")
+            status = "在线" if _get_online() else "离线模式"
+            gui.draw_text(x=120, y=200, text=status, font_size=14, color="#666666", origin="center")
     except Exception as e:
         log(f"GUI 更新失败: {e}", "ERROR")
 
@@ -959,29 +984,30 @@ def update_gui_home():
     if not gui:
         return
     try:
-        gui.clear()
-        with _gui_lock:
-            _clock_date_obj = None
-            _clock_time_obj = None
-        gui.draw_text(x=120, y=30, text="智能服药提醒", font_size=18, color="#000000", origin="center")
-        status = "在线" if _get_online() else "离线模式"
-        gui.draw_text(x=120, y=65, text=status, font_size=12, color="#666666", origin="center")
-        now = datetime.datetime.now()
-        # 日期行
-        date_obj = gui.draw_text(
-            x=120, y=120, text=_format_date(now),
-            font_size=16, color="#333333", origin="center",
-        )
-        # 时分秒行（醒目蓝色）
-        time_obj = gui.draw_text(
-            x=120, y=165, text=_format_time(now),
-            font_size=24, color="#0050FF", origin="center",
-        )
-        with _gui_lock:
-            _clock_date_obj = date_obj
-            _clock_time_obj = time_obj
-            _gui_mode = "home"
-        gui.draw_text(x=120, y=220, text="B键启动提醒 A键紧急", font_size=11, color="#666666", origin="center")
+        with _gui_draw_lock:
+            gui.clear()
+            with _gui_lock:
+                _clock_date_obj = None
+                _clock_time_obj = None
+            gui.draw_text(x=120, y=30, text="智能服药提醒", font_size=18, color="#000000", origin="center")
+            status = "在线" if _get_online() else "离线模式"
+            gui.draw_text(x=120, y=65, text=status, font_size=12, color="#666666", origin="center")
+            now = datetime.datetime.now()
+            # 日期行
+            date_obj = gui.draw_text(
+                x=120, y=120, text=_format_date(now),
+                font_size=16, color="#333333", origin="center",
+            )
+            # 时分秒行（醒目蓝色）
+            time_obj = gui.draw_text(
+                x=120, y=165, text=_format_time(now),
+                font_size=24, color="#0050FF", origin="center",
+            )
+            with _gui_lock:
+                _clock_date_obj = date_obj
+                _clock_time_obj = time_obj
+                _gui_mode = "home"
+            gui.draw_text(x=120, y=220, text="B键启动提醒 A键紧急", font_size=11, color="#666666", origin="center")
     except Exception as e:
         log(f"GUI 更新失败: {e}", "ERROR")
 
@@ -994,11 +1020,12 @@ def update_gui_reminder(name, drug, dose):
     try:
         with _gui_lock:
             _gui_mode = "reminder"
-        gui.clear()
-        gui.draw_text(x=120, y=40, text="该吃药了", font_size=20, color="#FF0000", origin="center")
-        gui.draw_text(x=120, y=100, text=f"{name}，该吃 {drug}", font_size=16, color="#FF4444", origin="center")
-        gui.draw_text(x=120, y=140, text=f"每次 {dose}", font_size=16, color="#FF4444", origin="center")
-        gui.draw_text(x=120, y=220, text="按~A键确认已吃药", font_size=12, color="#666666", origin="center")
+        with _gui_draw_lock:
+            gui.clear()
+            gui.draw_text(x=120, y=40, text="该吃药了", font_size=20, color="#FF0000", origin="center")
+            gui.draw_text(x=120, y=100, text=f"{name}，该吃 {drug}", font_size=16, color="#FF4444", origin="center")
+            gui.draw_text(x=120, y=140, text=f"每次 {dose}", font_size=16, color="#FF4444", origin="center")
+            gui.draw_text(x=120, y=220, text="按~A键确认已吃药", font_size=12, color="#666666", origin="center")
     except Exception as e:
         log(f"GUI 更新失败: {e}", "ERROR")
 
@@ -1013,16 +1040,17 @@ def clock_thread():
                 date_obj = _clock_date_obj
             if gui and mode == "home":
                 now = datetime.datetime.now()
-                if time_obj is not None:
-                    try:
-                        time_obj.config(text=_format_time(now))
-                    except Exception:
-                        pass
-                if date_obj is not None:
-                    try:
-                        date_obj.config(text=_format_date(now))
-                    except Exception:
-                        pass
+                with _gui_draw_lock:
+                    if time_obj is not None:
+                        try:
+                            time_obj.config(text=_format_time(now))
+                        except Exception:
+                            pass
+                    if date_obj is not None:
+                        try:
+                            date_obj.config(text=_format_date(now))
+                        except Exception:
+                            pass
         except Exception as e:
             log(f"时钟刷新失败: {e}", "WARNING")
         time.sleep(CLOCK_REFRESH_INTERVAL)

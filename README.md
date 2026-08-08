@@ -335,7 +335,7 @@ m10.py
 - 旧版 `sync_reminders()` 接收 `{code, data: {reminders, medicines}}`
 - 新版 `sync_reminders()` 接收 `FamilyMedicationPlan[]`，通过 `_convert_plans_to_reminders()` / `_convert_plans_to_medicines()` 自动转换为兼容的内部格式
 
-### 已完成的 Bug 修复（v2.28.4，共 40 项）
+### 已完成的 Bug 修复（v2.28.5，共 47 项）
 
 | # | 严重度 | 描述 | 修复方案 |
 |---|--------|------|----------|
@@ -379,6 +379,13 @@ m10.py
 | 38 | 🟡 | `trigger_alert()` 将 `reminder` 字典引用直接存入 `active_alerts`，后续 `sync_reminders` 替换列表后可能导致数据不一致 | 改用 `dict(reminder)` 创建副本 |
 | 39 | 🟡 | `sync_reminders()` 对 API 错误响应缺乏校验，可能静默清空提醒 | 增加 `resp is None` 检查、`status != "ok"` 错误检测、`items` 字段兼容 |
 | 40 | 🟢 | 锁体系统一 | 锁数量从 3 把增至 6 把：`lock`(RLock)、`_gui_lock`、`_config_lock`、`_queue_lock`、`_log_lock`，每把锁职责单一 |
+| 41 | 🔴 | GUI 绘制操作（`gui.clear()`/`gui.draw_text()`）无线程锁保护，多线程同时绘制可能导致画面撕裂或崩溃 | 新增 `_gui_draw_lock`；所有绘制函数（`update_gui_status`/`update_gui_home`/`update_gui_reminder`/`clock_thread`）统一在锁内操作 |
+| 42 | 🔴 | 摄像头 `capture_photo()` 无线程锁，多线程并发拍照可能导致设备冲突或文件覆盖 | 新增 `_camera_lock` 串行化所有摄像头访问 |
+| 43 | 🔴 | `_speak_queue` 无大小限制，TTS 引擎堵塞时队列无限增长 | 改为 `Queue(maxsize=100)`；`tts_speak` 满时丢弃最旧消息保证时效性 |
+| 44 | 🟡 | `clock_thread` 读取的 `_clock_time_obj`/`_clock_date_obj` 可能在 `update_gui_home` 清空后变为无效引用 | 在 `_gui_draw_lock` 保护下操作，与 `update_gui_home` 互斥 |
+| 45 | 🟡 | `_convert_plans_to_reminders` 硬编码 `days=[1..7]`，忽略 API 可能传入的特定工作日（如仅周一/三/五） | 增加 `days`/`weekdays`/`day_of_week` 字段解析，兼容多种格式 |
+| 46 | 🟡 | `_get_ocr_engine()` 无锁保护，多线程首次调用时可能重复初始化 OCR 引擎 | 新增 `_ocr_lock` + 双重检查锁定模式（DCLP） |
+| 47 | 🟢 | 锁体系再次完善 | 锁数量增至 **9 把**：`lock`/`_gui_lock`/`_gui_draw_lock`/`_config_lock`/`_queue_lock`/`_log_lock`/`_camera_lock`/`_speech_lock`/`_ocr_lock` |
 
 ## 版本与更新
 
