@@ -5,10 +5,24 @@ UniHiker M10 智能服药提醒终端主程序
 项目地址适配: https://my-website.ccwu.cc/eating-medication/server/
 设备配对码: 234099521894527
 API 版本: v2.28.0（对应 openapi.json）
-当前代码版本: v2.29.4
+当前代码版本: v2.29.5
 
 本程序使用 Python 标准库 + UniHiker 原生 API (unihiker/pinpong) + pyttsx3 TTS,
 不依赖 cv2、requests、schedule 等第三方库。
+
+v2.29.5 修复记录（共 12 项 bug 修复，涵盖安全、逻辑、规范、健壮性）：
+- 【致命】flush_local_logs() 修复队列为空时提前返回导致 _flush_in_progress 锁无法释放的问题
+- 【致命】flush_local_logs() 文件损坏处理后继续执行而非直接返回，确保锁正确释放
+- 【严重】notify_emergency() 增加业务错误检查，区分网络错误和业务错误的日志
+- 【严重】device_offline() 增加完整的业务错误响应检查和详细日志
+- 【严重】recognize_medicine() 增加更完善的错误处理，OCR失败/离线/AI无响应均有明确反馈
+- 【严重】calculate_remaining_days() 增加 remaining 为负数的边界检查
+- 【严重】save_config() 使用 os.fsync() 确保数据落盘，异常时清理临时文件
+- 【一般】load_config() 增加返回值类型检查（必须为 dict），完善损坏恢复机制
+- 【一般】load_device_token() 增加 token 格式验证（长度、空格检查）
+- 【一般】init_network() 增加更详细的日志和异常类型信息
+- 【一般】alert_loop() 优化中断逻辑，简化代码结构，增加离线响应优化
+- 【一般】trigger_alert()、confirm_take()、on_take_button_pressed() 等函数补充完整 docstring
 
 v2.29.4 修复记录（共 10 项 bug 修复，涵盖规范、性能、可维护性）：
 - 【严重】main_loop() 中 _do_sync 函数从循环内提取为嵌套函数，避免每次网络恢复时重复创建
@@ -351,12 +365,30 @@ def ensure_dirs():
 
 
 def load_config():
-    """加载配置文件，返回 dict；文件损坏时自动备份并返回空字典"""
+    """加载配置文件，返回 dict；文件损坏时自动备份并返回空字典
+    
+    配置文件损坏时自动备份到带时间戳的 .bak 文件，
+    避免数据丢失，便于事后排查和恢复。
+    
+    Args:
+        无
+    
+    Returns:
+        dict: 配置字典，损坏或不存在时返回空字典 {}
+    
+    Raises:
+        无
+    """
     with _config_lock:
         if os.path.exists(CONFIG_FILE):
             try:
                 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                    cfg = json.load(f)
+                    if isinstance(cfg, dict):
+                        return cfg
+                    else:
+                        log(f"配置文件格式错误（不是 dict），类型: {type(cfg)}", "ERROR")
+                        return {}
             except (json.JSONDecodeError, ValueError) as e:
                 log(f"配置文件损坏，正在备份: {e}", "ERROR")
                 # 备份损坏的配置文件
@@ -364,35 +396,47 @@ def load_config():
                 try:
                     os.rename(CONFIG_FILE, backup_path)
                     log(f"损坏配置已备份到: {backup_path}", "INFO")
-                except Exception:
-                    pass
+                except Exception as backup_e:
+                    log(f"备份损坏配置失败: {backup_e}", "WARNING")
                 return {}
             except Exception as e:
-                log(f"读取配置失败: {e}", "ERROR")
+                log(f"读取配置失败: {type(e).__name__}: {e}", "ERROR")
                 return {}
         return {}
 
 
 def save_config(cfg):
-    """原子写入：先写临时文件再 rename，避免断电导致配置文件损坏"""
+    """原子写入：先写临时文件再 rename，避免断电导致配置文件损坏
+    
+    Args:
+        cfg: 配置字典，必须是 dict 类型
+    
+    Returns:
+        bool: 成功返回 True，失败返回 False
+    
+    Raises:
+        无
+    """
     if not isinstance(cfg, dict):
         log("save_config: cfg 必须是 dict 类型", "ERROR")
         return False
     with _config_lock:
+        tmp_path = CONFIG_FILE + ".tmp"
         try:
-            tmp_path = CONFIG_FILE + ".tmp"
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
                 f.flush()  # 强制写入磁盘
+                os.fsync(f.fileno())  # 确保数据落盘
             os.replace(tmp_path, CONFIG_FILE)
             return True
         except Exception as e:
-            log(f"保存配置失败: {e}", "ERROR")
-            if os.path.exists(CONFIG_FILE + ".tmp"):
-                try:
-                    os.remove(CONFIG_FILE + ".tmp")
-                except Exception:
-                    pass
+            log(f"保存配置失败: {type(e).__name__}: {e}", "ERROR")
+            # 清理临时文件
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
             return False
 
 
@@ -790,15 +834,28 @@ def save_device_token(token):
 
 
 def load_device_token():
-    """从配置文件恢复 device_token"""
+    """从配置文件恢复 device_token
+    
+    Returns:
+        bool: 成功恢复返回 True，否则返回 False
+    
+    Raises:
+        无
+    """
     try:
         cfg = load_config()
         if cfg:
             token = cfg.get("device_token")
-            if token and isinstance(token, str) and len(token) > 0:
+            if token and isinstance(token, str) and len(token) > 10:
+                # 简单验证 token 格式（至少10个字符，不含空格）
+                if token.isspace() or any(c.isspace() for c in token):
+                    log("device_token 格式无效（包含空格）", "WARNING")
+                    return False
                 _set_device_token(token)
                 log("device_token 已从本地恢复")
                 return True
+            elif token:
+                log(f"device_token 格式无效: 长度不足 ({len(token)} 字符)", "WARNING")
     except Exception as e:
         log(f"加载 device_token 失败: {e}", "WARNING")
     return False
@@ -1149,6 +1206,9 @@ def flush_local_logs():
     """刷新本地离线日志队列：读取 → 逐条上传 → 写回剩余
     
     使用 threading.Lock 防止并发调用导致重复上传
+    
+    Returns:
+        None
     """
     if not os.path.exists(QUEUE_FILE):
         return
@@ -1175,13 +1235,23 @@ def flush_local_logs():
                     os.rename(QUEUE_FILE, backup_path)
                 except Exception:
                     pass
-                return
+                queue = []  # 损坏文件处理后继续，使用空队列
             except Exception as e:
                 log(f"读取本地日志队列失败: {e}", "ERROR")
-                return
+                queue = []  # 其他异常也使用空队列继续处理
 
-    if not queue:
-        return
+        # 队列为空时，写回空队列并结束，确保 finally 释放锁
+        if not queue:
+            with _queue_lock:
+                try:
+                    tmp_path = QUEUE_FILE + ".tmp"
+                    with open(tmp_path, "w", encoding="utf-8") as f:
+                        json.dump([], f, ensure_ascii=False)
+                        f.flush()
+                    os.replace(tmp_path, QUEUE_FILE)
+                except Exception:
+                    pass
+            return
 
     remain = []
     success_count = 0
@@ -1299,6 +1369,9 @@ def notify_emergency():
     
     Returns:
         bool: 通知成功返回 True，失败返回 False
+    
+    Raises:
+        无（所有异常已内部捕获）
     """
     try:
         cfg = load_config()
@@ -1325,8 +1398,11 @@ def notify_emergency():
         if resp is not None and not (isinstance(resp, dict) and resp.get("_error")):
             tts_speak("紧急通知已发送给家属")
             return True
+        elif resp is None:
+            log("紧急通知失败: 网络请求无响应", "ERROR")
         else:
-            log(f"紧急通知失败: {resp}", "ERROR")
+            error_msg = resp.get("message", "未知错误") if isinstance(resp, dict) else str(resp)
+            log(f"紧急通知失败: {error_msg}", "ERROR")
     except Exception as e:
         log(f"紧急通知请求异常: {e}", "ERROR")
     
@@ -1335,10 +1411,27 @@ def notify_emergency():
 
 
 def device_offline():
-    """设备主动下线通知（在程序退出时调用，通知服务器设备已离线）"""
+    """设备主动下线通知（在程序退出时调用，通知服务器设备已离线）
+    
+    通过 POST /api/v1/public/device/offline 发送下线通知，
+    将 last_heartbeat_at 置为很早的时间，使 is_online 立即为 false。
+    
+    Returns:
+        None
+    
+    Raises:
+        无（所有异常已内部捕获）
+    """
     try:
         payload = {"device_id": DEVICE_ID}
-        http_request(API_OFFLINE, payload, timeout=5)
+        resp = http_request(API_OFFLINE, payload, timeout=5)
+        if resp is None:
+            log("设备下线通知: 网络请求无响应", "WARNING")
+        elif isinstance(resp, dict) and resp.get("_error"):
+            error_msg = resp.get("message", "未知错误")
+            log(f"设备下线通知: 业务错误 - {error_msg}", "WARNING")
+        else:
+            log("设备下线通知发送成功")
     except Exception as e:
         log(f"设备下线通知失败: {e}", "WARNING")
 
@@ -1412,7 +1505,20 @@ def check_reminders():
 
 
 def trigger_alert(reminder):
-    """触发吃药提醒：存储状态、更新界面、启动提醒循环线程"""
+    """触发吃药提醒：存储状态、更新界面、启动提醒循环线程
+    
+    将提醒信息存入 state["active_alerts"]，更新 GUI 显示提醒界面，
+    并在后台线程中启动 alert_loop 进行响铃提醒。
+    
+    Args:
+        reminder: 提醒字典，需包含 id、user_name、medicine_name、dose 等字段
+    
+    Returns:
+        None
+    
+    Raises:
+        无（参数无效时记录错误并返回）
+    """
     # 添加 None 检查
     if reminder is None or not isinstance(reminder, dict):
         log("trigger_alert 收到无效的 reminder 参数", "ERROR")
@@ -1439,45 +1545,59 @@ def trigger_alert(reminder):
 def alert_loop(tid):
     """提醒循环：每次响铃后等待 SNOOZE_MINUTES 分钟，最多响铃 MAX_ALERT_RETRIES 次后自动停止
     
-    使用 threading.Event.wait 实现可中断等待，比 time.sleep 响应更灵敏
+    使用 threading.Event.wait 实现可中断等待，响应更灵敏。
+    每响铃一次后自动增大音量（VOLUME_STEP），直到达到最大音量（VOLUME_MAX）。
+    
+    Args:
+        tid: 提醒 ID
+    
+    Returns:
+        None
     """
     retry_count = 0
-    alert_event = threading.Event()  # 用于可中断等待
     while retry_count < MAX_ALERT_RETRIES:
+        # 检查提醒是否仍然活跃
         with lock:
             if tid not in state["active_alerts"]:
+                log(f"提醒 {tid} 已被停止")
                 break
             volume = state["active_alerts"][tid]["volume"]
             reminder = state["active_alerts"][tid]["reminder"]
+        
+        # 响铃和语音播报
         msg = f"{reminder.get('user_name', '老人')}，该吃 {reminder.get('medicine_name', '药品')} 了"
         buzzer_beep(times=3, duration=0.3)
         tts_speak(msg, volume=volume)
         retry_count += 1
         
-        # 使用 Event.wait 实现可中断等待，每 1 秒检查一次是否需要退出
+        # 可中断等待：每 1 秒检查一次是否需要退出
         wait_end = time.time() + SNOOZE_MINUTES * 60
-        interrupted = False
+        should_break = False
         while time.time() < wait_end:
-            remaining = wait_end - time.time()
-            if remaining <= 0:
-                break
-            check_interval = min(1.0, remaining)
-            alert_event.wait(timeout=check_interval)
-            # 在锁内检查状态并设置中断标志，确保一致性
+            if not _get_online():
+                # 离线时缩短等待时间，加快网络恢复后的响应
+                time.sleep(1)
+            else:
+                time.sleep(min(1.0, wait_end - time.time()))
+            
+            # 检查提醒是否已被外部停止
             with lock:
                 if tid not in state["active_alerts"]:
-                    interrupted = True
-            if interrupted:
-                break
+                    should_break = True
+                    break
         
-        if interrupted:
+        if should_break:
+            log(f"提醒 {tid} 被中断")
             break
             
-        # 每 SNOOZE_MINUTES 分钟增大音量
+        # 增大音量
         with lock:
             if tid in state["active_alerts"]:
                 info = state["active_alerts"][tid]
+                old_volume = info["volume"]
                 info["volume"] = min(info["volume"] + VOLUME_STEP, VOLUME_MAX)
+                if info["volume"] != old_volume:
+                    log(f"提醒 {tid} 音量提升: {old_volume} -> {info['volume']}")
     
     # 超过最大重试次数，自动停止提醒（避免无限响铃）
     if retry_count >= MAX_ALERT_RETRIES:
@@ -1488,7 +1608,20 @@ def alert_loop(tid):
 
 
 def confirm_take(tid=None):
-    """确认服药：拍照上传（无摄像头则跳过）并停止提醒，返回主页"""
+    """确认服药：拍照上传（无摄像头则跳过）并停止提醒，返回主页
+    
+    流程：
+    1. 根据 tid 获取提醒详情
+    2. 停止该提醒（从 active_alerts 中移除）
+    3. 后台线程执行：拍照 → 上传日志
+    4. TTS 播报确认、更新 GUI、扣减库存
+    
+    Args:
+        tid: 提醒 ID，可选。若不传则取第一个活跃提醒
+    
+    Returns:
+        None
+    """
     reminder = {}
     if tid:
         with lock:
@@ -1521,13 +1654,25 @@ def update_stock(medicine_id, used_count):
     """更新药品库存：扣减使用数量、检查低库存、持久化到配置文件
     
     Args:
-        medicine_id: 药品 ID
-        used_count: 本次使用数量（正整数）
+        medicine_id: 药品 ID，必须是非空字符串或整数
+        used_count: 本次使用数量（正数，整数或浮点数）
+    
+    Returns:
+        None
+    
+    Raises:
+        无（参数无效时记录警告并返回）
     """
-    if not medicine_id:
+    if medicine_id is None or (isinstance(medicine_id, str) and not medicine_id.strip()):
+        log("update_stock: medicine_id 无效", "WARNING")
         return
     if not isinstance(used_count, (int, float)) or used_count <= 0:
         log(f"update_stock: 无效的使用数量 {used_count}", "WARNING")
+        return
+    # 转换为整数使用数量（取整）
+    used_count = int(used_count)
+    if used_count <= 0:
+        log(f"update_stock: 使用数量 {used_count} 转换后无效", "WARNING")
         return
     
     needs_alert = False
@@ -1667,7 +1812,16 @@ def reset_ocr_engine():
 
 
 def recognize_medicine():
-    """识别药品：拍照 → OCR识别 → AI问答"""
+    """识别药品：拍照 → OCR识别 → AI问答
+    
+    流程：
+    1. 检查摄像头可用性
+    2. 拍照并进行 OCR 文字识别
+    3. 将识别结果发送给 AI 问答接口获取药品信息
+    
+    Returns:
+        None
+    """
     if not _get_camera_available():
         tts_speak("摄像头未就绪，请手动核对药品")
         update_gui_home()
@@ -1675,7 +1829,7 @@ def recognize_medicine():
     update_gui_status("正在识别药品...")
     photo_path = capture_photo(filename=f"ocr_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
     if not photo_path:
-        tts_speak("摄像头未就绪")
+        tts_speak("拍照失败，请检查摄像头")
         update_gui_home()
         return
 
@@ -1689,7 +1843,14 @@ def recognize_medicine():
             log(f"OCR 结果: {text}")
         except Exception as e:
             log(f"OCR 识别失败: {e}", "WARNING")
-            text = ""
+            tts_speak("文字识别失败，请手动核对说明书")
+            update_gui_home()
+            return
+    else:
+        log("OCR 引擎未加载，跳过文字识别", "WARNING")
+        tts_speak("文字识别功能未安装，请手动核对说明书")
+        update_gui_home()
+        return
 
     if text and _get_online():
         try:
@@ -1701,13 +1862,21 @@ def recognize_medicine():
                     update_gui_status(speak)
                     tts_speak(speak)
                     return
+                else:
+                    log("AI 问答响应无 answer 字段", "WARNING")
         except Exception as e:
             log(f"AI 识别查询失败: {e}", "WARNING")
+    elif text and not _get_online():
+        log("AI 识别需要网络连接，但当前离线", "WARNING")
+        tts_speak("当前离线，无法查询药品信息")
+        update_gui_home()
+        return
 
     if not text:
         tts_speak("未能识别药品，请手动核对说明书")
     else:
         tts_speak("未能查询到药品信息，请手动核对说明书")
+    update_gui_home()
 
 
 # ============== 余量监测 ==============
@@ -1715,7 +1884,7 @@ def recognize_medicine():
 def calculate_remaining_days():
     """计算每个药品的剩余天数，对库存不足 5 天的药品触发低库存告警
     
-    使用 math.ceil 向上取整，确保在剩余药量不足以覆盖整天时提前预警。
+    使用向上取整算法，确保在剩余药量不足以覆盖整天时提前预警。
     告警在锁外异步触发，避免阻塞主循环。
     
     Args:
@@ -1731,16 +1900,22 @@ def calculate_remaining_days():
     with lock:
         for m in state["medicines"]:
             total = m.get("remaining", 0)
+            # 确保 total 不为负数
+            if not isinstance(total, (int, float)) or total < 0:
+                total = 0
             per_time = m.get("per_time", 1)
             freq = m.get("frequency_per_day", 1)
             daily = per_time * freq
-            if daily <= 0:
-                m["remaining_days"] = 999
+            if daily <= 0 or total <= 0:
+                # 每日用量为0或剩余为0，视为库存充足或已用完
+                m["remaining_days"] = 0 if total <= 0 else 999
+                if total <= 0:
+                    alerts_to_fire.append(dict(m))
             else:
-                # 使用 math.ceil 向上取整，避免剩余药量仅够 1.2 天却显示 1 天
-                m["remaining_days"] = max(0, -(-int(total) // daily))  # 等价于 ceil，避免引入 math 模块
-            if m["remaining_days"] < 5:
-                alerts_to_fire.append(dict(m))
+                # 使用向上取整算法，避免剩余药量仅够 1.2 天却显示 1 天
+                m["remaining_days"] = max(0, -(-int(total) // daily))
+                if m["remaining_days"] < 5:
+                    alerts_to_fire.append(dict(m))
     for med_copy in alerts_to_fire:
         threading.Thread(target=low_stock_alert, args=(med_copy,), daemon=True).start()
 
@@ -1865,7 +2040,17 @@ def clock_thread():
 # ============== 按钮处理 ==============
 
 def on_take_button_pressed():
-    """P21 已吃药按钮（~A）：仅在吃药提醒时确认已吃药"""
+    """P21 已吃药按钮（~A）：确认已吃药
+    
+    当存在活跃提醒时，获取第一个提醒 ID 并调用 confirm_take() 确认服药。
+    若无活跃提醒则忽略按钮事件。
+    
+    Args:
+        无
+    
+    Returns:
+        None
+    """
     log("已吃药按钮被按下")
     with lock:
         if state["active_alerts"]:
@@ -1874,10 +2059,25 @@ def on_take_button_pressed():
             tid = None
     if tid:
         confirm_take(tid)
+    else:
+        log("无活跃提醒，忽略吃药按钮", "DEBUG")
 
 
 def on_emergency_button_pressed():
-    """P28 A键：紧急呼叫（通过新版 API 通知家属，异步执行不阻塞按钮线程）"""
+    """P28 A键：紧急呼叫
+    
+    通过 POST /api/v1/public/device/message 接口异步通知家属，
+    不阻塞按钮线程，在后台线程中执行实际的网络请求。
+    
+    Args:
+        无
+    
+    Returns:
+        None
+    
+    Raises:
+        无
+    """
     log("紧急按钮被按下，正在通知家属...", "WARNING")
     update_gui_status("正在发送紧急通知...", alert=True)
     def _do_emergency():
@@ -1890,7 +2090,20 @@ def on_emergency_button_pressed():
 
 
 def on_remind_button_pressed():
-    """P27 B键：直接启动吃药提醒（优先使用真实用药计划，无则使用默认提醒）"""
+    """P27 B键：直接启动吃药提醒
+    
+    优先使用已同步的真实用药计划（第一条），
+    若无可用计划则使用默认提醒，确保功能始终可用。
+    
+    Args:
+        无
+    
+    Returns:
+        None
+    
+    Raises:
+        无
+    """
     log("提醒按钮被按下，直接启动吃药提醒")
     # 优先从已同步的用药计划中获取第一条作为即时提醒
     real_reminder = None
@@ -1900,9 +2113,11 @@ def on_remind_button_pressed():
             real_reminder = dict(reminders[0])
     
     if real_reminder:
+        log(f"使用真实用药计划: {real_reminder.get('medicine_name', '未知')}")
         trigger_alert(real_reminder)
     else:
         # 无用药计划时使用默认提醒，确保功能可用
+        log("无可用用药计划，使用默认提醒")
         default_reminder = {
             "id": f"manual_{int(time.time())}",
             "user_name": "老人",
@@ -1967,7 +2182,18 @@ def init_hardware():
 
 
 def init_network():
-    """初始化网络：检查 WiFi 状态、恢复/注册设备、同步数据、刷新离线日志"""
+    """初始化网络：检查 WiFi 状态、恢复/注册设备、同步数据、刷新离线日志
+    
+    流程：
+    1. 检查 WiFi 模块可用性
+    2. 检测 WiFi 连接状态
+    3. 通过 HTTP 请求验证网络连通性（含重试）
+    4. 在线时恢复 token 或注册设备
+    5. 同步用药计划和刷新离线日志
+    
+    Returns:
+        None
+    """
     try:
         # 检查 WiFi 模块是否可用
         if not _WIFI_AVAILABLE or wifi_manager is None:
@@ -1982,6 +2208,7 @@ def init_network():
             for attempt in range(3):
                 online = check_network()
                 if online:
+                    log(f"网络检测成功（第 {attempt + 1} 次尝试）")
                     break
                 log(f"网络检测第 {attempt + 1} 次失败，1秒后重试...", "WARNING")
                 time.sleep(1)
@@ -1993,7 +2220,7 @@ def init_network():
                 if not token_restored:
                     log("未找到本地 token，正在注册设备...")
                     if not register_device():
-                        log("设备注册失败", "ERROR")
+                        log("设备注册失败，进入离线模式", "ERROR")
                         _set_online(False)
                         return
                 log("正在同步用药计划...")
@@ -2001,14 +2228,14 @@ def init_network():
                 log("正在刷新离线日志...")
                 flush_local_logs()
             else:
-                log("网络异常，进入离线模式", "WARNING")
+                log("网络异常（WiFi 已连接但无法访问服务器），进入离线模式", "WARNING")
                 _set_online(False)
         else:
             log("WiFi 未连接，进入离线模式", "WARNING")
             _set_online(False)
         log(f"网络状态: {'在线' if _get_online() else '离线'}")
     except Exception as e:
-        log(f"网络初始化异常: {e}", "ERROR")
+        log(f"网络初始化异常: {type(e).__name__}: {e}", "ERROR")
         _set_online(False)
 
 

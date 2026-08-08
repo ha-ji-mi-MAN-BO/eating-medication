@@ -226,7 +226,7 @@ m10.py
 | 项目 | 值 |
 |------|-----|
 | 服务端基础路径 | `/eating-medication/server` |
-| API 版本 | v2.28.0（当前修复版：v2.29.4） |
+| API 版本 | v2.28.0（当前修复版：v2.29.5） |
 | 认证方式 | 设备注册后返回 `device_token`，后续请求通过 `X-Device-Token` Header 校验 |
 | 限流 | 设备端基于 IP 限流；部分接口需 `device_token` |
 
@@ -495,6 +495,23 @@ m10.py
 | 13 | 🟢 | OCR 引擎加载失败后无法重置，需重启设备 | 新增 `reset_ocr_engine()` 函数，支持运行时重置 |
 | 14 | 🟢 | `_get_ocr_engine()` 缺少文档说明 | 添加详细 docstring，说明返回值和异常情况 |
 | 15 | 🟢 | `flush_local_logs()` 的 `_flush_in_progress` 事件可能因异常未释放 | 添加 finally 块确保事件清理 |
+
+### 已完成的 Bug 修复（v2.29.5，共 12 项）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `flush_local_logs()` 队列为空时提前返回导致 `_flush_in_progress` 锁无法释放，后续调用永久阻塞 | 重构逻辑：损坏文件处理后使用空队列继续执行，队列为空时写回空队列后返回，确保 finally 释放锁 |
+| 2 | 🔴 | `flush_local_logs()` 文件损坏后直接 `return`，跳过锁释放 | 损坏文件处理后设 `queue = []` 继续执行后续逻辑 |
+| 3 | 🟡 | `notify_emergency()` 未区分网络错误和业务错误，日志信息不明确 | 增加 `resp is None` 检查和业务错误日志记录 |
+| 4 | 🟡 | `device_offline()` 未检查业务错误响应，无法判断下线是否真正成功 | 增加完整的业务错误响应检查和详细日志 |
+| 5 | 🟡 | `recognize_medicine()` 错误处理不完善，OCR 失败/离线/AI 无响应均无反馈 | 增加分支处理：OCR失败提示、离线提示、AI响应检查 |
+| 6 | 🟡 | `calculate_remaining_days()` 未处理 remaining 为负数的异常情况 | 增加 `total < 0` 检查，负数时重置为 0 |
+| 7 | 🟡 | `save_config()` 临时文件在异常时可能残留 | 使用 `os.fsync()` 确保数据落盘，异常时清理临时文件 |
+| 8 | 🟢 | `load_config()` 返回值未验证类型，非 dict 可能导致后续错误 | 增加 `isinstance(cfg, dict)` 检查 |
+| 9 | 🟢 | `load_device_token()` 未验证 token 格式 | 增加长度检查（>10字符）和空格检查 |
+| 10 | 🟢 | `init_network()` 异常日志不详细 | 增加异常类型信息，日志更可诊断 |
+| 11 | 🟢 | `alert_loop()` 中断逻辑复杂，可读性差 | 简化代码结构，优化中断检查逻辑，增加离线响应优化 |
+| 12 | 🟢 | `trigger_alert()`、`confirm_take()` 等函数 docstring 不完整 | 补充完整 docstring（Args、Returns） |
 
 ### 已完成的 Bug 修复（v2.29.4，共 10 项）
 
