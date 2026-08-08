@@ -29,9 +29,6 @@ from pathlib import Path
 from unihiker import GUI
 from pinpong.board import Board, Pin
 from dfrobot_huskylensv2 import *
-from unihiker_connet_wifi import *
-wifi_manager = WiFiManager()
-response_success = wifi_manager.connect_wifi("666", "15756491077")
 
 # ============== 配置区 ==============
 BASE_URL = "https://my-website.ccwu.cc/eating-medication/family"
@@ -51,7 +48,7 @@ LOG_FILE = "/root/medication_local.log"
 PHOTO_DIR = "/root/medication_photos"
 QUEUE_FILE = "/root/medication_log_queue.json"
 
-WIFI_SSID = "666"
+WIFI_SSID = "TP-LINK_5G_36DB"
 WIFI_PASSWORD = "15756491077"
 
 # 硬件引脚
@@ -138,9 +135,16 @@ def save_config(cfg):
 
 def connect_wifi(ssid, password):
     """连接 WiFi，返回是否成功"""
-    if wifi_manager.is_wifi_connected():
-        return True
-    elif (not wifi_manager.is_wifi_connected()):
+    if not ssid:
+        return False
+    try:
+        cmd = f'nmcli dev wifi connect "{ssid}" password "{password}"'
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+        ok = r.returncode == 0 or "successfully" in r.stdout.lower() or "已激活" in r.stdout
+        log(f"WiFi 连接: {r.stdout.strip()}")
+        return ok
+    except Exception as e:
+        log(f"WiFi 连接异常: {e}", "ERROR")
         return False
 
 
