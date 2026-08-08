@@ -51,9 +51,6 @@ LOG_FILE = "/root/medication_local.log"
 PHOTO_DIR = "/root/medication_photos"
 QUEUE_FILE = "/root/medication_log_queue.json"
 
-WIFI_SSID = "666"
-WIFI_PASSWORD = "15756491077"
-
 # 硬件引脚
 BUZZER_PIN = Pin.P25      # 蜂鸣器
 BUTTON_TAKE_PIN = Pin.P21  # 已吃药按钮（~A，按下高电平，松开低电平）
@@ -134,14 +131,6 @@ def save_config(cfg):
             json.dump(cfg, f, ensure_ascii=False, indent=2)
     except Exception as e:
         log(f"保存配置失败: {e}", "ERROR")
-
-
-def connect_wifi(ssid, password):
-    """连接 WiFi，返回是否成功"""
-    if wifi_manager.is_wifi_connected():
-        return True
-    elif (not wifi_manager.is_wifi_connected()):
-        return False
 
 
 def check_network():
@@ -798,10 +787,7 @@ def init_hardware():
 
 
 def init_network():
-    cfg = load_config()
-    ssid = cfg.get("wifi_ssid", WIFI_SSID)
-    pwd = cfg.get("wifi_password", WIFI_PASSWORD)
-    if ssid and connect_wifi(ssid, pwd):
+    if wifi_manager.is_wifi_connected():
         state["online"] = check_network()
         if state["online"]:
             register_device()
