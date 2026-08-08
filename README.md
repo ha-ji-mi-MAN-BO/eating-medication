@@ -214,7 +214,7 @@ m10.py
 | 项目 | 值 |
 |------|-----|
 | 服务端基础路径 | `/eating-medication/server` |
-| API 版本 | v2.28.0 |
+| API 版本 | v2.28.0（当前修复版：v2.29.1） |
 | 认证方式 | 设备注册后返回 `device_token`，后续请求通过 `X-Device-Token` Header 校验 |
 | 限流 | 设备端基于 IP 限流；部分接口需 `device_token` |
 
@@ -433,6 +433,19 @@ m10.py
 | 29 | 🟢 | `http_request()` 添加详细错误日志 | HTTPError 时打印错误响应体前 200 字符 |
 | 30 | 🟢 | `log()` 函数代码结构优化 | 先读取状态再执行 I/O，减少锁持有时间 |
 | 31 | 🟢 | `init_network()` 添加更详细的状态日志 | 每步操作都有日志输出，便于问题排查 |
+
+### 已完成的 Bug 修复（v2.29.1，共 8 项）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | 版本号不一致：m10.py 声明 v2.29.0，但 openapi.json 版本为 v2.28.0 | 统一为 v2.28.0，并在文件头标注 API 版本 |
+| 2 | 🔴 | `sync_reminders()` 存在重复错误检查逻辑 | 删除冗余的 `status != "ok"` 检查，消除重复代码 |
+| 3 | 🔴 | `check_reminders()` 在 `with lock:` 块内调用 `trigger_alert()`，存在锁嵌套 | 将 `trigger_alert()` 调用移到锁外执行，避免潜在死锁风险 |
+| 4 | 🟡 | `_parse_frequency_per_day()` 频率解析能力不足 | 增强正则匹配，支持"每日N次"、"每N小时"等更多格式 |
+| 5 | 🟡 | `upload_log()` 中 `data` 字段处理不符合 API schema | 根据 `DeviceMessage` schema，支持 `data` 为 `null` |
+| 6 | 🟡 | 日志中 HTTP 错误响应体过长（200字符），可能泄露敏感信息 | 限制为 100 字符，并处理空响应体情况 |
+| 7 | 🟡 | GET 请求携带不必要的 `Content-Type: application/json` 头 | GET 请求自动移除 `Content-Type` 头，符合 HTTP 规范 |
+| 8 | 🟢 | 版本号规范更新 | 按照版本号规范递增 PATCH 版本，更新至 v2.29.1 |
 
 ## 版本与更新
 

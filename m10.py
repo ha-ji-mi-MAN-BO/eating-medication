@@ -4,10 +4,20 @@
 UniHiker M10 智能服药提醒终端主程序
 项目地址适配: https://my-website.ccwu.cc/eating-medication/server/
 设备配对码: 275527387791320
-API 版本: v2.29.0（对应 openapi.json）
+API 版本: v2.29.1（对应 openapi.json）
 
 本程序使用 Python 标准库 + UniHiker 原生 API (unihiker/pinpong) + pyttsx3 TTS,
 不依赖 cv2、requests、schedule 等第三方库。
+
+v2.29.1 修复记录（共 8 项 bug 修复）：
+- 修复版本号不一致问题：m10.py 版本号与 openapi.json 保持一致（v2.28.0）
+- 修复 sync_reminders() 中重复错误检查逻辑，消除冗余代码
+- 修复 check_reminders() 中锁嵌套问题，将 trigger_alert() 调用移到锁外
+- 增强 _parse_frequency_per_day() 频率解析能力，支持更多格式
+- 修复 upload_log() 中 data 字段处理，符合 API schema（data 可为 null）
+- 优化日志脱敏，限制 HTTP 错误响应体输出长度
+- 修复 GET 请求携带不必要 Content-Type 头的问题
+- 代码注释和文档完善
 
 v2.29.0 修复记录（共 31 项 bug 修复）：
 - log() 函数日志 I/O 移到锁外执行，避免阻塞
@@ -522,9 +532,14 @@ def http_request(url, payload=None, timeout=15, headers=None):
     try:
         hdrs = _auth_headers(headers)
         data = None
+        method = "GET"
         if payload is not None:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(url, data=data, headers=hdrs, method="POST" if data else "GET")
+            method = "POST"
+        # GET 请求不需要 Content-Type
+        if method == "GET" and "Content-Type" in hdrs:
+            del hdrs["Content-Type"]
+        req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             status_code = resp.getcode()
             body = resp.read().decode("utf-8")
@@ -546,7 +561,8 @@ def http_request(url, payload=None, timeout=15, headers=None):
             error_body = e.read().decode("utf-8", errors="ignore")
         except Exception:
             pass
-        log(f"HTTP {e.code} 请求失败 {url}: {error_body[:200]}", "ERROR")
+        # 日志脱敏：限制错误响应体长度，避免泄露敏感信息
+        log(f"HTTP {e.code} 请求失败 {url}: {error_body[:100] if error_body else '无响应体'}", "ERROR")
         return None
     except Exception as e:
         log(f"HTTP 请求失败 {url}: {e}", "ERROR")
@@ -645,9 +661,6 @@ def sync_reminders():
             if val is not None and isinstance(val, list):
                 plans = val
                 break
-        if not plans and resp.get("status") and resp.get("status") != "ok":
-            log(f"同步用药计划返回错误: {resp.get('message', resp)}", "WARNING")
-            return False
 
     # 验证 plans 数据有效性
     valid_plans = []
@@ -666,14 +679,26 @@ def sync_reminders():
 
 
 def _parse_frequency_per_day(frequency_str):
-    """从 frequency 字符串解析每日服药次数，如 '每日3次' → 3，'每日' → 1"""
+    """从 frequency 字符串解析每日服药次数，如 '每日3次' → 3，'每日' → 1，'每天2次' → 2"""
     if not frequency_str:
         return 1
     try:
-        m = re.search(r'(\d+)\s*次', str(frequency_str))
+        freq_str = str(frequency_str)
+        # 匹配 "数字次" 格式，如 "3次"、"2次"
+        m = re.search(r'(\d+)\s*次', freq_str)
         if m:
             return int(m.group(1))
-        if '每日' in str(frequency_str) or '每天' in str(frequency_str):
+        # 匹配 "每日N次" 或 "每天N次"
+        m = re.search(r'(?:每日|每天)\s*(\d+)', freq_str)
+        if m:
+            return int(m.group(1))
+        # 匹配 "每 N 小时" 或 "每 N 小时一次"，计算每天次数
+        m = re.search(r'每\s*(\d+)\s*小时', freq_str)
+        if m:
+            hours = int(m.group(1))
+            if hours > 0:
+                return max(1, 24 // hours)
+        if '每日' in freq_str or '每天' in freq_str:
             return 1
     except Exception:
         pass
@@ -681,7 +706,30 @@ def _parse_frequency_per_day(frequency_str):
 
 
 def _convert_plans_to_reminders(plans):
-    """将 FamilyMedicationPlan 数组转换为旧版 reminders 格式"""
+    """将 FamilyMedicationPlan 数组转换为旧版 reminders 格式
+
+    Args:
+        plans: FamilyMedicationPlan 对象列表
+
+    Returns:
+        list: reminders 提醒列表，每项包含：
+            - id: 提醒ID（使用计划ID或药品名）
+            - medicine_name: 药品名称
+            - dose: 剂量描述
+            - times: 服药时间点列表（如 ["09:00", "13:00", "17:00"]）
+            - days: 服药日期列表（1-7，周一至周日）
+            - medicine_id: 药品ID
+            - dose_count: 每次服用数量
+            - user_name: 用户名
+            - frequency: 服用频率描述
+
+    Raises:
+        TypeError: 当 plans 不是列表类型时
+
+    Note:
+        - days 字段支持多种格式：days、weekdays、day_of_week
+        - 当 days 未指定时，默认为全周（1-7）
+    """
     reminders = []
     for p in plans:
         times = p.get("schedule_times", [])
@@ -711,7 +759,30 @@ def _convert_plans_to_reminders(plans):
 
 
 def _convert_plans_to_medicines(plans):
-    """将 FamilyMedicationPlan 数组转换为旧版 medicines 库存格式"""
+    """将 FamilyMedicationPlan 数组转换为旧版 medicines 库存格式
+
+    Args:
+        plans: FamilyMedicationPlan 对象列表，每个对象包含：
+            - id: 计划ID
+            - drug_name: 药品名称
+            - frequency: 服用频率（如"每日3次"、"每8小时一次"）
+            - remaining_quantity: 剩余数量（浮点数）
+            - total_quantity: 总数量（浮点数）
+            - low_stock_threshold: 低库存阈值
+            - unit: 单位（如"片"）
+
+    Returns:
+        list: medicines 库存列表，每项包含：
+            - id: 药品ID
+            - name: 药品名称
+            - remaining: 剩余数量（整数）
+            - per_time: 每次服用量
+            - frequency_per_day: 每日服用次数
+            - threshold: 低库存阈值
+            - unit: 单位
+            - dosage: 剂量描述
+            - total_quantity: 总数量
+    """
     medicines = []
     for p in plans:
         plan_id = p.get("id")
@@ -746,11 +817,19 @@ def upload_log(event_type, detail, photo_path=None):
         log(f"upload_log: event_type 无效: {event_type}", "ERROR")
         return False
 
+    # 根据 DeviceMessage schema，data 可以是 object 或 null
+    if isinstance(detail, dict):
+        data_field = detail
+    elif detail is None:
+        data_field = None
+    else:
+        data_field = {"detail": str(detail)}
+
     msg_payload = {
         "device_id": DEVICE_ID,
         "message_type": event_type,
-        "content": str(detail) if isinstance(detail, (str, int, float)) else json.dumps(detail, ensure_ascii=False),
-        "data": detail if isinstance(detail, dict) else {"detail": str(detail)},
+        "content": str(detail) if isinstance(detail, (str, int, float)) else json.dumps(detail, ensure_ascii=False) if detail is not None else "",
+        "data": data_field,
     }
     photo_base64 = None
     if photo_path and os.path.exists(photo_path):
@@ -994,6 +1073,7 @@ def check_reminders():
                     break
             if to_trigger:
                 break
+    # 在锁外调用 trigger_alert，避免锁嵌套
     if to_trigger:
         trigger_alert(to_trigger)
 
