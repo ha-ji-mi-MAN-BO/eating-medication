@@ -335,7 +335,7 @@ m10.py
 - 旧版 `sync_reminders()` 接收 `{code, data: {reminders, medicines}}`
 - 新版 `sync_reminders()` 接收 `FamilyMedicationPlan[]`，通过 `_convert_plans_to_reminders()` / `_convert_plans_to_medicines()` 自动转换为兼容的内部格式
 
-### 已完成的 Bug 修复（v2.28.2，共 23 项）
+### 已完成的 Bug 修复（v2.28.3，共 33 项）
 
 | # | 严重度 | 描述 | 修复方案 |
 |---|--------|------|----------|
@@ -362,6 +362,16 @@ m10.py
 | 21 | 🟢 | `FAMILY_BASE_URL` 常量已无引用（API 迁移后） | 删除死代码 |
 | 22 | 🟢 | `from dfrobot_huskylensv2 import *` 无实际使用 | 删除死导入 |
 | 23 | 🟢 | 紧急按钮注释过时（"仅记录日志"） | 更新为"联网通知家属" |
+| 24 | 🔴 | `state["online"]` 在 10+ 处无锁读写（`low_stock_alert`/`recognize_medicine`/GUI/`main_loop`/`init_network`） | 新增 `_get_online()`/`_set_online()` 辅助函数，统一加锁保护 |
+| 25 | 🔴 | `state["camera_available"]` 无锁读写（`init_hardware` 写，`confirm_take`/`recognize_medicine` 读） | 新增 `_get_camera_available()`/`_set_camera_available()` 辅助函数 |
+| 26 | 🔴 | 配置文件竞态：`update_stock()` 与 `main_loop` 可能同时写 `medication_config.json` | 新增 `_config_lock` 保护 `load_config()`/`save_config()` |
+| 27 | 🔴 | `update_stock()` 锁外读取 `state["medicines"]` 用于持久化，其他线程可能已修改 | 在锁内采集 `medicines_snapshot = list(state["medicines"])` |
+| 28 | 🔴 | `init_network()` 同步阻塞主线程最长 30+ 秒（网络检查 + 注册 + 同步） | 改为 `threading.Thread` 异步执行 |
+| 29 | 🔴 | `confirm_take()` 中 `capture_photo()` 阻塞 `button_thread` 最长 10 秒 | 将拍照 + 上传全部移到 `_do_confirm_upload` 后台线程，超时降为 5 秒 |
+| 30 | 🟡 | `_convert_plans_to_medicines()` `frequency_per_day` 恒为 1，库存阈值计算不准确 | 新增 `_parse_frequency_per_day()` 从 `frequency` 字段解析（如"每日3次"→3） |
+| 31 | 🟡 | `_convert_plans_to_medicines()` `remaining` 字段丢失（默认 0） | 改用 `int(remaining_quantity)` |
+| 32 | 🟡 | `notify_emergency()` 紧急联系人硬编码 "120" | 从配置文件 `emergency_contact` 读取，默认 "120" |
+| 33 | 🟢 | `import re` 在 `_parse_frequency_per_day()` 内动态导入 | 移至文件顶部导入 |
 
 ## 版本与更新
 

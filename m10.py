@@ -9,13 +9,13 @@ API 版本: v2.28.0（对应 openapi.json）
 本程序使用 Python 标准库 + UniHiker 原生 API (unihiker/pinpong) + pyttsx3 TTS,
 不依赖 cv2、requests、schedule 等第三方库。
 
-v2.28.2 修复记录（共 23 项 bug 修复）：
-- API 全面迁移至 /api/v1/public/* 新版路径
-- 引入 X-Device-Token 认证机制（自动持久化）
-- 修复 12 项多线程竞态条件（RLock + 新增 _gui_lock）
-- 移除 4 处阻塞 button_thread 的同步网络调用
-- 文件 I/O 全部移到锁外执行
-- OCR 引擎延迟加载并缓存
+v2.28.3 修复记录（共 33 项 bug 修复）：
+- state["online"]/state["camera_available"] 全面加锁保护（_get_online/_set_online 等辅助函数）
+- 新增 _config_lock 保护配置文件读写，防止多线程 JSON 损坏
+- init_network、confirm_take 改为异步执行，不再阻塞 button_thread
+- update_stock 在锁内采集 medicines_snapshot，消除锁外读竞态
+- _convert_plans_to_medicines 正确映射 remaining_quantity 和 frequency_per_day
+- notify_emergency 紧急联系人从配置文件读取
 """
 
 import os
@@ -24,6 +24,7 @@ os.environ["DISPLAY"] = os.environ.get("DISPLAY") or ":0"
 
 import time
 import json
+import re
 import base64
 import queue
 import threading
@@ -102,6 +103,7 @@ state = {
 
 lock = threading.RLock()
 _gui_lock = threading.Lock()
+_config_lock = threading.Lock()  # 保护配置文件的读写，避免多线程同时写入导致 JSON 损坏
 
 gui = None
 buzzer = None
@@ -110,6 +112,26 @@ button_emergency = None
 button_remind = None
 
 # ============== 工具函数 ==============
+
+def _get_online():
+    """线程安全读取在线状态"""
+    with lock:
+        return state["online"]
+
+def _set_online(value):
+    """线程安全设置在线状态"""
+    with lock:
+        state["online"] = value
+
+def _get_camera_available():
+    """线程安全读取摄像头可用性"""
+    with lock:
+        return state["camera_available"]
+
+def _set_camera_available(value):
+    """线程安全设置摄像头可用性"""
+    with lock:
+        state["camera_available"] = value
 
 def log(msg, level="INFO"):
     line = f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [{level}] {msg}"
@@ -126,21 +148,23 @@ def ensure_dirs():
 
 
 def load_config():
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            log(f"读取配置失败: {e}", "ERROR")
-    return {}
+    with _config_lock:
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                log(f"读取配置失败: {e}", "ERROR")
+        return {}
 
 
 def save_config(cfg):
-    try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        log(f"保存配置失败: {e}", "ERROR")
+    with _config_lock:
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            log(f"保存配置失败: {e}", "ERROR")
 
 
 def check_network():
@@ -310,7 +334,7 @@ def buzzer_beep(times=1, duration=0.2):
         log(f"蜂鸣器异常: {e}", "ERROR")
 
 
-def capture_photo(filename=None):
+def capture_photo(filename=None, timeout=10):
     """使用系统 fswebcam 命令拍照，不依赖 cv2"""
     if filename is None:
         filename = f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
@@ -318,7 +342,7 @@ def capture_photo(filename=None):
     try:
         # 优先使用 fswebcam（Linux 下 USB/CSI 摄像头通用）
         cmd = f"fswebcam -r 640x480 --no-banner {path}"
-        r = subprocess.run(cmd, shell=True, capture_output=True, timeout=10)
+        r = subprocess.run(cmd, shell=True, capture_output=True, timeout=timeout)
         if r.returncode == 0 and os.path.exists(path) and os.path.getsize(path) > 0:
             return path
         log(f"fswebcam 失败: {r.stderr.decode('utf-8', errors='ignore')}", "WARNING")
@@ -421,6 +445,21 @@ def sync_reminders():
     return False
 
 
+def _parse_frequency_per_day(frequency_str):
+    """从 frequency 字符串解析每日服药次数，如 '每日3次' → 3，'每日' → 1"""
+    if not frequency_str:
+        return 1
+    try:
+        m = re.search(r'(\d+)\s*次', str(frequency_str))
+        if m:
+            return int(m.group(1))
+        if '每日' in str(frequency_str) or '每天' in str(frequency_str):
+            return 1
+    except Exception:
+        pass
+    return 1
+
+
 def _convert_plans_to_reminders(plans):
     """将 FamilyMedicationPlan 数组转换为旧版 reminders 格式"""
     reminders = []
@@ -428,6 +467,7 @@ def _convert_plans_to_reminders(plans):
         times = p.get("schedule_times", [])
         drug_name = p.get("drug_name", "")
         plan_id = p.get("id")
+        freq = p.get("frequency", "每日")
         reminders.append({
             "id": plan_id if plan_id is not None else drug_name,
             "medicine_name": drug_name,
@@ -437,6 +477,7 @@ def _convert_plans_to_reminders(plans):
             "medicine_id": plan_id,
             "dose_count": 1,
             "user_name": "老人",
+            "frequency": freq,
         })
     return reminders
 
@@ -447,12 +488,14 @@ def _convert_plans_to_medicines(plans):
     for p in plans:
         plan_id = p.get("id")
         drug_name = p.get("drug_name", "")
+        freq = p.get("frequency", "每日")
+        freq_per_day = _parse_frequency_per_day(freq)
         medicines.append({
             "id": plan_id if plan_id is not None else drug_name,
             "name": drug_name,
-            "remaining": p.get("remaining_quantity", 0),
+            "remaining": int(p.get("remaining_quantity", 0)),
             "per_time": 1,
-            "frequency_per_day": 1,
+            "frequency_per_day": freq_per_day,
             "threshold": p.get("low_stock_threshold", 5),
             "unit": p.get("unit", "片"),
             "dosage": p.get("dosage", "1片"),
@@ -553,8 +596,10 @@ def query_refill(medicine_id):
     return http_request(API_AI_ASK, payload)
 
 
-def notify_emergency(contact="120"):
+def notify_emergency():
     """紧急通知家属（POST /device/message，message_type=emergency）"""
+    cfg = load_config()
+    contact = cfg.get("emergency_contact", "120")
     payload = {
         "device_id": DEVICE_ID,
         "message_type": "emergency",
@@ -670,26 +715,29 @@ def alert_loop(tid):
 
 def confirm_take(tid=None):
     """确认服药：拍照上传（无摄像头则跳过）并停止提醒，返回主页"""
-    photo_path = None
-    if state.get("camera_available"):
-        photo_path = capture_photo(filename=f"take_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
     reminder = {}
     if tid:
         with lock:
             if tid in state["active_alerts"]:
-                reminder = state["active_alerts"][tid]["reminder"]
+                reminder = dict(state["active_alerts"][tid]["reminder"])
                 del state["active_alerts"][tid]
 
-    detail = {
-        "action": "confirm_take",
-        "medicine": reminder.get("medicine_name", ""),
-        "user": reminder.get("user_name", ""),
-        "photo_path": photo_path,
-    }
-    # 日志上传改为异步，不阻塞按钮线程
-    threading.Thread(
-        target=upload_log, args=("confirm_take", detail, photo_path), daemon=True
-    ).start()
+    def _do_confirm_upload():
+        photo_path = None
+        if _get_camera_available():
+            photo_path = capture_photo(
+                filename=f"take_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg",
+                timeout=5,
+            )
+        detail = {
+            "action": "confirm_take",
+            "medicine": reminder.get("medicine_name", ""),
+            "user": reminder.get("user_name", ""),
+            "photo_path": photo_path,
+        }
+        upload_log("confirm_take", detail, photo_path)
+
+    threading.Thread(target=_do_confirm_upload, daemon=True).start()
     tts_speak("已记录服药")
     update_gui_home()
     update_stock(reminder.get("medicine_id"), reminder.get("dose_count", 1))
@@ -700,6 +748,7 @@ def update_stock(medicine_id, used_count):
         return
     needs_alert = False
     alert_medicine = None
+    medicines_snapshot = None
     with lock:
         for m in state["medicines"]:
             if m.get("id") == medicine_id:
@@ -710,10 +759,11 @@ def update_stock(medicine_id, used_count):
                     needs_alert = True
                     alert_medicine = dict(m)
                 break
+        medicines_snapshot = list(state["medicines"])
     # 文件 I/O 在锁外执行，避免阻塞其他线程
     try:
         cfg = load_config()
-        cfg["medicines"] = state["medicines"]
+        cfg["medicines"] = medicines_snapshot
         save_config(cfg)
     except Exception as e:
         log(f"库存持久化失败: {e}", "ERROR")
@@ -727,7 +777,7 @@ def low_stock_alert(medicine):
     log(msg)
     tts_speak(msg)
     update_gui_status(msg, alert=True)
-    if state["online"]:
+    if _get_online():
         resp = query_refill(medicine.get("id"))
         if resp:
             answer = resp.get("answer", "")
@@ -758,7 +808,7 @@ def _get_ocr_engine():
 
 
 def recognize_medicine():
-    if not state.get("camera_available"):
+    if not _get_camera_available():
         tts_speak("摄像头未就绪，请手动核对药品")
         update_gui_home()
         return
@@ -781,7 +831,7 @@ def recognize_medicine():
             log(f"OCR 识别失败: {e}", "WARNING")
             text = ""
 
-    if state["online"] and text.strip():
+    if _get_online() and text.strip():
         resp = query_drug_by_ocr(text.strip())
         if resp:
             answer = resp.get("answer", "")
@@ -842,7 +892,7 @@ def update_gui_status(text, alert=False):
         gui.clear()
         gui.draw_text(x=120, y=40, text="智能服药提醒", font_size=20, color="#000000", origin="center")
         gui.draw_text(x=120, y=100, text=text, font_size=16, color=color, origin="center")
-        status = "在线" if state["online"] else "离线模式"
+        status = "在线" if _get_online() else "离线模式"
         gui.draw_text(x=120, y=200, text=status, font_size=14, color="#666666", origin="center")
     except Exception as e:
         log(f"GUI 更新失败: {e}", "ERROR")
@@ -859,7 +909,7 @@ def update_gui_home():
             _clock_date_obj = None
             _clock_time_obj = None
         gui.draw_text(x=120, y=30, text="智能服药提醒", font_size=18, color="#000000", origin="center")
-        status = "在线" if state["online"] else "离线模式"
+        status = "在线" if _get_online() else "离线模式"
         gui.draw_text(x=120, y=65, text=status, font_size=12, color="#666666", origin="center")
         now = datetime.datetime.now()
         # 日期行
@@ -989,7 +1039,7 @@ def init_hardware():
             gui = None
         # 检测摄像头是否可用（通过 fswebcam 能否执行）
         r = subprocess.run("which fswebcam", shell=True, capture_output=True)
-        state["camera_available"] = r.returncode == 0
+        _set_camera_available(r.returncode == 0)
         log("硬件初始化完成")
     except Exception as e:
         log(f"硬件初始化异常: {e}", "ERROR")
@@ -997,16 +1047,16 @@ def init_hardware():
 
 def init_network():
     if wifi_manager.is_wifi_connected():
-        state["online"] = check_network()
-        if state["online"]:
+        _set_online(check_network())
+        if _get_online():
             # 尝试从本地恢复 device_token，否则重新注册
             if not load_device_token():
                 register_device()
             sync_reminders()
             flush_local_logs()
     else:
-        state["online"] = False
-    log(f"网络状态: {'在线' if state['online'] else '离线'}")
+        _set_online(False)
+    log(f"网络状态: {'在线' if _get_online() else '离线'}")
 
 
 def button_thread():
@@ -1051,7 +1101,7 @@ def main_loop():
         # 每小时同步一次数据
         if now.hour != last_hour:
             last_hour = now.hour
-            if state["online"]:
+            if _get_online():
                 sync_reminders()
 
         # 每 6 小时检查库存
@@ -1062,14 +1112,14 @@ def main_loop():
         # 每 30 分钟刷新离线日志
         if time.time() - last_flush > 30 * 60:
             last_flush = time.time()
-            if state["online"]:
+            if _get_online():
                 flush_local_logs()
 
         # 每 30 秒检查网络恢复
-        if not state["online"] and time.time() - last_reconnect_check > 30:
+        if not _get_online() and time.time() - last_reconnect_check > 30:
             last_reconnect_check = time.time()
             if check_network():
-                state["online"] = True
+                _set_online(True)
                 # 尝试恢复 token，否则重新注册
                 if not load_device_token():
                     register_device()
@@ -1086,7 +1136,8 @@ def main():
     init_hardware()
     init_speech()
     update_gui_status("正在连接网络...")
-    init_network()
+    # 网络初始化改为异步，不阻塞主界面显示
+    threading.Thread(target=init_network, daemon=True).start()
 
     threading.Thread(target=button_thread, daemon=True).start()
     # 启动主界面时钟刷新线程（每秒更新年月日时分秒）
