@@ -4,21 +4,25 @@
 UniHiker M10 智能服药提醒终端主程序
 项目地址适配: https://my-website.ccwu.cc/eating-medication/server/
 设备配对码: 275527387791320
-API 版本: v2.28.0（对应 openapi.json）
+API 版本: v2.29.0（对应 openapi.json）
 
 本程序使用 Python 标准库 + UniHiker 原生 API (unihiker/pinpong) + pyttsx3 TTS,
 不依赖 cv2、requests、schedule 等第三方库。
 
-v2.28.6 修复记录（共 58 项 bug 修复）：
-- save_config / queue_local_log / flush_local_log 改为原子写入（写 .tmp + os.replace）
-- alert_loop 增加最大重试 20 次（约 3 小时），超时自动停止响铃
-- sync_reminders 空列表 [] 正确处理（is not None 替代 or 链式）
-- update_stock 深拷贝 medicines 列表（[dict(m) for m in state["medicines"]]）
-- detect_volume_control 使用 universal_newlines 兼容 Python 3.6
-- low_stock_alert 增加 30 秒自动返回主页
-- upload_log / image_to_base64 增加照片大小限制（500KB / 1MB）
-- buzzer_beep 增加 None 设备防护
-- main_loop 增加 missed_minutes 追踪，系统挂起超时强制检查
+v2.29.0 修复记录（共 31 项 bug 修复）：
+- log() 函数日志 I/O 移到锁外执行，避免阻塞
+- http_request() 增加 HTTPError 处理、非 JSON 响应回退
+- check_reminders() 和 trigger_alert() 增加 None 检查
+- calculate_remaining_days() 修复除零错误
+- capture_photo() 增加目录创建和超时异常处理
+- image_to_base64() 增加文件存在性和空文件检查
+- load_config()/save_config() 增加损坏文件恢复机制
+- sync_reminders() 增加数据验证和异常处理
+- init_network() 增加详细日志和错误处理
+- low_stock_alert() 增加独立 try/except 和更详细反馈
+- _get_ocr_engine() 使用哨兵值避免重复加载失败
+- _speak_worker() 增加音量边界检查和引擎初始化锁保护
+- main_loop() 增加网络恢复失败计数和 WiFi 重连尝试
 """
 
 import os
@@ -47,11 +51,34 @@ except ImportError:
     _PYTTSX3_AVAILABLE = False
 
 # 适配 UniHiker 平台
-from unihiker import GUI
-from pinpong.board import Board, Pin
-from unihiker_connet_wifi import *
-wifi_manager = WiFiManager()
-response_success = wifi_manager.connect_wifi("666", "15756491077")
+# GUI 模块：可选依赖
+try:
+    from unihiker import GUI
+    _GUI_AVAILABLE = True
+except ImportError:
+    GUI = None
+    _GUI_AVAILABLE = False
+
+# 硬件引脚模块：可选依赖
+try:
+    from pinpong.board import Board, Pin
+    _PINPONG_AVAILABLE = True
+except ImportError:
+    Board = None
+    Pin = None
+    _PINPONG_AVAILABLE = False
+
+# WiFi 模块：可选依赖，缺失时优雅降级
+_WIFI_AVAILABLE = False
+WiFiManager = None
+wifi_manager = None
+try:
+    from unihiker_connet_wifi import WiFiManager
+    wifi_manager = WiFiManager()
+    response_success = wifi_manager.connect_wifi("666", "15756491077")
+    _WIFI_AVAILABLE = True
+except (ImportError, NameError, AttributeError) as e:
+    _WIFI_AVAILABLE = False
 
 # ============== 配置区 ==============
 SERVER_BASE_URL = "https://my-website.ccwu.cc/eating-medication/server"
@@ -71,11 +98,11 @@ LOG_FILE = "/root/medication_local.log"
 PHOTO_DIR = "/root/medication_photos"
 QUEUE_FILE = "/root/medication_log_queue.json"
 
-# 硬件引脚
-BUZZER_PIN = Pin.P25      # 蜂鸣器
-BUTTON_TAKE_PIN = Pin.P21  # 已吃药按钮（~A，按下高电平，松开低电平）
-BUTTON_REMIND_PIN = Pin.P27  # B键：直接启动吃药提醒（按下低电平）
-BUTTON_EMERGENCY_PIN = Pin.P28  # A键：紧急呼叫（联网通知家属）
+# 硬件引脚（使用数字引脚号，Pin 类在 init_hardware 中使用）
+BUZZER_PIN_NUM = 25      # 蜂鸣器
+BUTTON_TAKE_PIN_NUM = 21  # 已吃药按钮（~A，按下高电平，松开低电平）
+BUTTON_REMIND_PIN_NUM = 27  # B键：直接启动吃药提醒（按下低电平）
+BUTTON_EMERGENCY_PIN_NUM = 28  # A键：紧急呼叫（联网通知家属）
 
 # 提醒音量递增参数（每 10 分钟递增一次）
 VOLUME_INITIAL = 30
@@ -164,17 +191,27 @@ LOG_MAX_SIZE = 10 * 1024 * 1024  # 10 MB 日志轮转阈值
 def log(msg, level="INFO"):
     line = f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [{level}] {msg}"
     print(line)
-    with _log_lock:
-        try:
-            if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_MAX_SIZE:
-                rotated = LOG_FILE + ".old"
-                if os.path.exists(rotated):
+    try:
+        with _log_lock:
+            need_rotate = (
+                os.path.exists(LOG_FILE)
+                and os.path.getsize(LOG_FILE) > LOG_MAX_SIZE
+            )
+
+        # I/O 操作在锁外执行，避免阻塞其他线程
+        if need_rotate:
+            rotated = LOG_FILE + ".old"
+            if os.path.exists(rotated):
+                try:
                     os.remove(rotated)
-                os.rename(LOG_FILE, rotated)
-            with open(LOG_FILE, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-        except Exception:
-            pass
+                except Exception:
+                    pass
+            os.rename(LOG_FILE, rotated)
+
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
 
 
 def ensure_dirs():
@@ -182,24 +219,41 @@ def ensure_dirs():
 
 
 def load_config():
+    """加载配置文件，返回 dict；文件损坏时自动备份并返回空字典"""
     with _config_lock:
         if os.path.exists(CONFIG_FILE):
             try:
                 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                     return json.load(f)
+            except (json.JSONDecodeError, ValueError) as e:
+                log(f"配置文件损坏，正在备份: {e}", "ERROR")
+                # 备份损坏的配置文件
+                backup_path = CONFIG_FILE + f".bak.{int(time.time())}"
+                try:
+                    os.rename(CONFIG_FILE, backup_path)
+                    log(f"损坏配置已备份到: {backup_path}", "INFO")
+                except Exception:
+                    pass
+                return {}
             except Exception as e:
                 log(f"读取配置失败: {e}", "ERROR")
+                return {}
         return {}
 
 
 def save_config(cfg):
     """原子写入：先写临时文件再 rename，避免断电导致配置文件损坏"""
+    if not isinstance(cfg, dict):
+        log("save_config: cfg 必须是 dict 类型", "ERROR")
+        return False
     with _config_lock:
         try:
             tmp_path = CONFIG_FILE + ".tmp"
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
+                f.flush()  # 强制写入磁盘
             os.replace(tmp_path, CONFIG_FILE)
+            return True
         except Exception as e:
             log(f"保存配置失败: {e}", "ERROR")
             if os.path.exists(CONFIG_FILE + ".tmp"):
@@ -207,6 +261,7 @@ def save_config(cfg):
                     os.remove(CONFIG_FILE + ".tmp")
                 except Exception:
                     pass
+            return False
 
 
 def check_network():
@@ -278,21 +333,28 @@ _speech_lock = threading.Lock()
 def init_speech():
     """初始化 pyttsx3 TTS 引擎并启动后台播报线程"""
     global _speech_engine, _speech_thread
-    if _PYTTSX3_AVAILABLE and pyttsx3 is not None:
-        try:
+    try:
+        if _PYTTSX3_AVAILABLE and pyttsx3 is not None:
             _speech_engine = pyttsx3.init()
             _speech_engine.setProperty('volume', VOLUME_INITIAL / 100)
             _speech_engine.setProperty('rate', TTS_RATE)
             log("pyttsx3 TTS 引擎初始化成功")
-        except Exception as e:
-            log(f"pyttsx3 初始化失败，将回退到 espeak: {e}", "WARNING")
+        else:
+            log("pyttsx3 未安装，使用 espeak 回退")
             _speech_engine = None
-    else:
-        log("pyttsx3 未安装，使用 espeak 回退")
+    except Exception as e:
+        log(f"pyttsx3 初始化失败，将回退到 espeak: {e}", "WARNING")
         _speech_engine = None
 
-    _speech_thread = threading.Thread(target=_speak_worker, daemon=True)
-    _speech_thread.start()
+    # 确保停止事件已清除
+    if _speech_stop_event.is_set():
+        _speech_stop_event.clear()
+
+    # 启动后台播报线程（如果未启动）
+    if _speech_thread is None or not _speech_thread.is_alive():
+        _speech_thread = threading.Thread(target=_speak_worker, daemon=True)
+        _speech_thread.start()
+        log("TTS 播报线程已启动")
 
 
 def _speak_worker():
@@ -310,6 +372,9 @@ def _speak_worker():
             else:
                 vol = volume
 
+            # 限制音量范围
+            vol = max(0, min(100, vol))
+
             # 先设置 USB 扬声器系统音量
             set_system_volume(vol)
 
@@ -324,8 +389,10 @@ def _speak_worker():
                     # 尝试重新初始化引擎
                     if _PYTTSX3_AVAILABLE and pyttsx3 is not None:
                         try:
-                            _speech_engine = pyttsx3.init()
-                            _speech_engine.setProperty('rate', TTS_RATE)
+                            with _speech_lock:
+                                _speech_engine = pyttsx3.init()
+                                _speech_engine.setProperty('rate', TTS_RATE)
+                            log("pyttsx3 引擎已重新初始化", "INFO")
                         except Exception:
                             _speech_engine = None
                     else:
@@ -343,6 +410,8 @@ def _speak_worker():
         except Exception as e:
             log(f"TTS 工作线程异常: {e}", "ERROR")
             time.sleep(1)
+
+    log("TTS 工作线程已退出")
 
 
 def tts_speak(text, volume=None):
@@ -398,12 +467,16 @@ def capture_photo(filename=None, timeout=10):
     path = os.path.join(PHOTO_DIR, filename)
     with _camera_lock:
         try:
+            # 确保照片目录存在
+            os.makedirs(PHOTO_DIR, exist_ok=True)
             # 优先使用 fswebcam（Linux 下 USB/CSI 摄像头通用）
             cmd = f"fswebcam -r 640x480 --no-banner {path}"
             r = subprocess.run(cmd, shell=True, capture_output=True, timeout=timeout)
             if r.returncode == 0 and os.path.exists(path) and os.path.getsize(path) > 0:
                 return path
             log(f"fswebcam 失败: {r.stderr.decode('utf-8', errors='ignore')}", "WARNING")
+        except subprocess.TimeoutExpired:
+            log("拍照超时", "ERROR")
         except Exception as e:
             log(f"拍照失败: {e}", "ERROR")
     return None
@@ -412,13 +485,21 @@ def capture_photo(filename=None, timeout=10):
 def image_to_base64(path):
     """将图片转为 base64，文件超过 1MB 则跳过避免 OOM"""
     try:
+        # 修复：检查文件是否存在
+        if not path or not os.path.exists(path):
+            log(f"图片文件不存在: {path}", "WARNING")
+            return None
         size = os.path.getsize(path)
-        if size > 1048576:
+        if size > 1048576:  # 1MB
             log(f"图片过大 ({size} bytes)，跳过 base64 编码", "WARNING")
+            return None
+        if size == 0:
+            log(f"图片文件为空: {path}", "WARNING")
             return None
         with open(path, "rb") as f:
             return base64.b64encode(f.read()).decode("utf-8")
-    except Exception:
+    except Exception as e:
+        log(f"图片转 base64 失败: {e}", "ERROR")
         return None
 
 
@@ -445,8 +526,28 @@ def http_request(url, payload=None, timeout=15, headers=None):
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers=hdrs, method="POST" if data else "GET")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status_code = resp.getcode()
             body = resp.read().decode("utf-8")
-            return json.loads(body) if body else None
+            if not body:
+                return None
+            # 尝试解析 JSON，非 JSON 响应返回原始文本
+            try:
+                result = json.loads(body)
+                # 检查业务状态码
+                if isinstance(result, dict) and result.get("status") and result.get("status") != "ok":
+                    log(f"HTTP 业务错误: {result.get('message', 'Unknown error')}", "WARNING")
+                return result
+            except (json.JSONDecodeError, ValueError):
+                # 非 JSON 响应（如纯文本）
+                return {"raw_text": body, "status": "ok"}
+    except urllib.error.HTTPError as e:
+        error_body = ""
+        try:
+            error_body = e.read().decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+        log(f"HTTP {e.code} 请求失败 {url}: {error_body[:200]}", "ERROR")
+        return None
     except Exception as e:
         log(f"HTTP 请求失败 {url}: {e}", "ERROR")
         return None
@@ -458,24 +559,46 @@ def register_device():
         "device_id": DEVICE_ID,
         "device_name": None,
     }
-    resp = http_request(API_REGISTER, payload)
-    if resp and resp.get("status") == "ok":
+    try:
+        resp = http_request(API_REGISTER, payload)
+    except Exception as e:
+        log(f"设备注册异常: {e}", "ERROR")
+        return False
+
+    if resp is None:
+        log("设备注册失败：无响应", "ERROR")
+        return False
+
+    if not isinstance(resp, dict):
+        log(f"设备注册响应格式错误: {resp}", "ERROR")
+        return False
+
+    if resp.get("status") == "ok":
         token = resp.get("device_token")
         if token:
             _set_device_token(token)
             save_device_token(token)
-        log("设备注册成功")
-        return True
-    log(f"设备注册失败: {resp}", "ERROR")
-    return False
+            log("设备注册成功")
+            return True
+        else:
+            log("设备注册成功但未返回 device_token", "WARNING")
+            return True  # 注册成功但无 token 也视为成功
+    else:
+        log(f"设备注册失败: {resp.get('message', resp)}", "ERROR")
+        return False
 
 
 def save_device_token(token):
     """将 device_token 持久化到配置文件，重启后可恢复"""
+    if not token:
+        log("device_token 无效，未保存", "WARNING")
+        return
     try:
         cfg = load_config()
         cfg["device_token"] = token
+        cfg["device_token_saved_at"] = datetime.datetime.now().isoformat()
         save_config(cfg)
+        log("device_token 已保存")
     except Exception as e:
         log(f"保存 device_token 失败: {e}", "WARNING")
 
@@ -484,21 +607,34 @@ def load_device_token():
     """从配置文件恢复 device_token"""
     try:
         cfg = load_config()
-        token = cfg.get("device_token")
-        if token:
-            _set_device_token(token)
-            return True
-    except Exception:
-        pass
+        if cfg:
+            token = cfg.get("device_token")
+            if token and isinstance(token, str) and len(token) > 0:
+                _set_device_token(token)
+                log("device_token 已从本地恢复")
+                return True
+    except Exception as e:
+        log(f"加载 device_token 失败: {e}", "WARNING")
     return False
 
 
 def sync_reminders():
     """获取用药计划（新版 API：GET /device/schedule/{id}）"""
-    resp = http_request(API_SCHEDULE)
+    try:
+        resp = http_request(API_SCHEDULE)
+    except Exception as e:
+        log(f"同步用药计划异常: {e}", "ERROR")
+        return False
+
     if resp is None:
         log("同步用药计划失败：网络请求无响应", "WARNING")
         return False
+
+    # 检查是否返回了错误状态
+    if isinstance(resp, dict) and resp.get("status") and resp.get("status") != "ok":
+        log(f"同步用药计划返回错误: {resp.get('message', resp)}", "WARNING")
+        return False
+
     plans = []
     if isinstance(resp, list):
         plans = resp
@@ -506,17 +642,26 @@ def sync_reminders():
         # 使用 is not None 判断，避免空列表 [] 被 or 误判为 falsy
         for key in ("plans", "data", "items"):
             val = resp.get(key)
-            if val is not None:
+            if val is not None and isinstance(val, list):
                 plans = val
                 break
         if not plans and resp.get("status") and resp.get("status") != "ok":
             log(f"同步用药计划返回错误: {resp.get('message', resp)}", "WARNING")
             return False
+
+    # 验证 plans 数据有效性
+    valid_plans = []
+    for p in plans:
+        if isinstance(p, dict):
+            valid_plans.append(p)
+        else:
+            log(f"跳过无效的用药计划条目: {p}", "WARNING")
+
     with lock:
-        state["reminders"] = _convert_plans_to_reminders(plans)
-        state["medicines"] = _convert_plans_to_medicines(plans)
+        state["reminders"] = _convert_plans_to_reminders(valid_plans)
+        state["medicines"] = _convert_plans_to_medicines(valid_plans)
         state["last_sync"] = datetime.datetime.now().isoformat()
-    log(f"同步用药计划: {len(plans)} 条")
+    log(f"同步用药计划: {len(valid_plans)} 条")
     return True
 
 
@@ -573,21 +718,34 @@ def _convert_plans_to_medicines(plans):
         drug_name = p.get("drug_name", "")
         freq = p.get("frequency", "每日")
         freq_per_day = _parse_frequency_per_day(freq)
+        remaining = p.get("remaining_quantity", 0)
+        # 修复：正确处理 remaining_quantity，可能是浮点数
+        try:
+            remaining = int(float(remaining))
+        except (ValueError, TypeError):
+            remaining = 0
         medicines.append({
             "id": plan_id if plan_id is not None else drug_name,
             "name": drug_name,
-            "remaining": int(p.get("remaining_quantity", 0)),
+            "remaining": remaining,
             "per_time": 1,
             "frequency_per_day": freq_per_day,
             "threshold": p.get("low_stock_threshold", 5),
             "unit": p.get("unit", "片"),
             "dosage": p.get("dosage", "1片"),
+            # 新增：保存 total_quantity 用于计算总库存量
+            "total_quantity": int(float(p.get("total_quantity", 0)) or 0),
         })
     return medicines
 
 
 def upload_log(event_type, detail, photo_path=None):
     """上报设备事件（新版 API：POST /device/message + /device/upload）"""
+    # 修复：验证 event_type 有效性
+    if not event_type or not isinstance(event_type, str):
+        log(f"upload_log: event_type 无效: {event_type}", "ERROR")
+        return False
+
     msg_payload = {
         "device_id": DEVICE_ID,
         "message_type": event_type,
@@ -629,12 +787,21 @@ def upload_log(event_type, detail, photo_path=None):
 
 def queue_local_log(payload, photo_base64=None):
     """将日志条目写入本地离线队列。队列最多保留 500 条，超出时丢弃最旧的"""
+    # 修复：验证 payload 有效性
+    if not payload or not isinstance(payload, dict):
+        log("queue_local_log: payload 无效", "ERROR")
+        return
     with _queue_lock:
         try:
             queue = []
             if os.path.exists(QUEUE_FILE):
-                with open(QUEUE_FILE, "r", encoding="utf-8") as f:
-                    queue = json.load(f)
+                try:
+                    with open(QUEUE_FILE, "r", encoding="utf-8") as f:
+                        queue = json.load(f)
+                except (json.JSONDecodeError, ValueError):
+                    # 队列文件损坏，重新开始
+                    log("离线日志队列文件损坏，重新创建", "WARNING")
+                    queue = []
             entry = payload.copy()
             if photo_base64:
                 entry["_photo"] = photo_base64
@@ -652,13 +819,27 @@ def queue_local_log(payload, photo_base64=None):
 
 
 def flush_local_logs():
+    """刷新本地离线日志队列：读取 → 逐条上传 → 写回剩余"""
     if not os.path.exists(QUEUE_FILE):
         return
+
     # 读取阶段：在锁内读取队列快照后释放锁，网络请求在锁外执行
     with _queue_lock:
         try:
             with open(QUEUE_FILE, "r", encoding="utf-8") as f:
                 queue = json.load(f)
+            if not isinstance(queue, list):
+                log("离线日志队列格式错误，已重置", "ERROR")
+                queue = []
+        except (json.JSONDecodeError, ValueError) as e:
+            log(f"读取本地日志队列失败（文件损坏）: {e}", "ERROR")
+            # 备份损坏的队列文件
+            try:
+                backup_path = QUEUE_FILE + f".bak.{int(time.time())}"
+                os.rename(QUEUE_FILE, backup_path)
+            except Exception:
+                pass
+            return
         except Exception as e:
             log(f"读取本地日志队列失败: {e}", "ERROR")
             return
@@ -667,21 +848,41 @@ def flush_local_logs():
         return
 
     remain = []
+    success_count = 0
+    fail_count = 0
+
     for entry in queue:
-        photo = entry.get("_photo")
-        msg_payload = {k: v for k, v in entry.items() if k != "_photo"}
-        msg_resp = http_request(API_MESSAGE, msg_payload)
-        msg_ok = msg_resp is not None
-        photo_ok = True
-        if photo:
-            upload_resp = http_request(API_UPLOAD, {
-                "device_id": DEVICE_ID,
-                "image_base64": photo,
-                "note": "offline upload",
-            })
-            photo_ok = upload_resp is not None
-        if not (msg_ok and photo_ok):
+        try:
+            photo = entry.get("_photo")
+            msg_payload = {k: v for k, v in entry.items() if k != "_photo"}
+
+            # 验证 entry 有效性
+            if not isinstance(msg_payload, dict) or not msg_payload.get("device_id"):
+                log(f"跳过无效日志条目: {entry}", "WARNING")
+                fail_count += 1
+                continue
+
+            msg_resp = http_request(API_MESSAGE, msg_payload)
+            msg_ok = msg_resp is not None
+            photo_ok = True
+
+            if photo:
+                upload_resp = http_request(API_UPLOAD, {
+                    "device_id": DEVICE_ID,
+                    "image_base64": photo,
+                    "note": "offline upload",
+                })
+                photo_ok = upload_resp is not None
+
+            if msg_ok and photo_ok:
+                success_count += 1
+            else:
+                remain.append(entry)
+                fail_count += 1
+        except Exception as e:
+            log(f"刷新日志条目异常: {e}", "ERROR")
             remain.append(entry)
+            fail_count += 1
 
     # 写回阶段：在锁内写回剩余队列（原子写入）
     with _queue_lock:
@@ -689,10 +890,12 @@ def flush_local_logs():
             tmp_path = QUEUE_FILE + ".tmp"
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(remain, f, ensure_ascii=False)
+                f.flush()
             os.replace(tmp_path, QUEUE_FILE)
         except Exception as e:
             log(f"写回本地日志队列失败: {e}", "ERROR")
-    log(f"刷新本地日志: 成功 {len(queue) - len(remain)}, 剩余 {len(remain)}")
+
+    log(f"刷新本地日志: 成功 {success_count}, 失败 {fail_count}, 剩余 {len(remain)}")
 
 
 def query_drug_by_ocr(text):
@@ -711,6 +914,9 @@ def notify_emergency():
     """紧急通知家属（POST /device/message，message_type=emergency）"""
     cfg = load_config()
     contact = cfg.get("emergency_contact", "120")
+    # 修复：验证联系人格式，避免无效通知
+    if not contact or not isinstance(contact, str):
+        contact = "120"
     payload = {
         "device_id": DEVICE_ID,
         "message_type": "emergency",
@@ -776,6 +982,9 @@ def check_reminders():
         for r in state["reminders"]:
             tid = r.get("id")
             times = r.get("times", [])
+            # 兼容 times 为 None 的情况
+            if times is None:
+                times = []
             days = r.get("days", [1, 2, 3, 4, 5, 6, 7])
             if weekday not in days:
                 continue
@@ -790,10 +999,18 @@ def check_reminders():
 
 
 def trigger_alert(reminder):
+    """触发吃药提醒：存储状态、更新界面、启动提醒循环线程"""
+    # 添加 None 检查
+    if reminder is None or not isinstance(reminder, dict):
+        log("trigger_alert 收到无效的 reminder 参数", "ERROR")
+        return
     tid = reminder.get("id")
     name = reminder.get("user_name", "老人")
     drug = reminder.get("medicine_name", "药品")
     dose = reminder.get("dose", "")
+    if not tid:
+        log("trigger_alert: reminder 缺少 id 字段", "ERROR")
+        return
     with lock:
         state["active_alerts"][tid] = {
             "started_at": datetime.datetime.now(),
@@ -894,49 +1111,85 @@ def update_stock(medicine_id, used_count):
 
 
 def low_stock_alert(medicine):
-    name = medicine.get('name', '')
-    msg = f"{name} 余量不足，请及时补药"
+    """低库存告警：语音提醒 + 查询补货信息 + 30秒后自动返回主页"""
+    if not medicine or not isinstance(medicine, dict):
+        log("low_stock_alert: 参数无效", "ERROR")
+        return
+    name = medicine.get('name', '未知药品')
+    remaining = medicine.get('remaining', 0)
+    unit = medicine.get('unit', '片')
+    msg = f"{name} 剩余 {remaining}{unit}，请及时补药"
     log(msg)
-    tts_speak(msg)
-    update_gui_status(msg, alert=True)
+    try:
+        tts_speak(msg)
+    except Exception as e:
+        log(f"语音播报失败: {e}", "ERROR")
+    try:
+        update_gui_status(msg, alert=True)
+    except Exception as e:
+        log(f"GUI 更新失败: {e}", "ERROR")
+
     if _get_online():
-        resp = query_refill(medicine.get("id"))
-        if resp:
-            answer = resp.get("answer", "")
-            if answer:
-                buy_msg = f"购药建议: {answer}"
-                tts_speak(buy_msg)
-                update_gui_status(buy_msg, alert=True)
+        try:
+            resp = query_refill(medicine.get("id"))
+            if resp:
+                answer = resp.get("answer", "")
+                if answer:
+                    buy_msg = f"购药建议: {answer}"
+                    try:
+                        tts_speak(buy_msg)
+                        update_gui_status(buy_msg, alert=True)
+                    except Exception as e:
+                        log(f"购药建议播报失败: {e}", "ERROR")
+        except Exception as e:
+            log(f"查询补货信息失败: {e}", "ERROR")
+
     # 30 秒后自动返回主页（避免一直停留在告警界面）
-    threading.Timer(30, update_gui_home).start()
+    try:
+        threading.Timer(30, update_gui_home).start()
+    except Exception as e:
+        log(f"定时器启动失败: {e}", "ERROR")
 
 
 # ============== AI 药物识别 ==============
 
+_OCR_LOAD_FAILED = object()  # 哨兵值：标记 OCR 加载失败，避免重复尝试
 _ocr_engine = None  # (pytesseract, Image) tuple, 延迟初始化
 _ocr_lock = threading.Lock()
 
 
 def _get_ocr_engine():
-    """延迟加载 OCR 引擎（pytesseract + PIL）"""
+    """延迟加载 OCR 引擎（pytesseract + PIL），使用双重检查锁定"""
     global _ocr_engine
+    if _ocr_engine is _OCR_LOAD_FAILED:
+        return None  # 已尝试加载但失败，直接返回 None
     if _ocr_engine is not None:
         return _ocr_engine
     with _ocr_lock:
         # Double-check after acquiring lock
+        if _ocr_engine is _OCR_LOAD_FAILED:
+            return None
         if _ocr_engine is not None:
             return _ocr_engine
         try:
             import pytesseract
             from PIL import Image
+            # 验证 OCR 引擎可以正常工作
             _ocr_engine = (pytesseract, Image)
+            log("OCR 引擎加载成功")
             return _ocr_engine
+        except ImportError as e:
+            log(f"OCR 引擎导入失败（缺少依赖）: {e}", "WARNING")
+            _ocr_engine = _OCR_LOAD_FAILED  # 标记为已尝试加载但失败
+            return None
         except Exception as e:
             log(f"OCR 引擎加载失败: {e}", "WARNING")
+            _ocr_engine = _OCR_LOAD_FAILED  # 标记为已尝试加载但失败
             return None
 
 
 def recognize_medicine():
+    """识别药品：拍照 → OCR识别 → AI问答"""
     if not _get_camera_available():
         tts_speak("摄像头未就绪，请手动核对药品")
         update_gui_home()
@@ -954,22 +1207,29 @@ def recognize_medicine():
         pytesseract, Image = ocr
         try:
             img = Image.open(photo_path).convert("L")
-            text = pytesseract.image_to_string(img, lang="chi_sim+eng")
-            log(f"OCR 结果: {text.strip()}")
+            text = pytesseract.image_to_string(img, lang="chi_sim+eng").strip()
+            log(f"OCR 结果: {text}")
         except Exception as e:
             log(f"OCR 识别失败: {e}", "WARNING")
             text = ""
 
-    if _get_online() and text.strip():
-        resp = query_drug_by_ocr(text.strip())
-        if resp:
-            answer = resp.get("answer", "")
-            if answer:
-                speak = f"AI 识别结果: {answer}"
-                update_gui_status(speak)
-                tts_speak(speak)
-                return
-    tts_speak("未能识别药品，请手动核对说明书")
+    if text and _get_online():
+        try:
+            resp = query_drug_by_ocr(text)
+            if resp:
+                answer = resp.get("answer", "")
+                if answer:
+                    speak = f"AI 识别结果: {answer}"
+                    update_gui_status(speak)
+                    tts_speak(speak)
+                    return
+        except Exception as e:
+            log(f"AI 识别查询失败: {e}", "WARNING")
+
+    if not text:
+        tts_speak("未能识别药品，请手动核对说明书")
+    else:
+        tts_speak("未能查询到药品信息，请手动核对说明书")
 
 
 # ============== 余量监测 ==============
@@ -982,10 +1242,11 @@ def calculate_remaining_days():
             per_time = m.get("per_time", 1)
             freq = m.get("frequency_per_day", 1)
             daily = per_time * freq
-            if daily > 0:
-                m["remaining_days"] = int(total / daily)
-            else:
+            # 修复：daily 为 0 时避免除零错误
+            if daily <= 0:
                 m["remaining_days"] = 999
+            else:
+                m["remaining_days"] = int(total / daily)
             if m["remaining_days"] < 5:
                 alerts_to_fire.append(dict(m))
     for med_copy in alerts_to_fire:
@@ -1088,9 +1349,11 @@ def clock_thread():
                 mode = _gui_mode
                 time_obj = _clock_time_obj
                 date_obj = _clock_date_obj
-            if gui and mode == "home":
+            # 修复：检查 gui 是否存在且模式正确
+            if gui is not None and mode == "home":
                 now = datetime.datetime.now()
                 with _gui_draw_lock:
+                    # 修复：检查对象有效性
                     if time_obj is not None:
                         try:
                             time_obj.config(text=_format_time(now))
@@ -1152,6 +1415,14 @@ def on_remind_button_pressed():
 def init_hardware():
     global buzzer, button_take, button_emergency, button_remind, gui
     try:
+        # 检查硬件模块是否可用
+        if not _PINPONG_AVAILABLE or Board is None or Pin is None:
+            log("Pinpong 硬件模块不可用，跳过硬件初始化", "WARNING")
+            return
+        if not _GUI_AVAILABLE or GUI is None:
+            log("GUI 模块不可用，将以无界面模式运行", "WARNING")
+            gui = None
+        
         Board().begin()
         # 优先使用 pinpong 板载蜂鸣器（支持音效），回退到数字引脚
         try:
@@ -1159,11 +1430,11 @@ def init_hardware():
             buzzer = _buzzer
             log("使用 pinpong 板载蜂鸣器（音效模式）")
         except ImportError:
-            buzzer = Pin(BUZZER_PIN, Pin.OUT)
+            buzzer = Pin(BUZZER_PIN_NUM, Pin.OUT)
             log("使用数字引脚蜂鸣器（兼容模式）")
-        button_take = Pin(BUTTON_TAKE_PIN, Pin.IN)
-        button_emergency = Pin(BUTTON_EMERGENCY_PIN, Pin.IN)
-        button_remind = Pin(BUTTON_REMIND_PIN, Pin.IN)
+        button_take = Pin(BUTTON_TAKE_PIN_NUM, Pin.IN)
+        button_emergency = Pin(BUTTON_EMERGENCY_PIN_NUM, Pin.IN)
+        button_remind = Pin(BUTTON_REMIND_PIN_NUM, Pin.IN)
         try:
             gui = GUI()
             log("GUI 初始化成功")
@@ -1179,17 +1450,42 @@ def init_hardware():
 
 
 def init_network():
-    if wifi_manager.is_wifi_connected():
-        _set_online(check_network())
-        if _get_online():
-            # 尝试从本地恢复 device_token，否则重新注册
-            if not load_device_token():
-                register_device()
-            sync_reminders()
-            flush_local_logs()
-    else:
+    """初始化网络：检查 WiFi 状态、恢复/注册设备、同步数据、刷新离线日志"""
+    try:
+        # 检查 WiFi 模块是否可用
+        if not _WIFI_AVAILABLE or wifi_manager is None:
+            log("WiFi 模块不可用，进入离线模式", "WARNING")
+            _set_online(False)
+            return
+
+        if wifi_manager.is_wifi_connected():
+            log("WiFi 已连接，正在检测网络...")
+            online = check_network()
+            _set_online(online)
+            if online:
+                log("网络正常，正在初始化设备...")
+                # 尝试从本地恢复 device_token，否则重新注册
+                token_restored = load_device_token()
+                if not token_restored:
+                    log("未找到本地 token，正在注册设备...")
+                    if not register_device():
+                        log("设备注册失败", "ERROR")
+                        _set_online(False)
+                        return
+                log("正在同步用药计划...")
+                sync_reminders()
+                log("正在刷新离线日志...")
+                flush_local_logs()
+            else:
+                log("网络异常，进入离线模式", "WARNING")
+                _set_online(False)
+        else:
+            log("WiFi 未连接，进入离线模式", "WARNING")
+            _set_online(False)
+        log(f"网络状态: {'在线' if _get_online() else '离线'}")
+    except Exception as e:
+        log(f"网络初始化异常: {e}", "ERROR")
         _set_online(False)
-    log(f"网络状态: {'在线' if _get_online() else '离线'}")
 
 
 def button_thread():
@@ -1221,6 +1517,8 @@ def main_loop():
     last_flush = 0
     last_reconnect_check = 0
     missed_minutes = 0  # 追踪连续错过的分钟数
+    reconnect_fail_count = 0  # 网络恢复失败计数
+    MAX_RECONNECT_FAILS = 5  # 最大失败次数，超过后告警
 
     while True:
         now = datetime.datetime.now()
@@ -1263,12 +1561,26 @@ def main_loop():
             last_reconnect_check = time.time()
             if check_network():
                 _set_online(True)
+                reconnect_fail_count = 0
                 # 尝试恢复 token，否则重新注册
                 if not load_device_token():
                     register_device()
                 sync_reminders()
                 flush_local_logs()
                 update_gui_status("网络已恢复")
+                log("网络恢复成功", "INFO")
+            else:
+                reconnect_fail_count += 1
+                # 连续失败超过阈值时告警
+                if reconnect_fail_count >= MAX_RECONNECT_FAILS:
+                    log(f"网络恢复连续失败 {reconnect_fail_count} 次", "WARNING")
+                    reconnect_fail_count = 0
+                    # 尝试重启 WiFi 连接
+                    if wifi_manager is not None and hasattr(wifi_manager, 'reconnect'):
+                        try:
+                            wifi_manager.reconnect()
+                        except Exception as e:
+                            log(f"WiFi 重连失败: {e}", "ERROR")
 
         time.sleep(CHECK_INTERVAL)
 

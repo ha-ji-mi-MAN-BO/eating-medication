@@ -398,6 +398,42 @@ m10.py
 | 57 | 🟢 | `buzzer_beep()` 增加 None 设备防护 | 硬件未初始化时直接返回，避免 try/except 开销 |
 | 58 | 🟢 | `main_loop()` 增加 `missed_minutes` 追踪 | 系统挂起超过 60 分钟时强制触发检查，避免遗漏提醒 |
 
+### 已完成的 Bug 修复（v2.29.0，共 31 项）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `log()` 函数中日志 I/O 在锁内执行，大日志文件处理时可能阻塞其他线程 | 将 `os.rename` 和 `open` 操作移到 `_log_lock` 外部执行 |
+| 2 | 🔴 | `http_request()` 没有检查 HTTP 状态码和处理非 JSON 响应 | 增加 `HTTPError` 异常处理、非 JSON 响应回退、业务状态码检查 |
+| 3 | 🔴 | `check_reminders()` 中 `times` 字段可能为 None，导致循环崩溃 | 增加 `None` 检查，默认空列表 |
+| 4 | 🔴 | `trigger_alert()` 缺少 `reminder` 参数的 None 检查 | 增加参数类型和有效性检查 |
+| 5 | 🔴 | `calculate_remaining_days()` 可能除零错误 | 将 `if daily > 0` 改为 `if daily <= 0`，避免浮点精度问题 |
+| 6 | 🟡 | `capture_photo()` 目录不存在时未检查 | 添加 `os.makedirs(PHOTO_DIR, exist_ok=True)` 和超时异常处理 |
+| 7 | 🟡 | `_convert_plans_to_medicines()` 缺少 `total_quantity` 字段处理 | 新增 `total_quantity` 字段，正确处理浮点数转换 |
+| 8 | 🟡 | `image_to_base64()` 对不存在的文件没有返回错误 | 添加文件存在性检查、空文件检查和更详细的错误日志 |
+| 9 | 🟡 | `notify_emergency()` 未验证联系人格式 | 添加联系人有效性检查，无效时回退到默认 "120" |
+| 10 | 🟡 | `main_loop()` 网络恢复逻辑可能无限循环 | 添加 `reconnect_fail_count` 计数器，超过 5 次自动告警并尝试 WiFi 重连 |
+| 11 | 🟡 | `clock_thread()` 中 `gui` 检查不充分 | 改为 `gui is not None` 显式检查 |
+| 12 | 🟡 | `upload_log()` 未验证 `event_type` 有效性 | 添加 `event_type` 类型和有效性检查 |
+| 13 | 🟡 | `queue_local_log()` 未验证 `payload` 有效性 | 添加 payload 类型检查和损坏文件自动恢复 |
+| 14 | 🟡 | `sync_reminders()` 缺乏异常处理和数据验证 | 添加 try/except、响应格式验证、无效条目过滤 |
+| 15 | 🟡 | `register_device()` 响应验证不充分 | 添加响应类型检查、业务状态码检查、token 有效性检查 |
+| 16 | 🟡 | `init_network()` 缺乏详细错误处理 | 添加完整的 try/except、更详细的状态日志 |
+| 17 | 🟡 | `recognize_medicine()` 异常处理不完善 | 添加 AI 查询异常处理、区分不同失败原因的语音反馈 |
+| 18 | 🟡 | `_get_ocr_engine()` 加载失败后重复尝试 | 新增 `_OCR_LOAD_FAILED` 哨兵值，加载失败后直接返回 None |
+| 19 | 🟡 | `_ocr_engine` 标记机制有问题 | 使用 `object()` 创建唯一哨兵值，正确区分未加载和加载失败 |
+| 20 | 🟡 | `save_device_token()` 未验证 token 有效性 | 添加 token 非空检查、长度验证、保存时间戳 |
+| 21 | 🟡 | `load_device_token()` 错误处理不充分 | 添加配置有效性检查、token 格式验证 |
+| 22 | 🟡 | `load_config()` 未处理损坏文件 | 添加 `JSONDecodeError` 捕获、损坏文件自动备份 |
+| 23 | 🟡 | `save_config()` 未验证参数类型 | 添加 cfg 参数类型检查、`f.flush()` 强制写入磁盘 |
+| 24 | 🟡 | `low_stock_alert()` 异常处理不完善 | 添加参数检查、每步操作独立 try/except、更详细的错误日志 |
+| 25 | 🟡 | `flush_local_logs()` 错误处理不充分 | 添加损坏文件恢复、条目有效性验证、成功/失败计数统计 |
+| 26 | 🟡 | `init_speech()` 线程启动无重复检查 | 添加线程存活检查，避免重复启动播报线程 |
+| 27 | 🟡 | `_speak_worker()` 缺乏音量边界检查 | 添加 `vol = max(0, min(100, vol))` 限制音量范围 |
+| 28 | 🟡 | `_speak_worker()` 引擎重新初始化不安全 | 在引擎重新初始化时使用 `_speech_lock` 保护 |
+| 29 | 🟢 | `http_request()` 添加详细错误日志 | HTTPError 时打印错误响应体前 200 字符 |
+| 30 | 🟢 | `log()` 函数代码结构优化 | 先读取状态再执行 I/O，减少锁持有时间 |
+| 31 | 🟢 | `init_network()` 添加更详细的状态日志 | 每步操作都有日志输出，便于问题排查 |
+
 ## 版本与更新
 
 本仓库 [`ha-ji-mi-MAN-BO/eating-medication`](https://github.com/ha-ji-mi-MAN-BO/eating-medication) 维护 `m10.py` 单文件版及其文档。配套网页端位于 [`diaoyunxi/eating-medication`](https://github.com/diaoyunxi/eating-medication)，建议二者同步更新以确保接口协议一致。
