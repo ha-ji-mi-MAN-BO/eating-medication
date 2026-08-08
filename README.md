@@ -91,7 +91,7 @@ response_success = wifi_manager.connect_wifi("666", "15756491077")
 # 服务端地址（API）与家属端地址（参考）
 SERVER_BASE_URL = "https://my-website.ccwu.cc/eating-medication/server"
 FAMILY_BASE_URL = "https://my-website.ccwu.cc/eating-medication/family"
-PAIR_CODE = "234099521894527"
+PAIR_CODE = "2AIDMUNIHIKER13"
 DEVICE_ID = "m10_" + PAIR_CODE
 
 # 新版 API 端点（v2.28.0）
@@ -254,7 +254,7 @@ m10.py
 **请求体** (`DeviceRegister`)：
 ```json
 {
-  "device_id": "m10_234099521894527",
+  "device_id": "m10_2AIDMUNIHIKER13",
   "device_name": null
 }
 ```
@@ -275,7 +275,7 @@ m10.py
 **请求体** (`DeviceMessage`)：
 ```json
 {
-  "device_id": "m10_234099521894527",
+  "device_id": "m10_2AIDMUNIHIKER13",
   "message_type": "info",
   "content": "服药确认",
   "data": {
@@ -293,7 +293,7 @@ m10.py
 **请求体** (`DeviceUpload`)：
 ```json
 {
-  "device_id": "m10_234099521894527",
+  "device_id": "m10_2AIDMUNIHIKER13",
   "image_base64": "/9j/4AAQSkZJRg...",
   "note": "服药确认照片"
 }
@@ -316,7 +316,7 @@ m10.py
 ```json
 {
   "question": "老人吃什么药比较好？",
-  "device_id": "m10_234099521894527"
+  "device_id": "m10_2AIDMUNIHIKER13"
 }
 ```
 

@@ -3,7 +3,7 @@
 """
 UniHiker M10 智能服药提醒终端主程序
 项目地址适配: https://my-website.ccwu.cc/eating-medication/server/
-设备配对码: 234099521894527
+设备配对码: 2AIDMUNIHIKER13
 API 版本: v2.28.0（对应 openapi.json）
 当前代码版本: v2.29.9
 
@@ -212,7 +212,7 @@ except (ImportError, NameError, AttributeError) as e:
 
 # ============== 配置区 ==============
 SERVER_BASE_URL = "https://my-website.ccwu.cc/eating-medication/server"
-PAIR_CODE = "234099521894527"
+PAIR_CODE = "2AIDMUNIHIKER13"
 DEVICE_ID = "m10_" + PAIR_CODE
 
 # API 端点（v2.28.0，对应 openapi.json，m10.py 当前版本 v2.29.7）
