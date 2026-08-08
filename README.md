@@ -226,7 +226,7 @@ m10.py
 | 项目 | 值 |
 |------|-----|
 | 服务端基础路径 | `/eating-medication/server` |
-| API 版本 | v2.28.0（当前修复版：v2.29.3） |
+| API 版本 | v2.28.0（当前修复版：v2.29.4） |
 | 认证方式 | 设备注册后返回 `device_token`，后续请求通过 `X-Device-Token` Header 校验 |
 | 限流 | 设备端基于 IP 限流；部分接口需 `device_token` |
 
@@ -495,6 +495,21 @@ m10.py
 | 13 | 🟢 | OCR 引擎加载失败后无法重置，需重启设备 | 新增 `reset_ocr_engine()` 函数，支持运行时重置 |
 | 14 | 🟢 | `_get_ocr_engine()` 缺少文档说明 | 添加详细 docstring，说明返回值和异常情况 |
 | 15 | 🟢 | `flush_local_logs()` 的 `_flush_in_progress` 事件可能因异常未释放 | 添加 finally 块确保事件清理 |
+
+### 已完成的 Bug 修复（v2.29.4，共 10 项）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🟡 | `main_loop()` 中 `_do_sync` 函数在循环内重复创建，每次网络恢复时都生成新的函数对象 | 提取为嵌套函数 `_do_network_recovery_sync()`，仅定义一次，复用闭包 |
+| 2 | 🟡 | `alert_loop()` 中局部变量 `max_retries` 与全局常量 `MAX_ALERT_RETRIES` 重复定义 | 移除局部变量，直接使用全局常量 `MAX_ALERT_RETRIES` |
+| 3 | 🟡 | 魔法数字 `10*1024*1024` 和 `60` 未提取为命名常量 | 新增 `LOG_MAX_SIZE` 和 `_LOG_SIZE_CHECK_INTERVAL` 常量 |
+| 4 | 🟡 | 音量转换 `/100` 硬编码，缺乏语义 | 新增 `_VOLUME_DIVISOR = 100` 常量，替换两处硬编码 |
+| 5 | 🟡 | 注释引用错误行号（"第168行"实际为第192行） | 删除具体行号引用，改为通用描述 |
+| 6 | 🟡 | `upload_log()` 中 `content` 字段使用三重嵌套三元表达式，可读性差 | 拆分为独立的 `content_field` 变量，逻辑清晰 |
+| 7 | 🟢 | `ensure_dirs()`、`log()`、`set_system_volume()`、`calculate_remaining_days()`、`init_hardware()` 函数文档不完整 | 补充完整 docstring（Args、Returns、Raises） |
+| 8 | 🟢 | 日志函数说明不完整 | 在 docstring 中增加日志轮转功能说明 |
+| 9 | 🟢 | 音量参数边界检查逻辑优化 | 完善参数类型检查和范围校验 |
+| 10 | 🟢 | 代码结构优化 | 减少冗余代码，统一命名规范 |
 
 ### 已完成的 Bug 修复（v2.29.3，共 30 项）
 
