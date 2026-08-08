@@ -2479,7 +2479,8 @@ def main_loop():
             if check_network():
                 _set_online(True)
                 reconnect_fail_count = 0
-                update_gui_status("网络已恢复")
+                # 网络恢复后直接回到主页，显示"在线"状态和时钟
+                update_gui_home()
                 log("网络恢复成功，正在同步数据...", "INFO")
                 
                 # 异步执行数据同步，避免阻塞主循环
