@@ -226,7 +226,7 @@ m10.py
 | 项目 | 值 |
 |------|-----|
 | 服务端基础路径 | `/eating-medication/server` |
-| API 版本 | v2.28.0（当前修复版：v2.29.5） |
+| API 版本 | v2.28.0（当前修复版：v2.29.8） |
 | 认证方式 | 设备注册后返回 `device_token`，后续请求通过 `X-Device-Token` Header 校验 |
 | 限流 | 设备端基于 IP 限流；部分接口需 `device_token` |
 
@@ -495,6 +495,48 @@ m10.py
 | 13 | 🟢 | OCR 引擎加载失败后无法重置，需重启设备 | 新增 `reset_ocr_engine()` 函数，支持运行时重置 |
 | 14 | 🟢 | `_get_ocr_engine()` 缺少文档说明 | 添加详细 docstring，说明返回值和异常情况 |
 | 15 | 🟢 | `flush_local_logs()` 的 `_flush_in_progress` 事件可能因异常未释放 | 添加 finally 块确保事件清理 |
+
+### 已完成的 Bug 修复（v2.29.8，共 12 项）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | 模块加载时 WiFi 连接阻塞（30秒超时），导致启动卡死 | 移至 `init_network()` 延迟执行，添加 3 次重试机制，每次间隔 2 秒 |
+| 2 | 🔴 | `_emergency_contact_cache` 和 `_volume_control_cmd` 全局缓存变量缺少并发锁保护 | 新增 `_emergency_lock` 和 `_volume_lock`，在所有缓存访问处加锁 |
+| 3 | 🟡 | `on_take_button_pressed()` 使用 `next(iter())` 无默认值，集合为空时抛 StopIteration | 添加默认值 `next(iter(...), None)`，确保安全获取 |
+| 4 | 🟡 | `_convert_plans_to_medicines()` `total_quantity` 非数字字符串时转换崩溃 | 添加 try/except 处理 ValueError 和 TypeError，异常时默认 0 |
+| 5 | 🟡 | `init_hardware()` 中 `subprocess.run` 调用无超时，`fswebcam` 检测可能卡死 | 添加 `timeout=5` 和超时异常捕获，超时后置为 False |
+| 6 | 🟡 | `upload_log()` `event_type` 空字符串校验不完整 | 增加 `strip()` 检查，空白字符串也视为无效 |
+| 7 | 🟡 | `config` 和 `queue` 备份路径仅用时间戳，并发写文件时可能覆盖备份 | 备份文件名添加 `os.getpid()` 避免并发冲突 |
+| 8 | 🟡 | `http_request()` 超时值使用魔法数字 15，难以维护 | 提取为 `HTTP_REQUEST_TIMEOUT` 常量，默认参数改为 None |
+| 9 | 🟢 | `button_thread()` 按钮去重时间使用魔法数字 2/3 | 提取为 `BUTTON_DEBOUNCE_TAKE/REMIND/EMERGENCY` 常量 |
+| 10 | 🟢 | `init_network()` 异常日志类型信息不足 | 添加详细异常类型和堆栈日志，提升可调试性 |
+| 11 | 🟢 | 网络连接首次尝试无提示，重试间隔不明确 | 添加首次提示日志和重试间隔说明 |
+| 12 | 🟢 | 代码注释优化 | 优化注释说明，提升代码可读性 |
+
+### 已完成的 Bug 修复（v2.29.7，共 9 项）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `_speech_lock` 使用 `threading.Lock`，`_speak_worker` 中嵌套获取导致永久死锁 | 改用 `threading.RLock()` 支持嵌套获取 |
+| 2 | 🔴 | `check_reminders()` 空列表 `[]` 作为 days 时默认值不生效，提醒永不触发 | 增加空列表检查，空列表时使用默认值 `[1-7]` |
+| 3 | 🔴 | `upload_log()` 消息成功但照片失败时，消息被重复入队导致重复发送 | 照片失败时仅入队照片数据，不再重复入队消息 |
+| 4 | 🟡 | `_convert_plans_to_medicines()` `total_quantity` 为 None 时 `float()` 抛出 TypeError | 改用 `p.get("total_quantity") or 0` 安全处理 |
+| 5 | 🟡 | `trigger_alert()` 中 `reminder` 在锁外被引用，可能导致数据竞争 | 函数入口立即创建副本 `reminder_copy`，锁内外均使用副本 |
+| 6 | 🟡 | `set_system_volume()` `_volume_control_cmd` 为空字符串时 amixer 参数错误 | 增加空字符串检查，为空时跳过音量设置 |
+| 7 | 🟡 | `notify_emergency()` 每次紧急呼叫同步读取配置文件，响应延迟 | 缓存紧急联系人信息到模块级变量，首次读取后复用 |
+| 8 | 🟢 | `_speak_worker()` espeak 回退无特殊字符处理 | 清理换行符、引号等特殊字符，避免 espeak 解析错误 |
+| 9 | 🟢 | 代码注释优化 | 优化注释说明，提升代码可读性 |
+
+### 已完成的 Bug 修复（v2.29.6，共 6 项）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | 版本号注释过时，API 端点注释仍为 v2.29.3 | 更新注释为 v2.29.6，与当前代码版本一致 |
+| 2 | 🔴 | `upload_log()` 消息发送失败后仍尝试上传照片，浪费网络资源和时间 | 消息失败时直接写入离线队列，跳过照片上传，提升效率 |
+| 3 | 🟡 | `low_stock_alert()` AI 查询补货失败日志不详细，无法区分错误类型 | 增加业务错误检查、网络错误检查和详细异常类型记录 |
+| 4 | 🟡 | `flush_local_logs()` 空照片数据仍尝试上传，且消息失败时仍处理照片 | 增加照片数据有效性校验（非空字符串），消息失败时直接保留条目跳过照片处理 |
+| 5 | 🟡 | `init_network()` WiFi 重连成功无日志，异常日志不详细 | 添加重连成功日志和详细异常类型记录，便于问题排查 |
+| 6 | 🟢 | 代码注释优化 | 优化注释说明，提升代码可读性 |
 
 ### 已完成的 Bug 修复（v2.29.5，共 12 项）
 

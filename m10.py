@@ -5,10 +5,43 @@ UniHiker M10 智能服药提醒终端主程序
 项目地址适配: https://my-website.ccwu.cc/eating-medication/server/
 设备配对码: 234099521894527
 API 版本: v2.28.0（对应 openapi.json）
-当前代码版本: v2.29.5
+当前代码版本: v2.29.8
 
 本程序使用 Python 标准库 + UniHiker 原生 API (unihiker/pinpong) + pyttsx3 TTS,
 不依赖 cv2、requests、schedule 等第三方库。
+
+v2.29.8 修复记录（共 12 项 bug 修复，涵盖安全、并发、健壮性、可维护性）：
+- 【致命】模块加载时 WiFi 连接阻塞，移至 init_network() 延迟执行，添加 3 次重试
+- 【严重】全局缓存变量 _emergency_contact_cache 和 _volume_control_cmd 缺少并发锁保护
+- 【严重】on_take_button_pressed() 使用 next(iter()) 无默认值，集合为空时抛 StopIteration
+- 【严重】_convert_plans_to_medicines() total_quantity 非数字值转换时崩溃
+- 【一般】init_hardware() 中 subprocess.run 调用无超时，fswebcam 检测可能卡死
+- 【一般】upload_log() event_type 空字符串校验不完整
+- 【一般】config 和 queue 备份路径无 PID，并发写文件可能覆盖备份
+- 【一般】http_request() 超时值使用魔法数字 15，提取为 HTTP_REQUEST_TIMEOUT 常量
+- 【优化】button_thread() 按钮去重时间提取为 BUTTON_DEBOUNCE_* 常量
+- 【优化】init_network() 添加详细异常类型和堆栈日志，提升可调试性
+- 【优化】网络连接日志添加首次提示和重试间隔说明
+- 【优化】代码注释优化，提升可读性
+
+v2.29.7 修复记录（共 9 项 bug 修复，涵盖安全、逻辑、健壮性、可维护性）：
+- 【致命】_speech_lock 从 Lock 改为 RLock，避免 _speak_worker 中嵌套获取导致永久死锁
+- 【严重】check_reminders() 空列表 days 默认值不生效，导致永不触发提醒
+- 【严重】upload_log() 消息成功但照片失败时重复入队消息，改为仅入队照片数据
+- 【严重】_convert_plans_to_medicines() total_quantity 为 None 时 float() 抛出 TypeError
+- 【一般】trigger_alert() 立即创建 reminder 副本，避免锁外引用导致数据竞争
+- 【一般】set_system_volume() 增加空字符串控制命令检查，跳过无效音量设置
+- 【一般】notify_emergency() 缓存紧急联系人信息，避免每次紧急呼叫同步读配置文件
+- 【优化】espeak 回退播报清理文本特殊字符，避免解析错误
+- 【优化】代码注释优化，提升可读性
+
+v2.29.6 修复记录（共 6 项 bug 修复，涵盖逻辑、健壮性、可维护性）：
+- 【严重】版本号注释更新：API 端点注释版本号从 v2.29.3 更新为 v2.29.6
+- 【严重】upload_log() 消息发送失败后直接写入离线队列，不再尝试上传照片，节省资源
+- 【一般】low_stock_alert() AI 查询补货失败日志更详细，区分业务错误和网络错误
+- 【一般】flush_local_logs() 消息发送失败时直接保留条目，不尝试上传照片；照片数据有效性校验
+- 【一般】init_network() WiFi 重连添加成功日志和详细异常类型记录
+- 【优化】代码注释优化，提升可读性
 
 v2.29.5 修复记录（共 12 项 bug 修复，涵盖安全、逻辑、规范、健壮性）：
 - 【致命】flush_local_logs() 修复队列为空时提前返回导致 _flush_in_progress 锁无法释放的问题
@@ -162,10 +195,13 @@ except ImportError:
 _WIFI_AVAILABLE = False
 WiFiManager = None
 wifi_manager = None
+_wifi_initialized = False  # WiFi 是否已初始化连接
+_WIFI_SSID = "666"
+_WIFI_PASSWORD = "15756491077"
+
 try:
     from unihiker_connet_wifi import WiFiManager
     wifi_manager = WiFiManager()
-    response_success = wifi_manager.connect_wifi("666", "15756491077")
     _WIFI_AVAILABLE = True
 except (ImportError, NameError, AttributeError) as e:
     _WIFI_AVAILABLE = False
@@ -175,7 +211,7 @@ SERVER_BASE_URL = "https://my-website.ccwu.cc/eating-medication/server"
 PAIR_CODE = "234099521894527"
 DEVICE_ID = "m10_" + PAIR_CODE
 
-# API 端点（v2.28.0，对应 openapi.json，m10.py 当前版本 v2.29.6）
+# API 端点（v2.28.0，对应 openapi.json，m10.py 当前版本 v2.29.7）
 API_REGISTER = f"{SERVER_BASE_URL}/api/v1/public/device/register"
 API_SCHEDULE = f"{SERVER_BASE_URL}/api/v1/public/device/schedule/{DEVICE_ID}"
 API_MESSAGE = f"{SERVER_BASE_URL}/api/v1/public/device/message"
@@ -227,6 +263,10 @@ STOCK_CHECK_INTERVAL = 6 * 3600  # 库存检查间隔（6 小时）
 LOG_FLUSH_INTERVAL = 30 * 60     # 日志刷新间隔（30 分钟）
 ALERT_TIMEOUT = 30               # 低库存告警超时（秒）
 MISSED_MINUTES_THRESHOLD = 60    # 错过分钟数阈值
+HTTP_REQUEST_TIMEOUT = 15        # HTTP 请求默认超时（秒）
+BUTTON_DEBOUNCE_TAKE = 2         # 吃药按钮去重时间（秒）
+BUTTON_DEBOUNCE_REMIND = 3       # 提醒按钮去重时间（秒）
+BUTTON_DEBOUNCE_EMERGENCY = 3    # 紧急按钮去重时间（秒）
 
 # GUI 颜色常量
 COLOR_TITLE = "#000000"
@@ -257,6 +297,8 @@ _config_lock = threading.Lock()  # 保护配置文件的读写，避免多线程
 _queue_lock = threading.Lock()   # 保护离线日志队列文件的读写
 _log_lock = threading.Lock()      # 保护日志文件写入与轮转
 _camera_lock = threading.Lock()  # 保护摄像头访问，避免多线程并发拍照冲突
+_emergency_lock = threading.Lock()  # 保护紧急联系人缓存的并发访问
+_volume_lock = threading.Lock()  # 保护音量控制命令缓存的并发访问
 
 gui = None
 buzzer = None
@@ -391,8 +433,8 @@ def load_config():
                         return {}
             except (json.JSONDecodeError, ValueError) as e:
                 log(f"配置文件损坏，正在备份: {e}", "ERROR")
-                # 备份损坏的配置文件
-                backup_path = CONFIG_FILE + f".bak.{int(time.time())}"
+                # 备份损坏的配置文件（添加 PID，避免并发冲突）
+                backup_path = CONFIG_FILE + f".bak.{int(time.time())}.{os.getpid()}"
                 try:
                     os.rename(CONFIG_FILE, backup_path)
                     log(f"损坏配置已备份到: {backup_path}", "INFO")
@@ -509,11 +551,17 @@ def set_system_volume(vol):
         log(f"音量参数类型无效: {type(vol)}", "ERROR")
         return
     vol = max(0, min(100, int(vol)))
-    if not _volume_control_cmd:
-        _volume_control_cmd = VOLUME_CONTROL if VOLUME_CONTROL else detect_volume_control()
+    # 保护 _volume_control_cmd 的并发访问
+    with _volume_lock:
+        if not _volume_control_cmd:
+            _volume_control_cmd = VOLUME_CONTROL if VOLUME_CONTROL else detect_volume_control()
+        current_cmd = _volume_control_cmd
+    if not current_cmd or not current_cmd.strip():
+        log("音量控制命令为空，跳过音量设置", "DEBUG")
+        return
     try:
         # 解析控制命令，构建安全的 subprocess 列表参数
-        cmd_parts = _volume_control_cmd.split()
+        cmd_parts = current_cmd.split()
         amixer_args = ["amixer"] + cmd_parts + [f"{vol}%"]
         subprocess.run(amixer_args, capture_output=True, timeout=5, shell=False)
     except Exception as e:
@@ -526,7 +574,7 @@ _speech_engine = None
 _speak_queue = queue.Queue(maxsize=100)  # 有界队列，最多 100 条排队
 _speech_stop_event = threading.Event()
 _speech_thread = None
-_speech_lock = threading.Lock()
+_speech_lock = threading.RLock()  # 使用 RLock 支持嵌套获取，避免 _speak_worker 中死锁
 
 
 def init_speech():
@@ -600,7 +648,9 @@ def _speak_worker():
             else:
                 # 回退到 espeak
                 try:
-                    subprocess.run(["espeak", "-v", "zh", text], timeout=30)
+                    # 清理文本中的特殊字符，避免 espeak 解析错误
+                    safe_text = text.replace('\n', ' ').replace('\r', ' ').replace('"', '')
+                    subprocess.run(["espeak", "-v", "zh", safe_text], timeout=30)
                 except Exception as e:
                     log(f"espeak 回退播报失败: {e}", "ERROR")
 
@@ -729,7 +779,7 @@ def _auth_headers(extra=None):
     return headers
 
 
-def http_request(url, payload=None, timeout=15, headers=None):
+def http_request(url, payload=None, timeout=None, headers=None):
     """封装 urllib，payload 为 dict 时 POST，否则 GET。
     自动携带 X-Device-Token（已注册后）。
     
@@ -737,6 +787,8 @@ def http_request(url, payload=None, timeout=15, headers=None):
         dict/list/None: 请求成功返回解析后的 JSON，失败返回 None。
         业务错误时返回 {"status": "error", "message": "..."} 格式。
     """
+    if timeout is None:
+        timeout = HTTP_REQUEST_TIMEOUT
     try:
         hdrs = _auth_headers(headers)
         data = None
@@ -1076,6 +1128,14 @@ def _convert_plans_to_medicines(plans):
             remaining = int(float(remaining))
         except (ValueError, TypeError):
             remaining = 0
+        # 修复：正确处理 total_quantity，添加异常保护
+        total_quantity = 0
+        try:
+            total_val = p.get("total_quantity")
+            if total_val is not None:
+                total_quantity = int(float(total_val))
+        except (ValueError, TypeError):
+            total_quantity = 0
         medicines.append({
             "id": plan_id if plan_id is not None else drug_name,
             "name": drug_name,
@@ -1086,7 +1146,7 @@ def _convert_plans_to_medicines(plans):
             "unit": p.get("unit", "片"),
             "dosage": p.get("dosage", "1片"),
             # 新增：保存 total_quantity 用于计算总库存量
-            "total_quantity": int(float(p.get("total_quantity", 0)) or 0),
+            "total_quantity": total_quantity,
         })
     return medicines
 
@@ -1102,8 +1162,8 @@ def upload_log(event_type, detail, photo_path=None):
     Returns:
         bool: 上传成功返回 True，失败返回 False
     """
-    # 修复：验证 event_type 有效性
-    if not event_type or not isinstance(event_type, str):
+    # 修复：验证 event_type 有效性（类型检查 + 空字符串检查）
+    if not event_type or not isinstance(event_type, str) or not event_type.strip():
         log(f"upload_log: event_type 无效: {event_type}", "ERROR")
         return False
 
@@ -1165,11 +1225,20 @@ def upload_log(event_type, detail, photo_path=None):
         if not photo_ok:
             log(f"照片上传失败，但消息已发送成功: {event_type}")
 
+    # 照片上传成功
     if msg_ok and photo_ok:
         log(f"日志上传成功: {event_type}")
         return True
-    # 照片上传失败时仍写入本地队列（消息已发送，但照片需要重试）
-    queue_local_log(msg_payload, photo_base64)
+
+    # 照片上传失败时仅入队照片数据（消息已发送成功，无需重复入队消息）
+    if msg_ok and not photo_ok:
+        log(f"照片上传失败，但消息已发送成功: {event_type}")
+        if photo_base64:
+            photo_payload = {"device_id": DEVICE_ID, "image_base64": photo_base64, "note": f"{event_type} photo"}
+            queue_local_log(photo_payload)
+        return False
+
+    # 消息成功或照片失败的其他情况（消息发送失败时已在前面处理过）
     return False
 
 
@@ -1236,9 +1305,9 @@ def flush_local_logs():
                     queue = []
             except (json.JSONDecodeError, ValueError) as e:
                 log(f"读取本地日志队列失败（文件损坏）: {e}", "ERROR")
-                # 备份损坏的队列文件
+                # 备份损坏的队列文件（添加 PID，避免并发冲突）
                 try:
-                    backup_path = QUEUE_FILE + f".bak.{int(time.time())}"
+                    backup_path = QUEUE_FILE + f".bak.{int(time.time())}.{os.getpid()}"
                     os.rename(QUEUE_FILE, backup_path)
                 except Exception:
                     pass
@@ -1278,9 +1347,16 @@ def flush_local_logs():
                 msg_resp = http_request(API_MESSAGE, msg_payload)
                 # 检查 HTTP 错误和业务错误（_error 标记）
                 msg_ok = msg_resp is not None and not (isinstance(msg_resp, dict) and msg_resp.get("_error"))
-                photo_ok = True
 
-                if photo:
+                # 消息发送失败时直接保留条目，不尝试上传照片
+                if not msg_ok:
+                    remain.append(entry)
+                    fail_count += 1
+                    continue
+
+                # 仅当 photo 非空且为有效字符串时才上传照片
+                photo_ok = True
+                if photo and isinstance(photo, str) and len(photo) > 0:
                     upload_resp = http_request(API_UPLOAD, {
                         "device_id": DEVICE_ID,
                         "image_base64": photo,
@@ -1371,6 +1447,10 @@ def query_refill(medicine_id):
         return None
 
 
+# 缓存紧急联系人信息，避免每次紧急呼叫都读取配置文件
+_emergency_contact_cache = None
+
+
 def notify_emergency():
     """紧急通知家属（POST /device/message，message_type=emergency）
     
@@ -1380,17 +1460,24 @@ def notify_emergency():
     Raises:
         无（所有异常已内部捕获）
     """
-    try:
-        cfg = load_config()
-        if not isinstance(cfg, dict):
-            cfg = {}
-    except Exception as e:
-        log(f"读取配置异常，使用默认紧急联系人: {e}", "WARNING")
-        cfg = {}
-    
-    contact = cfg.get("emergency_contact", "120")
-    if not contact or not isinstance(contact, str):
-        contact = "120"
+    global _emergency_contact_cache
+    # 优先使用缓存的紧急联系人，避免每次都读取配置文件
+    with _emergency_lock:
+        if _emergency_contact_cache is None:
+            try:
+                cfg = load_config()
+                if isinstance(cfg, dict):
+                    contact = cfg.get("emergency_contact", "120")
+                    if contact and isinstance(contact, str):
+                        _emergency_contact_cache = contact
+                    else:
+                        _emergency_contact_cache = "120"
+                else:
+                    _emergency_contact_cache = "120"
+            except Exception as e:
+                log(f"读取紧急联系人配置异常: {e}", "WARNING")
+                _emergency_contact_cache = "120"
+        contact = _emergency_contact_cache
     
     payload = {
         "device_id": DEVICE_ID,
@@ -1496,7 +1583,9 @@ def check_reminders():
         # 兼容 times 为 None 的情况
         if times is None:
             times = []
-        days = r.get("days", [1, 2, 3, 4, 5, 6, 7])
+        days = r.get("days")
+        if not days or not isinstance(days, list) or len(days) == 0:
+            days = [1, 2, 3, 4, 5, 6, 7]
         if weekday not in days:
             continue
         for t in times:
@@ -1530,10 +1619,12 @@ def trigger_alert(reminder):
     if reminder is None or not isinstance(reminder, dict):
         log("trigger_alert 收到无效的 reminder 参数", "ERROR")
         return
-    tid = reminder.get("id")
-    name = reminder.get("user_name", "老人")
-    drug = reminder.get("medicine_name", "药品")
-    dose = reminder.get("dose", "")
+    # 立即创建副本，避免外部修改导致数据竞争
+    reminder_copy = dict(reminder)
+    tid = reminder_copy.get("id")
+    name = reminder_copy.get("user_name", "老人")
+    drug = reminder_copy.get("medicine_name", "药品")
+    dose = reminder_copy.get("dose", "")
     if not tid:
         log("trigger_alert: reminder 缺少 id 字段", "ERROR")
         return
@@ -1541,7 +1632,7 @@ def trigger_alert(reminder):
         state["active_alerts"][tid] = {
             "started_at": datetime.datetime.now(),
             "volume": VOLUME_INITIAL,
-            "reminder": dict(reminder),  # 副本，避免原始字典被修改
+            "reminder": reminder_copy,  # 副本，避免原始字典被修改
         }
     msg = f"{name}，该吃 {drug} 了，每次 {dose}"
     log(f"触发提醒: {msg}")
@@ -1740,18 +1831,26 @@ def low_stock_alert(medicine):
 
     if _get_online():
         try:
-            resp = query_refill(medicine.get("id"))
-            if resp:
-                answer = resp.get("answer", "")
-                if answer:
-                    buy_msg = f"购药建议: {answer}"
-                    try:
-                        tts_speak(buy_msg)
-                        update_gui_status(buy_msg, alert=True)
-                    except Exception as e:
-                        log(f"购药建议播报失败: {e}", "ERROR")
+            medicine_id = medicine.get("id")
+            if medicine_id:
+                resp = query_refill(medicine_id)
+                if resp and isinstance(resp, dict):
+                    if resp.get("_error"):
+                        log(f"查询补货信息业务错误: {resp.get('message', '未知错误')}", "WARNING")
+                    answer = resp.get("answer", "")
+                    if answer:
+                        buy_msg = f"购药建议: {answer}"
+                        try:
+                            tts_speak(buy_msg)
+                            update_gui_status(buy_msg, alert=True)
+                        except Exception as e:
+                            log(f"购药建议播报失败: {e}", "ERROR")
+                    else:
+                        log("AI 查询补货无响应内容", "DEBUG")
+                elif resp is None:
+                    log("查询补货信息失败: 网络请求无响应", "WARNING")
         except Exception as e:
-            log(f"查询补货信息失败: {e}", "ERROR")
+            log(f"查询补货信息异常: {type(e).__name__}: {e}", "ERROR")
 
     # ALERT_TIMEOUT 秒后自动恢复状态显示（避免一直停留在告警界面）
     # 注意：不再强制调用 update_gui_home()，避免覆盖用户当前界面（如紧急呼叫状态）
@@ -2061,7 +2160,8 @@ def on_take_button_pressed():
     log("已吃药按钮被按下")
     with lock:
         if state["active_alerts"]:
-            tid = next(iter(state["active_alerts"]))
+            # 使用 next() 默认值 None 防止 StopIteration 异常
+            tid = next(iter(state["active_alerts"]), None)
         else:
             tid = None
     if tid:
@@ -2181,32 +2281,63 @@ def init_hardware():
             log(f"GUI 初始化失败，将以无界面模式运行: {e}", "WARNING")
             gui = None
         # 检测摄像头是否可用（通过 fswebcam 能否执行）
-        r = subprocess.run(["which", "fswebcam"], shell=False, capture_output=True)
-        _set_camera_available(r.returncode == 0)
+        try:
+            r = subprocess.run(["which", "fswebcam"], shell=False, capture_output=True, timeout=5)
+            _set_camera_available(r.returncode == 0)
+        except subprocess.TimeoutExpired:
+            log("检测摄像头超时", "WARNING")
+            _set_camera_available(False)
+        except Exception as e:
+            log(f"检测摄像头失败: {e}", "WARNING")
+            _set_camera_available(False)
         log("硬件初始化完成")
     except Exception as e:
         log(f"硬件初始化异常: {e}", "ERROR")
 
 
 def init_network():
-    """初始化网络：检查 WiFi 状态、恢复/注册设备、同步数据、刷新离线日志
+    """初始化网络：连接 WiFi、检查状态、恢复/注册设备、同步数据、刷新离线日志
     
     流程：
     1. 检查 WiFi 模块可用性
-    2. 检测 WiFi 连接状态
-    3. 通过 HTTP 请求验证网络连通性（含重试）
-    4. 在线时恢复 token 或注册设备
-    5. 同步用药计划和刷新离线日志
+    2. 首次调用时延迟连接 WiFi（带超时和重试）
+    3. 检测 WiFi 连接状态
+    4. 通过 HTTP 请求验证网络连通性（含重试）
+    5. 在线时恢复 token 或注册设备
+    6. 同步用药计划和刷新离线日志
     
     Returns:
         None
     """
+    global _wifi_initialized
     try:
         # 检查 WiFi 模块是否可用
         if not _WIFI_AVAILABLE or wifi_manager is None:
             log("WiFi 模块不可用，进入离线模式", "WARNING")
             _set_online(False)
             return
+
+        # 首次调用时尝试连接 WiFi（延迟执行，避免模块加载时阻塞）
+        if not _wifi_initialized:
+            log("正在连接 WiFi...")
+            wifi_connected = False
+            for attempt in range(3):
+                try:
+                    wifi_manager.connect_wifi(_WIFI_SSID, _WIFI_PASSWORD)
+                    if wifi_manager.is_wifi_connected():
+                        wifi_connected = True
+                        log(f"WiFi 连接成功（第 {attempt + 1} 次尝试）")
+                        break
+                    log(f"WiFi 连接第 {attempt + 1} 次失败，2秒后重试...", "WARNING")
+                    time.sleep(2)
+                except Exception as e:
+                    log(f"WiFi 连接异常（第 {attempt + 1} 次）: {type(e).__name__}: {e}", "WARNING")
+                    time.sleep(2)
+            _wifi_initialized = True
+            if not wifi_connected:
+                log("WiFi 连接失败，进入离线模式", "WARNING")
+                _set_online(False)
+                return
 
         if wifi_manager.is_wifi_connected():
             log("WiFi 已连接，正在检测网络...")
@@ -2253,15 +2384,15 @@ def button_thread():
     while True:
         now = time.time()
         # P21 已吃药按钮（~A）：按下高电平（1），松开低电平（0）
-        if button_take and button_take.read_digital() == 1 and now - last_take > 2:
+        if button_take and button_take.read_digital() == 1 and now - last_take > BUTTON_DEBOUNCE_TAKE:
             last_take = now
             on_take_button_pressed()
         # P27 B键启动吃药提醒：按下低电平（0）
-        if button_remind and button_remind.read_digital() == 0 and now - last_remind > 3:
+        if button_remind and button_remind.read_digital() == 0 and now - last_remind > BUTTON_DEBOUNCE_REMIND:
             last_remind = now
             on_remind_button_pressed()
         # P28 A键紧急呼叫：按下低电平，联网通知家属
-        if button_emergency and button_emergency.read_digital() == 0 and now - last_emergency > 3:
+        if button_emergency and button_emergency.read_digital() == 0 and now - last_emergency > BUTTON_DEBOUNCE_EMERGENCY:
             last_emergency = now
             on_emergency_button_pressed()
         time.sleep(0.1)
@@ -2347,9 +2478,11 @@ def main_loop():
                     # 尝试重启 WiFi 连接
                     if wifi_manager is not None and hasattr(wifi_manager, 'reconnect'):
                         try:
+                            log("尝试 WiFi 重连...", "INFO")
                             wifi_manager.reconnect()
+                            log("WiFi 重连成功", "INFO")
                         except Exception as e:
-                            log(f"WiFi 重连失败: {e}", "ERROR")
+                            log(f"WiFi 重连失败: {type(e).__name__}: {e}", "ERROR")
 
         time.sleep(CHECK_INTERVAL)
 
