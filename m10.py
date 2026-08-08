@@ -34,17 +34,18 @@ wifi_manager = WiFiManager()
 response_success = wifi_manager.connect_wifi("666", "15756491077")
 
 # ============== 配置区 ==============
-BASE_URL = "https://my-website.ccwu.cc/eating-medication/family"
+SERVER_BASE_URL = "https://my-website.ccwu.cc/eating-medication/server"
+FAMILY_BASE_URL = "https://my-website.ccwu.cc/eating-medication/family"
 PAIR_CODE = "275527387791320"
 DEVICE_ID = "m10_" + PAIR_CODE
 
-# API 端点（兼容 BASE_URL 及其子页面）
-API_REGISTER = f"{BASE_URL}/api/device/register"
-API_REMINDERS = f"{BASE_URL}/api/reminders"
-API_LOGS = f"{BASE_URL}/api/logs"
-API_DRUG_QUERY = f"{BASE_URL}/api/drug/query"
-API_REFILL = f"{BASE_URL}/api/refill/query"
-API_EMERGENCY = f"{BASE_URL}/api/emergency/notify"
+# API 端点（v2.28.0，对应 openapi.json）
+API_REGISTER = f"{SERVER_BASE_URL}/api/v1/public/device/register"
+API_SCHEDULE = f"{SERVER_BASE_URL}/api/v1/public/device/schedule/{DEVICE_ID}"
+API_MESSAGE = f"{SERVER_BASE_URL}/api/v1/public/device/message"
+API_UPLOAD = f"{SERVER_BASE_URL}/api/v1/public/device/upload"
+API_OFFLINE = f"{SERVER_BASE_URL}/api/v1/public/device/offline"
+API_AI_ASK = f"{SERVER_BASE_URL}/api/v1/public/ai/ask"
 
 CONFIG_FILE = "/root/medication_config.json"
 LOG_FILE = "/root/medication_local.log"
@@ -81,6 +82,7 @@ CLOCK_REFRESH_INTERVAL = 1
 # ============== 全局状态 ==============
 state = {
     "online": False,
+    "device_token": None,      # 设备注册后获得，用于 X-Device-Token Header
     "last_sync": None,
     "reminders": [],          # 服药提醒列表
     "medicines": [],          # 药品库存
@@ -323,14 +325,26 @@ def image_to_base64(path):
 
 # ============== 网络通信（仅使用 urllib） ==============
 
-def http_request(url, payload=None, timeout=15):
-    """封装 urllib，payload 为 dict 时 POST，否则 GET"""
+def _auth_headers(extra=None):
+    """构建请求头，自动携带 X-Device-Token（已注册时）"""
+    headers = {"Content-Type": "application/json"}
+    token = state.get("device_token")
+    if token:
+        headers["X-Device-Token"] = token
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def http_request(url, payload=None, timeout=15, headers=None):
+    """封装 urllib，payload 为 dict 时 POST，否则 GET。
+    自动携带 X-Device-Token（已注册后）。"""
     try:
-        headers = {"Content-Type": "application/json"}
+        hdrs = _auth_headers(headers)
         data = None
         if payload is not None:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(url, data=data, headers=headers, method="POST" if data else "GET")
+        req = urllib.request.Request(url, data=data, headers=hdrs, method="POST" if data else "GET")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = resp.read().decode("utf-8")
             return json.loads(body) if body else None
@@ -340,59 +354,141 @@ def http_request(url, payload=None, timeout=15):
 
 
 def register_device():
+    """设备注册（新版 API），成功后保存 device_token"""
     payload = {
         "device_id": DEVICE_ID,
-        "pair_code": PAIR_CODE,
-        "model": "unihiker_m10",
-        "base_url": BASE_URL,
+        "device_name": None,
     }
     resp = http_request(API_REGISTER, payload)
-    if resp and resp.get("code") == 0:
+    if resp and resp.get("status") == "ok":
+        token = resp.get("device_token")
+        if token:
+            state["device_token"] = token
+            save_device_token(token)
         log("设备注册成功")
         return True
     log(f"设备注册失败: {resp}", "ERROR")
     return False
 
 
+def save_device_token(token):
+    """将 device_token 持久化到配置文件，重启后可恢复"""
+    try:
+        cfg = load_config()
+        cfg["device_token"] = token
+        save_config(cfg)
+    except Exception as e:
+        log(f"保存 device_token 失败: {e}", "WARNING")
+
+
+def load_device_token():
+    """从配置文件恢复 device_token"""
+    try:
+        cfg = load_config()
+        token = cfg.get("device_token")
+        if token:
+            state["device_token"] = token
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def sync_reminders():
-    url = f"{API_REMINDERS}?device_id={DEVICE_ID}&pair_code={PAIR_CODE}"
-    resp = http_request(url)
-    if resp and resp.get("code") == 0:
+    """获取用药计划（新版 API：GET /device/schedule/{id}）"""
+    resp = http_request(API_SCHEDULE)
+    if resp:
+        plans = resp if isinstance(resp, list) else resp.get("plans", resp.get("data", []))
         with lock:
-            state["reminders"] = resp.get("data", {}).get("reminders", [])
-            state["medicines"] = resp.get("data", {}).get("medicines", [])
+            state["reminders"] = _convert_plans_to_reminders(plans)
+            state["medicines"] = _convert_plans_to_medicines(plans)
             state["last_sync"] = datetime.datetime.now().isoformat()
-        log(f"同步提醒: {len(state['reminders'])} 条")
+        log(f"同步用药计划: {len(plans)} 条")
         return True
     return False
+
+
+def _convert_plans_to_reminders(plans):
+    """将 FamilyMedicationPlan 数组转换为旧版 reminders 格式"""
+    reminders = []
+    for p in plans:
+        times = p.get("schedule_times", [])
+        reminders.append({
+            "id": p.get("id", str(p.get("drug_name", ""))),
+            "medicine_name": p.get("drug_name", ""),
+            "dose": p.get("dosage", "1片"),
+            "times": times if isinstance(times, list) else [times],
+            "days": [1, 2, 3, 4, 5, 6, 7],
+            "medicine_id": p.get("id"),
+            "dose_count": 1,
+            "user_name": "老人",
+        })
+    return reminders
+
+
+def _convert_plans_to_medicines(plans):
+    """将 FamilyMedicationPlan 数组转换为旧版 medicines 库存格式"""
+    medicines = []
+    for p in plans:
+        medicines.append({
+            "id": p.get("id"),
+            "name": p.get("drug_name", ""),
+            "remaining": p.get("remaining_quantity", 0),
+            "per_time": 1,
+            "frequency_per_day": 1,
+            "threshold": p.get("low_stock_threshold", 5),
+            "unit": p.get("unit", "片"),
+            "dosage": p.get("dosage", "1片"),
+        })
+    return medicines
 
 
 def upload_log(event_type, detail, photo_path=None):
-    payload = {
+    """上报设备事件（新版 API：POST /device/message + /device/upload）"""
+    msg_payload = {
         "device_id": DEVICE_ID,
-        "pair_code": PAIR_CODE,
-        "event_type": event_type,
-        "detail": detail,
-        "timestamp": datetime.datetime.now().isoformat(),
+        "message_type": event_type,
+        "content": str(detail) if isinstance(detail, (str, int, float)) else "",
+        "data": detail if isinstance(detail, dict) else {"detail": str(detail)},
     }
+    photo_base64 = None
     if photo_path and os.path.exists(photo_path):
-        payload["photo"] = image_to_base64(photo_path)
-    resp = http_request(API_LOGS, payload)
-    if resp and resp.get("code") == 0:
+        photo_base64 = image_to_base64(photo_path)
+
+    # 1. 上传消息事件
+    msg_resp = http_request(API_MESSAGE, msg_payload)
+    msg_ok = msg_resp is not None
+
+    # 2. 如有照片，单独上传
+    if photo_base64:
+        upload_payload = {
+            "device_id": DEVICE_ID,
+            "image_base64": photo_base64,
+            "note": f"{event_type} photo",
+        }
+        upload_resp = http_request(API_UPLOAD, upload_payload)
+        photo_ok = upload_resp is not None
+    else:
+        photo_ok = True
+
+    if msg_ok and photo_ok:
         log(f"日志上传成功: {event_type}")
         return True
     # 离线时写入本地队列
-    queue_local_log(payload)
+    queue_local_log(msg_payload, photo_base64)
     return False
 
 
-def queue_local_log(payload):
+def queue_local_log(payload, photo_base64=None):
     try:
         queue = []
         if os.path.exists(QUEUE_FILE):
             with open(QUEUE_FILE, "r", encoding="utf-8") as f:
                 queue = json.load(f)
-        queue.append(payload)
+        entry = payload.copy()
+        if photo_base64:
+            entry["_photo"] = photo_base64
+        queue.append(entry)
         with open(QUEUE_FILE, "w", encoding="utf-8") as f:
             json.dump(queue, f, ensure_ascii=False)
     except Exception as e:
@@ -406,10 +502,20 @@ def flush_local_logs():
         with open(QUEUE_FILE, "r", encoding="utf-8") as f:
             queue = json.load(f)
         remain = []
-        for payload in queue:
-            resp = http_request(API_LOGS, payload)
-            if not (resp and resp.get("code") == 0):
-                remain.append(payload)
+        for entry in queue:
+            photo = entry.pop("_photo", None)
+            msg_resp = http_request(API_MESSAGE, entry)
+            msg_ok = msg_resp is not None
+            photo_ok = True
+            if photo:
+                upload_resp = http_request(API_UPLOAD, {
+                    "device_id": DEVICE_ID,
+                    "image_base64": photo,
+                    "note": "offline upload",
+                })
+                photo_ok = upload_resp is not None
+            if not (msg_ok and photo_ok):
+                remain.append(entry)
         with open(QUEUE_FILE, "w", encoding="utf-8") as f:
             json.dump(remain, f, ensure_ascii=False)
         log(f"刷新本地日志: 成功 {len(queue) - len(remain)}, 剩余 {len(remain)}")
@@ -418,28 +524,37 @@ def flush_local_logs():
 
 
 def query_drug_by_ocr(text):
-    payload = {"device_id": DEVICE_ID, "pair_code": PAIR_CODE, "text": text}
-    return http_request(API_DRUG_QUERY, payload)
+    """AI 问答替代旧版药品查询（POST /public/ai/ask）"""
+    payload = {"question": f"识别药品：{text}", "context": []}
+    return http_request(API_AI_ASK, payload)
 
 
 def query_refill(medicine_id):
-    payload = {"device_id": DEVICE_ID, "pair_code": PAIR_CODE, "medicine_id": medicine_id}
-    return http_request(API_REFILL, payload)
+    """查询补货信息（AI 问答方式）"""
+    payload = {"question": f"药品 ID {medicine_id} 最优购买渠道", "context": []}
+    return http_request(API_AI_ASK, payload)
 
 
 def notify_emergency(contact="120"):
+    """紧急通知家属（POST /device/message，message_type=emergency）"""
     payload = {
         "device_id": DEVICE_ID,
-        "pair_code": PAIR_CODE,
-        "contact": contact,
-        "timestamp": datetime.datetime.now().isoformat(),
+        "message_type": "emergency",
+        "content": f"紧急呼叫，联系电话 {contact}",
+        "data": {"contact": contact, "timestamp": datetime.datetime.now().isoformat()},
     }
-    resp = http_request(API_EMERGENCY, payload)
-    if resp and resp.get("code") == 0:
+    resp = http_request(API_MESSAGE, payload)
+    if resp is not None:
         tts_speak("紧急通知已发送给家属")
         return True
     tts_speak("紧急通知发送失败，请手动拨打 120")
     return False
+
+
+def device_offline():
+    """设备主动下线通知"""
+    payload = {"device_id": DEVICE_ID}
+    http_request(API_OFFLINE, payload, timeout=5)
 
 
 # ============== 提醒核心 ==============
@@ -736,9 +851,14 @@ def on_take_button_pressed():
 
 
 def on_emergency_button_pressed():
-    """P28 A键：紧急呼叫（仅记录日志，不鸣叫，联网功能后续再接入）"""
-    log("紧急按钮被按下（仅记录日志，联网呼叫功能待后续接入）", "WARNING")
-    update_gui_status("已记录紧急呼叫", alert=True)
+    """P28 A键：紧急呼叫（通过新版 API 通知家属）"""
+    log("紧急按钮被按下，正在通知家属...", "WARNING")
+    update_gui_status("正在发送紧急通知...", alert=True)
+    success = notify_emergency()
+    if success:
+        update_gui_status("已通知家属", alert=True)
+    else:
+        update_gui_status("通知失败，请手动拨打 120", alert=True)
 
 
 def on_remind_button_pressed():
@@ -790,7 +910,9 @@ def init_network():
     if wifi_manager.is_wifi_connected():
         state["online"] = check_network()
         if state["online"]:
-            register_device()
+            # 尝试从本地恢复 device_token，否则重新注册
+            if not load_device_token():
+                register_device()
             sync_reminders()
             flush_local_logs()
     else:
@@ -891,4 +1013,5 @@ if __name__ == "__main__":
     except Exception as e:
         log(f"主程序异常: {traceback.format_exc()}", "CRITICAL")
     finally:
+        device_offline()
         stop_speech()

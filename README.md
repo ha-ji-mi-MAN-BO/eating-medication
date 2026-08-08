@@ -88,10 +88,19 @@ response_success = wifi_manager.connect_wifi("666", "15756491077")
 其余主要常量集中在 `m10.py` 顶部的「配置区」，按实际环境修改：
 
 ```python
-# 服务端地址与设备配对码
-BASE_URL = "https://my-website.ccwu.cc/eating-medication/family"
+# 服务端地址（API）与家属端地址（参考）
+SERVER_BASE_URL = "https://my-website.ccwu.cc/eating-medication/server"
+FAMILY_BASE_URL = "https://my-website.ccwu.cc/eating-medication/family"
 PAIR_CODE = "275527387791320"
 DEVICE_ID = "m10_" + PAIR_CODE
+
+# 新版 API 端点（v2.28.0）
+API_REGISTER = f"{SERVER_BASE_URL}/api/v1/public/device/register"
+API_SCHEDULE = f"{SERVER_BASE_URL}/api/v1/public/device/schedule/{DEVICE_ID}"
+API_MESSAGE = f"{SERVER_BASE_URL}/api/v1/public/device/message"
+API_UPLOAD = f"{SERVER_BASE_URL}/api/v1/public/device/upload"
+API_OFFLINE = f"{SERVER_BASE_URL}/api/v1/public/device/offline"
+API_AI_ASK = f"{SERVER_BASE_URL}/api/v1/public/ai/ask"
 
 # 固定服药提醒时间
 FIXED_REMINDER_TIMES = ["09:00", "13:00", "17:00"]
@@ -109,11 +118,15 @@ TTS_RATE = 200
 CLOCK_REFRESH_INTERVAL = 1
 ```
 
+### device_token 持久化
+
+设备首次注册成功后，`device_token` 会自动写入 `/root/medication_config.json`。后续启动时 `init_network()` 会优先从配置文件恢复 token，无需重复注册。若 token 失效，删除配置文件中的 `device_token` 字段即可强制重新注册。
+
 ### 运行时文件
 
 | 路径 | 用途 |
 |------|------|
-| `/root/medication_config.json` | 药品库存等运行时配置（不再包含 WiFi） |
+| `/root/medication_config.json` | 药品库存、`device_token` 等运行时配置 |
 | `/root/medication_local.log` | 本地运行日志 |
 | `/root/medication_log_queue.json` | 离线日志队列（网络恢复后自动回传） |
 | `/root/medication_photos/` | 服药确认照片与 OCR 照片 |
@@ -137,17 +150,26 @@ nohup python3 m10.py > /root/m10_stdout.log 2>&1 &
 ```
 m10.py
 ├── 模块级初始化          # WiFiManager 自动连接 + WiFi 凭据硬编码
-├── 配置区              # BASE_URL / 配对码 / API 端点 / 引脚 / 音量 / 提醒时间
-├── 全局状态            # state 字典（在线/提醒/库存/活跃提醒等）
+├── 配置区              # SERVER_BASE_URL / FAMILY_BASE_URL / 配对码 / 新版 API 端点 / 引脚 / 音量 / 提醒时间
+├── 全局状态            # state 字典（在线/device_token/提醒/库存/活跃提醒等）
 ├── 工具函数            # 日志 / 配置读写 / 网络探测 / 音量控制
 ├── TTS 语音播报        # pyttsx3 队列 + espeak 回退 + 音量联动
-├── 网络通信            # urllib 封装 / 设备注册 / 提醒同步 / 日志上传 / 紧急呼叫
+├── 网络通信（新版 API）
+│   ├── _auth_headers()       # 自动注入 X-Device-Token
+│   ├── http_request()        # urllib 封装
+│   ├── register_device()     # POST /device/register → 保存 device_token
+│   ├── load_device_token()   # 从配置恢复 token
+│   ├── sync_reminders()      # GET /device/schedule/{id} → 转换为内部格式
+│   ├── upload_log()          # POST /device/message + /device/upload
+│   ├── notify_emergency()    # POST /device/message（message_type=emergency）
+│   ├── device_offline()      # POST /device/offline
+│   └── query_drug_by_ocr()   # POST /ai/ask（AI 问答）
 ├── 提醒核心            # 固定提醒 / 服务端提醒 / trigger_alert / alert_loop / 服药确认
-├── AI 药品识别         # fswebcam 拍照 + pytesseract OCR + 服务端查询
+├── AI 药品识别         # fswebcam 拍照 + pytesseract OCR + AI 问答
 ├── 余量监测            # 剩余天数计算 + 低库存告警
 ├── GUI 更新            # 主页时钟 / 状态提示 / 提醒界面（三种模式）
-├── 按钮处理            # P21 确认 / P27 提醒 / P28 紧急
-└── 初始化与主循环      # 硬件初始化 / 网络初始化 / 时钟线程 / 按钮线程 / 主循环
+├── 按钮处理            # P21 确认 / P27 提醒 / P28 紧急（联网呼叫）
+└── 初始化与主循环      # 硬件初始化 / 网络初始化（含 token 恢复） / 线程启动 / 主循环 / 退出时下线通知
 ```
 
 ## 工作流程
@@ -157,7 +179,7 @@ m10.py
 1. **模块加载** → `WiFiManager.connect_wifi()` 自动连接 WiFi
 2. **初始化硬件** → `Board().begin()` + 蜂鸣器 + 按钮 + GUI
 3. **初始化 TTS** → `pyttsx3` 引擎 + 后台播报线程
-4. **初始化网络** → `wifi_manager.is_wifi_connected()` 检查 → 在线则注册设备/同步提醒/刷新日志
+4. **初始化网络** → `wifi_manager.is_wifi_connected()` 检查 → 尝试从本地恢复 `device_token` → 无 token 则注册设备 → 同步提醒 → 刷新离线日志
 5. **启动线程** → 按钮轮询线程 + 时钟刷新线程
 6. **进入主循环**
 
@@ -175,28 +197,143 @@ m10.py
 
 | 按钮 | 引脚 | 触发条件 | 行为 |
 |------|------|---------|------|
-| 已吃药（~A） | P21 | 按下高电平（1） | 确认服药 → 拍照上传 → 扣减库存 → 返回主页 |
+| 已吃药（~A） | P21 | 按下高电平（1） | 确认服药 → 拍照上传（`/device/upload`）→ 发送消息（`/device/message`）→ 扣减库存 → 返回主页 |
 | 启动提醒（B） | P27 | 按下低电平（0） | 立即启动一次服药提醒（测试药品 1片） |
-| 紧急呼叫（A） | P28 | 按下低电平（0） | 记录紧急日志 → 显示"已记录紧急呼叫" |
+| 紧急呼叫（A） | P28 | 按下低电平（0） | 通过 `/device/message`（message_type=emergency）通知家属 → 语音播报结果 |
 
 ### 时钟线程（每秒一次）
 
 仅在 `_gui_mode == "home"` 时刷新主页日期与时分秒文本对象，避免与提醒/状态界面冲突。
 
-## 与网页端的关系
+## API 接口规范
 
-`m10.py` 通过 HTTP 与 [eating-medication](https://github.com/diaoyunxi/eating-medication) 服务端通信：
+`m10.py` 通过 HTTP 与 [eating-medication](https://github.com/diaoyunxi/eating-medication) 服务端通信。API 规范详见 [`openapi.json`](file:///e:/m10/eating-medication/openapi.json)（OpenAPI 3.1.0）。
 
-| 接口 | 方法 | 用途 |
-|------|------|------|
-| `/api/device/register` | POST | 设备注册（携带 device_id + pair_code） |
-| `/api/reminders` | GET | 同步用药提醒与药品库存 |
-| `/api/logs` | POST | 上传服药/紧急/识别日志（含拍照 base64） |
-| `/api/drug/query` | POST | OCR 文本查询药品信息 |
-| `/api/refill/query` | POST | 查询补货最优价格 |
-| `/api/emergency/notify` | POST | 紧急呼叫通知家属 |
+### 基础信息
 
-> ⚠️ **API 迁移说明**：当前 `m10.py` 使用旧版接口路径，与 `openapi.json` 定义的新版 `/api/v1/public/device/*` 接口存在差异，后续版本将逐步切换。
+| 项目 | 值 |
+|------|-----|
+| 服务端基础路径 | `/eating-medication/server` |
+| API 版本 | v2.28.0 |
+| 认证方式 | 设备注册后返回 `device_token`，后续请求通过 `X-Device-Token` Header 校验 |
+| 限流 | 设备端基于 IP 限流；部分接口需 `device_token` |
+
+### 设备端公开接口
+
+以下接口位于 `openapi.json` 的 `设备公开接口` tag，供 M10 老人端调用：
+
+| 接口路径 | 方法 | 用途 | 认证 |
+|----------|------|------|------|
+| `/api/v1/public/device/register` | POST | 设备注册/心跳上报 | 无需 |
+| `/api/v1/public/device/offline` | POST | 设备主动下线通知 | `X-Device-Token` |
+| `/api/v1/public/device/message` | POST | 上报设备消息（服药/紧急/识别等事件） | `X-Device-Token` |
+| `/api/v1/public/device/upload` | POST | 上传服药照片（base64 编码） | `X-Device-Token` |
+| `/api/v1/public/device/schedule/{device_id}` | GET | 获取用药计划（每分钟轮询） | `X-Device-Token` |
+| `/api/v1/public/device/plans/{device_id}` | GET | 获取所有用药计划 | `X-Device-Token` |
+| `/api/v1/public/device/records/{device_id}` | GET | 获取服药历史记录 | `X-Device-Token` |
+| `/api/v1/public/device/check/{device_id}` | GET | 检查设备是否已注册 | 无需 |
+| `/api/v1/public/device/status/{device_id}` | GET | 获取设备在线状态 | `X-Device-Token` |
+| `/api/v1/public/ai/ask` | POST | AI 健康问答（设备端，IP 限流 10次/分钟） | 可选 `X-Device-Token` |
+
+### 关键接口请求/响应格式
+
+#### 1. 设备注册 — `POST /api/v1/public/device/register`
+
+**请求体** (`DeviceRegister`)：
+```json
+{
+  "device_id": "m10_275527387791320",
+  "device_name": null
+}
+```
+
+**响应**：
+```json
+{
+  "status": "ok",
+  "user_id": 123,
+  "device_token": "dh_xxxxx"   // 首次注册返回，后续请求需携带
+}
+```
+
+> 查找逻辑：优先按 `User.device_id` 查找（家属已绑定）→ 回退按 `User.username == device_id` 查找 → 都找不到则创建虚拟用户。
+
+#### 2. 设备消息上报 — `POST /api/v1/public/device/message`
+
+**请求体** (`DeviceMessage`)：
+```json
+{
+  "device_id": "m10_275527387791320",
+  "message_type": "info",
+  "content": "服药确认",
+  "data": {
+    "action": "confirm_take",
+    "medicine": "测试药品",
+    "user": "老人"
+  }
+}
+```
+
+**Header**：`X-Device-Token: dh_xxxxx`
+
+#### 3. 服药照片上传 — `POST /api/v1/public/device/upload`
+
+**请求体** (`DeviceUpload`)：
+```json
+{
+  "device_id": "m10_275527387791320",
+  "image_base64": "/9j/4AAQSkZJRg...",
+  "note": "服药确认照片"
+}
+```
+
+#### 4. 用药计划查询 — `GET /api/v1/public/device/schedule/{device_id}`
+
+**路径参数**：`device_id` — 设备唯一标识
+
+**Header**：`X-Device-Token: dh_xxxxx`
+
+**响应**：用药计划列表（`FamilyMedicationPlan` 数组），包含：
+- `drug_name` / `dosage` / `frequency` / `schedule_times`
+- `total_quantity` / `remaining_quantity` / `unit`
+- `low_stock_threshold`
+
+#### 5. AI 问答 — `POST /api/v1/public/ai/ask`
+
+**请求体**：
+```json
+{
+  "question": "老人吃什么药比较好？",
+  "context": []
+}
+```
+
+**响应**：
+```json
+{
+  "answer": "根据老人的情况，建议..."
+}
+```
+
+### 已完成的 API 迁移
+
+`m10.py` 已完成向 `openapi.json` v2.28.0 新版 API 的迁移：
+
+| 旧版路径 | 新版路径 | 状态 |
+|---------|---------|------|
+| `POST /api/device/register` | `POST /api/v1/public/device/register` | ✅ 已迁移 |
+| `GET /api/reminders` | `GET /api/v1/public/device/schedule/{device_id}` | ✅ 已迁移 |
+| `POST /api/logs` | `POST /api/v1/public/device/message` + `POST /api/v1/public/device/upload` | ✅ 已迁移 |
+| `POST /api/emergency/notify` | `POST /api/v1/public/device/message`（message_type=emergency） | ✅ 已迁移 |
+| `POST /api/drug/query` | `POST /api/v1/public/ai/ask`（AI 问答替代） | ✅ 已迁移 |
+| `POST /api/refill/query` | `POST /api/v1/public/ai/ask`（AI 问答替代） | ✅ 已迁移 |
+| — | `POST /api/v1/public/device/offline` | ✅ 新增（下线通知） |
+
+**认证机制变更**：旧版使用 `pair_code` 参数传递身份，新版改为 `X-Device-Token` Header。设备首次注册成功后返回 `device_token`，自动持久化到配置文件，后续启动可直接恢复无需重新注册。
+
+**数据格式变更**：
+- 旧版 `sync_reminders()` 接收 `{code, data: {reminders, medicines}}`
+- 新版 `sync_reminders()` 接收 `FamilyMedicationPlan[]`，通过 `_convert_plans_to_reminders()` / `_convert_plans_to_medicines()` 自动转换为兼容的内部格式
 
 ## 版本与更新
 
