@@ -226,7 +226,7 @@ m10.py
 | 项目 | 值 |
 |------|-----|
 | 服务端基础路径 | `/eating-medication/server` |
-| API 版本 | v2.28.0（当前修复版：v2.29.9） |
+| API 版本 | v2.28.0（当前修复版：v2.30.0） |
 | 认证方式 | 设备注册后返回 `device_token`，后续请求通过 `X-Device-Token` Header 校验 |
 | 限流 | 设备端基于 IP 限流；部分接口需 `device_token` |
 
@@ -495,6 +495,14 @@ m10.py
 | 13 | 🟢 | OCR 引擎加载失败后无法重置，需重启设备 | 新增 `reset_ocr_engine()` 函数，支持运行时重置 |
 | 14 | 🟢 | `_get_ocr_engine()` 缺少文档说明 | 添加详细 docstring，说明返回值和异常情况 |
 | 15 | 🟢 | `flush_local_logs()` 的 `_flush_in_progress` 事件可能因异常未释放 | 添加 finally 块确保事件清理 |
+
+### 已完成的 Bug 修复（v2.30.0，共 3 项）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | 设备 ID 变更后本地旧 token 失效，服务器返回 404"设备未注册"，所有接口（schedule/message/upload）均失败 | `http_request()` 检测 404 + "设备未注册"时设置 `_device_needs_re_register` 标志；`main_loop` 检测后调用 `clear_device_token()` 清除旧 token 并 `register_device()` 重新注册 |
+| 2 | 🟢 新增 | 缺少心跳机制，服务器无法感知设备是否在线 | 新增 `send_heartbeat()` 函数，`main_loop` 每 20 秒向 register 接口发送心跳（首次注册返回 token，已注册设备仅更新 `last_heartbeat_at`） |
+| 3 | 🟢 新增 | 无法清除失效的本地 token | 新增 `clear_device_token()` 函数，同时清除内存和配置文件中的 token |
 
 ### 已完成的 Bug 修复（v2.29.9，共 2 项）
 

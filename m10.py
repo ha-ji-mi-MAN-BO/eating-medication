@@ -5,10 +5,15 @@ UniHiker M10 智能服药提醒终端主程序
 项目地址适配: https://my-website.ccwu.cc/eating-medication/server/
 设备配对码: 2AIDMUNIHIKER13
 API 版本: v2.28.0（对应 openapi.json）
-当前代码版本: v2.29.9
+当前代码版本: v2.30.0
 
 本程序使用 Python 标准库 + UniHiker 原生 API (unihiker/pinpong) + pyttsx3 TTS,
 不依赖 cv2、requests、schedule 等第三方库。
+
+v2.30.0 修复记录（共 3 项，新增心跳机制和 404 自动重注，涵盖网络通信、注册逻辑）：
+- 【致命】http_request() 检测到 404"设备未注册"时设置 _device_needs_re_register 标志，main_loop 检测后清除旧 token 并重新注册（解决设备 ID 变更后旧 token 失效导致所有接口 404 的问题）
+- 【新增】send_heartbeat() 心跳函数，每 20 秒向 register 接口发送心跳（首次注册返回 token，已注册设备仅更新心跳）
+- 【新增】clear_device_token() 函数，清除内存和本地配置中的失效 token
 
 v2.29.9 修复记录（共 2 项 bug 修复，涵盖网络通信、注册逻辑）：
 - 【致命】_auth_headers() 缺少 User-Agent 头，导致 Cloudflare 返回 403 error code:1010 拦截所有 API 请求（注册、同步、上传均失败）
@@ -263,6 +268,7 @@ MAX_PHOTO_SIZE = 512000          # 照片上传最大大小（500KB）
 MAX_IMAGE_SIZE = 1048576         # 图片 base64 编码最大大小（1MB）
 NETWORK_RECONNECT_INTERVAL = 30  # 网络恢复检查间隔（秒）
 MAX_RECONNECT_FAILS = 5          # 网络恢复最大失败次数
+HEARTBEAT_INTERVAL = 20          # 心跳上报间隔（秒），向 register 接口发送心跳
 STOCK_CHECK_INTERVAL = 6 * 3600  # 库存检查间隔（6 小时）
 LOG_FLUSH_INTERVAL = 30 * 60     # 日志刷新间隔（30 分钟）
 ALERT_TIMEOUT = 30               # 低库存告警超时（秒）
@@ -303,6 +309,9 @@ _log_lock = threading.Lock()      # 保护日志文件写入与轮转
 _camera_lock = threading.Lock()  # 保护摄像头访问，避免多线程并发拍照冲突
 _emergency_lock = threading.Lock()  # 保护紧急联系人缓存的并发访问
 _volume_lock = threading.Lock()  # 保护音量控制命令缓存的并发访问
+
+# 设备未注册标志：检测到 404"设备未注册"时置位，main_loop 检测后清除旧 token 并重新注册
+_device_needs_re_register = threading.Event()
 
 gui = None
 buzzer = None
@@ -831,6 +840,10 @@ def http_request(url, payload=None, timeout=None, headers=None):
             error_body = e.read().decode("utf-8", errors="ignore")
         except Exception:
             pass
+        # 检测 404"设备未注册"：device_id 在服务器不存在，token 已失效，需重新注册
+        if e.code == 404 and "设备未注册" in error_body:
+            log("设备未注册（device_id 在服务器不存在），标记需要重新注册", "WARNING")
+            _device_needs_re_register.set()
         # 日志脱敏：限制错误响应体长度，避免泄露敏感信息
         log(f"HTTP {e.code} 请求失败 {url}: {error_body[:100] if error_body else '无响应体'}", "ERROR")
         return None
@@ -878,6 +891,40 @@ def register_device():
         return False
 
 
+def send_heartbeat():
+    """发送心跳到 register 接口
+
+    服务端 register_or_heartbeat 逻辑：
+    - 首次注册（设备不存在）：创建虚拟用户，返回 device_token
+    - 已注册设备：仅更新 last_heartbeat_at，不返回 token（防枚举攻击）
+
+    因此心跳时无 token 返回是正常行为，有 token 则保存（兼容设备 ID 变更场景）。
+    """
+    payload = {
+        "device_id": DEVICE_ID,
+        "device_name": None,
+    }
+    try:
+        resp = http_request(API_REGISTER, payload)
+    except Exception as e:
+        log(f"心跳异常: {e}", "ERROR")
+        return False
+
+    if resp is None:
+        return False
+
+    if isinstance(resp, dict) and resp.get("status") == "ok":
+        # 首次注册会返回 token，已注册设备不返回
+        token = resp.get("device_token")
+        if token:
+            _set_device_token(token)
+            save_device_token(token)
+            log("心跳发现新 token，已保存（设备 ID 可能已变更）")
+        return True
+
+    return False
+
+
 def save_device_token(token):
     """将 device_token 持久化到配置文件，重启后可恢复"""
     if not token:
@@ -919,6 +966,24 @@ def load_device_token():
     except Exception as e:
         log(f"加载 device_token 失败: {e}", "WARNING")
     return False
+
+
+def clear_device_token():
+    """清除设备令牌（内存 + 本地配置文件）
+
+    当服务器返回 404"设备未注册"时调用，清除失效的旧 token，
+    使后续请求不再携带无效 token，并触发重新注册。
+    """
+    _set_device_token(None)
+    try:
+        cfg = load_config()
+        if cfg and cfg.get("device_token"):
+            cfg.pop("device_token", None)
+            cfg.pop("device_token_saved_at", None)
+            save_config(cfg)
+            log("已清除本地 device_token（设备未注册，token 已失效）")
+    except Exception as e:
+        log(f"清除本地 device_token 失败: {e}", "WARNING")
 
 
 def sync_reminders():
@@ -2369,6 +2434,10 @@ def init_network():
                         log("设备注册失败，进入离线模式", "ERROR")
                         _set_online(False)
                         return
+                else:
+                    # 本地有 token，发心跳确认 device_id 在服务器已注册
+                    # （设备 ID 变更后旧 token 失效，心跳会触发服务端创建新用户并返回新 token）
+                    send_heartbeat()
                 log("正在同步用药计划...")
                 sync_reminders()
                 log("正在刷新离线日志...")
@@ -2416,6 +2485,7 @@ def main_loop():
     missed_minutes = 0  # 追踪连续错过的分钟数
     reconnect_fail_count = 0  # 网络恢复失败计数
     _sync_thread = None  # 网络恢复同步线程引用
+    last_heartbeat = 0  # 上次心跳时间戳
 
     def _do_network_recovery_sync():
         """网络恢复后的数据同步操作（仅定义一次，复用闭包）
@@ -2461,6 +2531,22 @@ def main_loop():
             last_hour = now.hour
             if _get_online():
                 sync_reminders()
+
+        # 检测设备未注册（404），清除旧 token 并重新注册
+        if _device_needs_re_register.is_set() and _get_online():
+            _device_needs_re_register.clear()
+            log("检测到设备未注册，清除旧 token 并重新注册...", "WARNING")
+            clear_device_token()
+            if register_device():
+                log("重新注册成功，正在同步用药计划...", "INFO")
+                sync_reminders()
+            else:
+                log("重新注册失败，稍后重试", "WARNING")
+
+        # 每 HEARTBEAT_INTERVAL 秒发送心跳（在线时）
+        if _get_online() and time.time() - last_heartbeat > HEARTBEAT_INTERVAL:
+            last_heartbeat = time.time()
+            send_heartbeat()
 
         # 每 STOCK_CHECK_INTERVAL 检查库存
         if time.time() - last_stock_check > STOCK_CHECK_INTERVAL:
