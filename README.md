@@ -335,7 +335,7 @@ m10.py
 - 旧版 `sync_reminders()` 接收 `{code, data: {reminders, medicines}}`
 - 新版 `sync_reminders()` 接收 `FamilyMedicationPlan[]`，通过 `_convert_plans_to_reminders()` / `_convert_plans_to_medicines()` 自动转换为兼容的内部格式
 
-### 已完成的 Bug 修复（v2.28.1）
+### 已完成的 Bug 修复（v2.28.2，共 23 项）
 
 | # | 严重度 | 描述 | 修复方案 |
 |---|--------|------|----------|
@@ -349,6 +349,19 @@ m10.py
 | 8 | 🟡 | `finally` 中 `device_offline()` 无异常保护，可能阻断 `stop_speech()` | 包裹 try/except |
 | 9 | 🟡 | `confirm_take()` 读取 `state["active_alerts"]` 未加锁 | 加 `with lock:` 保护 |
 | 10 | 🟡 | `check_network()` 硬编码旧域名 | 改用 `SERVER_BASE_URL` 常量 |
+| 11 | 🔴 | 紧急按钮 `notify_emergency()` 阻塞 `button_thread` 最长 30 秒 | 改为 `threading.Thread` 异步执行 |
+| 12 | 🔴 | `update_stock()` 中 `load_config()`/`save_config()` 文件 I/O 在 `with lock:` 内 | 将 I/O 移到锁外，锁内仅修改内存状态 |
+| 13 | 🔴 | `low_stock_alert()` 接收 `state["medicines"]` 中 dict 的可变引用，其他线程修改会导致数据竞争 | 传递 `dict(m)` 副本；同样修复 `calculate_remaining_days()` |
+| 14 | 🔴 | `confirm_take()` 中 `upload_log()` 阻塞 `button_thread` 最长 30 秒 | 改为 `threading.Thread` 异步执行 |
+| 15 | 🟡 | `recognize_medicine()` 每次调用都 `import pytesseract`/`PIL` | 新增 `_get_ocr_engine()` 延迟加载并缓存 |
+| 16 | 🟡 | `_auth_headers()` 读取 `state["device_token"]` 无锁保护 | 加 `with lock:` 保护 |
+| 17 | 🟡 | `_speak_worker()` 读取 `state["current_volume"]` 无锁保护 | 加 `with lock:` 保护 |
+| 18 | 🟡 | `flush_local_logs()` 中 `entry.pop("_photo")` 导致消息成功但照片失败时照片数据丢失 | 改用 `entry.get("_photo")` + 字典推导式分离，失败时完整保留 entry |
+| 19 | 🟡 | `alert_loop()` 读取 `state["active_alerts"][tid]` 无锁保护 | 加 `with lock:` 保护循环内所有读写 |
+| 20 | 🟡 | GUI 模式变量（`_gui_mode`/`_clock_*_obj`）在多线程中无锁读写 | 新增 `_gui_lock` 保护所有 GUI 状态变量 |
+| 21 | 🟢 | `FAMILY_BASE_URL` 常量已无引用（API 迁移后） | 删除死代码 |
+| 22 | 🟢 | `from dfrobot_huskylensv2 import *` 无实际使用 | 删除死导入 |
+| 23 | 🟢 | 紧急按钮注释过时（"仅记录日志"） | 更新为"联网通知家属" |
 
 ## 版本与更新
 

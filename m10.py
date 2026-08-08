@@ -2,11 +2,20 @@
 # -*- coding: utf-8 -*-
 """
 UniHiker M10 智能服药提醒终端主程序
-项目地址适配: https://my-website.ccwu.cc/eating-medication/family/
+项目地址适配: https://my-website.ccwu.cc/eating-medication/server/
 设备配对码: 275527387791320
+API 版本: v2.28.0（对应 openapi.json）
 
 本程序使用 Python 标准库 + UniHiker 原生 API (unihiker/pinpong) + pyttsx3 TTS,
 不依赖 cv2、requests、schedule 等第三方库。
+
+v2.28.2 修复记录（共 23 项 bug 修复）：
+- API 全面迁移至 /api/v1/public/* 新版路径
+- 引入 X-Device-Token 认证机制（自动持久化）
+- 修复 12 项多线程竞态条件（RLock + 新增 _gui_lock）
+- 移除 4 处阻塞 button_thread 的同步网络调用
+- 文件 I/O 全部移到锁外执行
+- OCR 引擎延迟加载并缓存
 """
 
 import os
@@ -28,14 +37,12 @@ from pathlib import Path
 # 适配 UniHiker 平台
 from unihiker import GUI
 from pinpong.board import Board, Pin
-from dfrobot_huskylensv2 import *
 from unihiker_connet_wifi import *
 wifi_manager = WiFiManager()
 response_success = wifi_manager.connect_wifi("666", "15756491077")
 
 # ============== 配置区 ==============
 SERVER_BASE_URL = "https://my-website.ccwu.cc/eating-medication/server"
-FAMILY_BASE_URL = "https://my-website.ccwu.cc/eating-medication/family"
 PAIR_CODE = "275527387791320"
 DEVICE_ID = "m10_" + PAIR_CODE
 
@@ -56,7 +63,7 @@ QUEUE_FILE = "/root/medication_log_queue.json"
 BUZZER_PIN = Pin.P25      # 蜂鸣器
 BUTTON_TAKE_PIN = Pin.P21  # 已吃药按钮（~A，按下高电平，松开低电平）
 BUTTON_REMIND_PIN = Pin.P27  # B键：直接启动吃药提醒（按下低电平）
-BUTTON_EMERGENCY_PIN = Pin.P28  # A键：紧急呼叫（按下低电平，仅记录日志）
+BUTTON_EMERGENCY_PIN = Pin.P28  # A键：紧急呼叫（联网通知家属）
 
 # 提醒音量递增参数（每 10 分钟递增一次）
 VOLUME_INITIAL = 30
@@ -94,6 +101,7 @@ state = {
 }
 
 lock = threading.RLock()
+_gui_lock = threading.Lock()
 
 gui = None
 buzzer = None
@@ -227,7 +235,11 @@ def _speak_worker():
             if item is None:
                 break
             text, volume = item
-            vol = volume if volume is not None else state.get("current_volume", VOLUME_INITIAL)
+            if volume is None:
+                with lock:
+                    vol = state.get("current_volume", VOLUME_INITIAL)
+            else:
+                vol = volume
 
             # 先设置 USB 扬声器系统音量
             set_system_volume(vol)
@@ -328,7 +340,8 @@ def image_to_base64(path):
 def _auth_headers(extra=None):
     """构建请求头，自动携带 X-Device-Token（已注册时）"""
     headers = {"Content-Type": "application/json"}
-    token = state.get("device_token")
+    with lock:
+        token = state.get("device_token")
     if token:
         headers["X-Device-Token"] = token
     if extra:
@@ -413,13 +426,15 @@ def _convert_plans_to_reminders(plans):
     reminders = []
     for p in plans:
         times = p.get("schedule_times", [])
+        drug_name = p.get("drug_name", "")
+        plan_id = p.get("id")
         reminders.append({
-            "id": p.get("id", str(p.get("drug_name", ""))),
-            "medicine_name": p.get("drug_name", ""),
+            "id": plan_id if plan_id is not None else drug_name,
+            "medicine_name": drug_name,
             "dose": p.get("dosage", "1片"),
             "times": times if isinstance(times, list) else [times],
             "days": [1, 2, 3, 4, 5, 6, 7],
-            "medicine_id": p.get("id"),
+            "medicine_id": plan_id,
             "dose_count": 1,
             "user_name": "老人",
         })
@@ -430,9 +445,11 @@ def _convert_plans_to_medicines(plans):
     """将 FamilyMedicationPlan 数组转换为旧版 medicines 库存格式"""
     medicines = []
     for p in plans:
+        plan_id = p.get("id")
+        drug_name = p.get("drug_name", "")
         medicines.append({
-            "id": p.get("id"),
-            "name": p.get("drug_name", ""),
+            "id": plan_id if plan_id is not None else drug_name,
+            "name": drug_name,
             "remaining": p.get("remaining_quantity", 0),
             "per_time": 1,
             "frequency_per_day": 1,
@@ -503,8 +520,9 @@ def flush_local_logs():
             queue = json.load(f)
         remain = []
         for entry in queue:
-            photo = entry.pop("_photo", None)
-            msg_resp = http_request(API_MESSAGE, entry)
+            photo = entry.get("_photo")
+            msg_payload = {k: v for k, v in entry.items() if k != "_photo"}
+            msg_resp = http_request(API_MESSAGE, msg_payload)
             msg_ok = msg_resp is not None
             photo_ok = True
             if photo:
@@ -633,17 +651,21 @@ def trigger_alert(reminder):
 
 
 def alert_loop(tid):
-    while tid in state["active_alerts"]:
-        info = state["active_alerts"][tid]
-        volume = info["volume"]
-        reminder = info["reminder"]
+    while True:
+        with lock:
+            if tid not in state["active_alerts"]:
+                break
+            volume = state["active_alerts"][tid]["volume"]
+            reminder = state["active_alerts"][tid]["reminder"]
         msg = f"{reminder.get('user_name', '老人')}，该吃 {reminder.get('medicine_name', '药品')} 了"
         buzzer_beep(times=3, duration=0.3)
         tts_speak(msg, volume=volume)
         # 每 10 分钟增大音量
         time.sleep(SNOOZE_MINUTES * 60)
-        if tid in state["active_alerts"]:
-            info["volume"] = min(volume + VOLUME_STEP, VOLUME_MAX)
+        with lock:
+            if tid in state["active_alerts"]:
+                info = state["active_alerts"][tid]
+                info["volume"] = min(info["volume"] + VOLUME_STEP, VOLUME_MAX)
 
 
 def confirm_take(tid=None):
@@ -651,15 +673,12 @@ def confirm_take(tid=None):
     photo_path = None
     if state.get("camera_available"):
         photo_path = capture_photo(filename=f"take_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
+    reminder = {}
     if tid:
         with lock:
             if tid in state["active_alerts"]:
                 reminder = state["active_alerts"][tid]["reminder"]
                 del state["active_alerts"][tid]
-            else:
-                reminder = {}
-    else:
-        reminder = {}
 
     detail = {
         "action": "confirm_take",
@@ -667,7 +686,10 @@ def confirm_take(tid=None):
         "user": reminder.get("user_name", ""),
         "photo_path": photo_path,
     }
-    upload_log("confirm_take", detail, photo_path)
+    # 日志上传改为异步，不阻塞按钮线程
+    threading.Thread(
+        target=upload_log, args=("confirm_take", detail, photo_path), daemon=True
+    ).start()
     tts_speak("已记录服药")
     update_gui_home()
     update_stock(reminder.get("medicine_id"), reminder.get("dose_count", 1))
@@ -676,17 +698,27 @@ def confirm_take(tid=None):
 def update_stock(medicine_id, used_count):
     if not medicine_id:
         return
+    needs_alert = False
+    alert_medicine = None
     with lock:
         for m in state["medicines"]:
             if m.get("id") == medicine_id:
                 m["remaining"] = max(0, m.get("remaining", 0) - used_count)
-                cfg = load_config()
-                cfg["medicines"] = state["medicines"]
-                save_config(cfg)
+                remaining = m["remaining"]
                 threshold = m.get("threshold", 5) * m.get("frequency_per_day", 1)
-                if m["remaining"] < threshold:
-                    threading.Thread(target=low_stock_alert, args=(m,), daemon=True).start()
+                if remaining < threshold:
+                    needs_alert = True
+                    alert_medicine = dict(m)
                 break
+    # 文件 I/O 在锁外执行，避免阻塞其他线程
+    try:
+        cfg = load_config()
+        cfg["medicines"] = state["medicines"]
+        save_config(cfg)
+    except Exception as e:
+        log(f"库存持久化失败: {e}", "ERROR")
+    if needs_alert and alert_medicine:
+        threading.Thread(target=low_stock_alert, args=(alert_medicine,), daemon=True).start()
 
 
 def low_stock_alert(medicine):
@@ -707,6 +739,24 @@ def low_stock_alert(medicine):
 
 # ============== AI 药物识别 ==============
 
+_ocr_engine = None  # (pytesseract, Image) tuple, 延迟初始化
+
+
+def _get_ocr_engine():
+    """延迟加载 OCR 引擎（pytesseract + PIL）"""
+    global _ocr_engine
+    if _ocr_engine is not None:
+        return _ocr_engine
+    try:
+        import pytesseract
+        from PIL import Image
+        _ocr_engine = (pytesseract, Image)
+        return _ocr_engine
+    except Exception as e:
+        log(f"OCR 引擎加载失败: {e}", "WARNING")
+        return None
+
+
 def recognize_medicine():
     if not state.get("camera_available"):
         tts_speak("摄像头未就绪，请手动核对药品")
@@ -720,16 +770,16 @@ def recognize_medicine():
         return
 
     text = ""
-    # 尝试使用 pytesseract（如果设备已安装）
-    try:
-        import pytesseract
-        from PIL import Image
-        img = Image.open(photo_path).convert("L")
-        text = pytesseract.image_to_string(img, lang="chi_sim+eng")
-        log(f"OCR 结果: {text.strip()}")
-    except Exception as e:
-        log(f"OCR 失败或未安装 tesseract: {e}", "WARNING")
-        text = ""
+    ocr = _get_ocr_engine()
+    if ocr:
+        pytesseract, Image = ocr
+        try:
+            img = Image.open(photo_path).convert("L")
+            text = pytesseract.image_to_string(img, lang="chi_sim+eng")
+            log(f"OCR 结果: {text.strip()}")
+        except Exception as e:
+            log(f"OCR 识别失败: {e}", "WARNING")
+            text = ""
 
     if state["online"] and text.strip():
         resp = query_drug_by_ocr(text.strip())
@@ -746,6 +796,7 @@ def recognize_medicine():
 # ============== 余量监测 ==============
 
 def calculate_remaining_days():
+    alerts_to_fire = []
     with lock:
         for m in state["medicines"]:
             total = m.get("remaining", 0)
@@ -757,7 +808,9 @@ def calculate_remaining_days():
             else:
                 m["remaining_days"] = 999
             if m["remaining_days"] < 5:
-                threading.Thread(target=low_stock_alert, args=(m,), daemon=True).start()
+                alerts_to_fire.append(dict(m))
+    for med_copy in alerts_to_fire:
+        threading.Thread(target=low_stock_alert, args=(med_copy,), daemon=True).start()
 
 
 # ============== GUI 更新 ==============
@@ -783,7 +836,8 @@ def update_gui_status(text, alert=False):
     if not gui:
         return
     try:
-        _gui_mode = "status"
+        with _gui_lock:
+            _gui_mode = "status"
         color = "#FF4444" if alert else "#333333"
         gui.clear()
         gui.draw_text(x=120, y=40, text="智能服药提醒", font_size=20, color="#000000", origin="center")
@@ -801,24 +855,28 @@ def update_gui_home():
         return
     try:
         gui.clear()
-        _clock_date_obj = None
-        _clock_time_obj = None
+        with _gui_lock:
+            _clock_date_obj = None
+            _clock_time_obj = None
         gui.draw_text(x=120, y=30, text="智能服药提醒", font_size=18, color="#000000", origin="center")
         status = "在线" if state["online"] else "离线模式"
         gui.draw_text(x=120, y=65, text=status, font_size=12, color="#666666", origin="center")
         now = datetime.datetime.now()
         # 日期行
-        _clock_date_obj = gui.draw_text(
+        date_obj = gui.draw_text(
             x=120, y=120, text=_format_date(now),
             font_size=16, color="#333333", origin="center",
         )
         # 时分秒行（醒目蓝色）
-        _clock_time_obj = gui.draw_text(
+        time_obj = gui.draw_text(
             x=120, y=165, text=_format_time(now),
             font_size=24, color="#0050FF", origin="center",
         )
+        with _gui_lock:
+            _clock_date_obj = date_obj
+            _clock_time_obj = time_obj
+            _gui_mode = "home"
         gui.draw_text(x=120, y=220, text="B键启动提醒 A键紧急", font_size=11, color="#666666", origin="center")
-        _gui_mode = "home"
     except Exception as e:
         log(f"GUI 更新失败: {e}", "ERROR")
 
@@ -829,7 +887,8 @@ def update_gui_reminder(name, drug, dose):
     if not gui:
         return
     try:
-        _gui_mode = "reminder"
+        with _gui_lock:
+            _gui_mode = "reminder"
         gui.clear()
         gui.draw_text(x=120, y=40, text="该吃药了", font_size=20, color="#FF0000", origin="center")
         gui.draw_text(x=120, y=100, text=f"{name}，该吃 {drug}", font_size=16, color="#FF4444", origin="center")
@@ -843,16 +902,20 @@ def clock_thread():
     """后台时钟刷新线程：仅在主页模式时每秒更新日期与时分秒文本对象"""
     while not _clock_stop_event.is_set():
         try:
-            if gui and _gui_mode == "home":
+            with _gui_lock:
+                mode = _gui_mode
+                time_obj = _clock_time_obj
+                date_obj = _clock_date_obj
+            if gui and mode == "home":
                 now = datetime.datetime.now()
-                if _clock_time_obj is not None:
+                if time_obj is not None:
                     try:
-                        _clock_time_obj.config(text=_format_time(now))
+                        time_obj.config(text=_format_time(now))
                     except Exception:
                         pass
-                if _clock_date_obj is not None:
+                if date_obj is not None:
                     try:
-                        _clock_date_obj.config(text=_format_date(now))
+                        date_obj.config(text=_format_date(now))
                     except Exception:
                         pass
         except Exception as e:
@@ -875,14 +938,16 @@ def on_take_button_pressed():
 
 
 def on_emergency_button_pressed():
-    """P28 A键：紧急呼叫（通过新版 API 通知家属）"""
+    """P28 A键：紧急呼叫（通过新版 API 通知家属，异步执行不阻塞按钮线程）"""
     log("紧急按钮被按下，正在通知家属...", "WARNING")
     update_gui_status("正在发送紧急通知...", alert=True)
-    success = notify_emergency()
-    if success:
-        update_gui_status("已通知家属", alert=True)
-    else:
-        update_gui_status("通知失败，请手动拨打 120", alert=True)
+    def _do_emergency():
+        success = notify_emergency()
+        if success:
+            update_gui_status("已通知家属", alert=True)
+        else:
+            update_gui_status("通知失败，请手动拨打 120", alert=True)
+    threading.Thread(target=_do_emergency, daemon=True).start()
 
 
 def on_remind_button_pressed():
@@ -958,7 +1023,7 @@ def button_thread():
         if button_remind and button_remind.read_digital() == 0 and now - last_remind > 3:
             last_remind = now
             on_remind_button_pressed()
-        # P28 A键紧急呼叫：按下低电平（0），仅记录日志
+        # P28 A键紧急呼叫：按下低电平，联网通知家属
         if button_emergency and button_emergency.read_digital() == 0 and now - last_emergency > 3:
             last_emergency = now
             on_emergency_button_pressed()
