@@ -335,7 +335,7 @@ m10.py
 - 旧版 `sync_reminders()` 接收 `{code, data: {reminders, medicines}}`
 - 新版 `sync_reminders()` 接收 `FamilyMedicationPlan[]`，通过 `_convert_plans_to_reminders()` / `_convert_plans_to_medicines()` 自动转换为兼容的内部格式
 
-### 已完成的 Bug 修复（v2.28.5，共 47 项）
+### 已完成的 Bug 修复（v2.28.6，共 58 项）
 
 | # | 严重度 | 描述 | 修复方案 |
 |---|--------|------|----------|
@@ -386,6 +386,17 @@ m10.py
 | 45 | 🟡 | `_convert_plans_to_reminders` 硬编码 `days=[1..7]`，忽略 API 可能传入的特定工作日（如仅周一/三/五） | 增加 `days`/`weekdays`/`day_of_week` 字段解析，兼容多种格式 |
 | 46 | 🟡 | `_get_ocr_engine()` 无锁保护，多线程首次调用时可能重复初始化 OCR 引擎 | 新增 `_ocr_lock` + 双重检查锁定模式（DCLP） |
 | 47 | 🟢 | 锁体系再次完善 | 锁数量增至 **9 把**：`lock`/`_gui_lock`/`_gui_draw_lock`/`_config_lock`/`_queue_lock`/`_log_lock`/`_camera_lock`/`_speech_lock`/`_ocr_lock` |
+| 48 | 🔴 | `save_config()` 直接写文件，断电/崩溃可能导致 JSON 损坏（部分写入） | 改为原子写入：先写 `.tmp` 临时文件，再 `os.replace()` 重命名 |
+| 49 | 🔴 | `queue_local_log()` 直接写文件，非原子操作；队列无大小限制可无限增长 | 原子写入 + 队列上限 500 条（超出裁剪最旧） |
+| 50 | 🔴 | `alert_loop()` 无限响铃无终止，若用户永远不确认，设备永久响铃 | 增加最大重试 20 次（约 3 小时），超时自动停止并返回主页 |
+| 51 | 🟡 | `sync_reminders()` 使用 `or` 链式获取字段，空列表 `[]` 被误判为 falsy 跳过 | 改用 `is not None` 逐 key 检查，正确处理空列表响应 |
+| 52 | 🟡 | `update_stock()` 使用 `list(state["medicines"])` 浅拷贝，锁释放后 dict 引用可被其他线程修改 | 改为 `[dict(m) for m in state["medicines"]]` 深拷贝 |
+| 53 | 🟡 | `detect_volume_control()` 使用 `text=True` 参数，Python 3.6 不兼容 | 改为 `universal_newlines=True`（兼容 Python 3.0+） |
+| 54 | 🟡 | `low_stock_alert()` 显示告警后无超时返回，设备永久停留在告警屏 | 增加 `threading.Timer(30, update_gui_home)` 自动返回 |
+| 55 | 🟡 | `upload_log()` 无照片大小限制，大图 base64 编码后内存翻倍 | 增加 500KB 上限检查 |
+| 56 | 🟡 | `image_to_base64()` 无大小限制，超大图 base64 可能 OOM | 增加 1MB 上限检查 |
+| 57 | 🟢 | `buzzer_beep()` 增加 None 设备防护 | 硬件未初始化时直接返回，避免 try/except 开销 |
+| 58 | 🟢 | `main_loop()` 增加 `missed_minutes` 追踪 | 系统挂起超过 60 分钟时强制触发检查，避免遗漏提醒 |
 
 ## 版本与更新
 

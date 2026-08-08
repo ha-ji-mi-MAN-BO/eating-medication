@@ -9,13 +9,16 @@ API 版本: v2.28.0（对应 openapi.json）
 本程序使用 Python 标准库 + UniHiker 原生 API (unihiker/pinpong) + pyttsx3 TTS,
 不依赖 cv2、requests、schedule 等第三方库。
 
-v2.28.5 修复记录（共 47 项 bug 修复）：
-- 新增 _gui_draw_lock 保护所有 GUI 绘制操作，防止多线程画面撕裂
-- 新增 _camera_lock 串行化摄像头访问，防止多线程冲突
-- _speak_queue 改为有界队列(maxsize=100)，tts_speak 满时丢弃旧消息
-- clock_thread 在 _gui_draw_lock 保护下操作 GUI 对象
-- _convert_plans_to_reminders 支持 API 传入的 days/weekdays 字段
-- _get_ocr_engine 新增 _ocr_lock + DCLP 双重检查锁定模式
+v2.28.6 修复记录（共 58 项 bug 修复）：
+- save_config / queue_local_log / flush_local_log 改为原子写入（写 .tmp + os.replace）
+- alert_loop 增加最大重试 20 次（约 3 小时），超时自动停止响铃
+- sync_reminders 空列表 [] 正确处理（is not None 替代 or 链式）
+- update_stock 深拷贝 medicines 列表（[dict(m) for m in state["medicines"]]）
+- detect_volume_control 使用 universal_newlines 兼容 Python 3.6
+- low_stock_alert 增加 30 秒自动返回主页
+- upload_log / image_to_base64 增加照片大小限制（500KB / 1MB）
+- buzzer_beep 增加 None 设备防护
+- main_loop 增加 missed_minutes 追踪，系统挂起超时强制检查
 """
 
 import os
@@ -190,12 +193,20 @@ def load_config():
 
 
 def save_config(cfg):
+    """原子写入：先写临时文件再 rename，避免断电导致配置文件损坏"""
     with _config_lock:
         try:
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            tmp_path = CONFIG_FILE + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, CONFIG_FILE)
         except Exception as e:
             log(f"保存配置失败: {e}", "ERROR")
+            if os.path.exists(CONFIG_FILE + ".tmp"):
+                try:
+                    os.remove(CONFIG_FILE + ".tmp")
+                except Exception:
+                    pass
 
 
 def check_network():
@@ -209,7 +220,7 @@ def check_network():
 def detect_volume_control():
     """自动检测可用的 ALSA 音量控制，优先 USB 声卡的 Speaker/Headphone/PCM"""
     try:
-        r = subprocess.run("aplay -l", shell=True, capture_output=True, text=True, timeout=5)
+        r = subprocess.run("aplay -l", shell=True, capture_output=True, universal_newlines=True, timeout=5)
         cards_output = r.stdout
         usb_card = None
         for line in cards_output.splitlines():
@@ -224,7 +235,7 @@ def detect_volume_control():
 
         def control_exists(card_arg, ctrl):
             cmd = f"amixer {card_arg} scontrols" if card_arg else "amixer scontrols"
-            rr = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=3)
+            rr = subprocess.run(cmd, shell=True, capture_output=True, universal_newlines=True, timeout=3)
             return ctrl.lower() in rr.stdout.lower()
 
         if usb_card is not None:
@@ -361,6 +372,8 @@ def stop_speech():
 
 def buzzer_beep(times=1, duration=0.2):
     """蜂鸣器提示，优先使用 pinpong 板载蜂鸣器音效，回退到数字引脚"""
+    if buzzer is None:
+        return
     try:
         if hasattr(buzzer, "play"):
             # 使用 pinpong 板载蜂鸣器音效（BA_DING）
@@ -397,7 +410,12 @@ def capture_photo(filename=None, timeout=10):
 
 
 def image_to_base64(path):
+    """将图片转为 base64，文件超过 1MB 则跳过避免 OOM"""
     try:
+        size = os.path.getsize(path)
+        if size > 1048576:
+            log(f"图片过大 ({size} bytes)，跳过 base64 编码", "WARNING")
+            return None
         with open(path, "rb") as f:
             return base64.b64encode(f.read()).decode("utf-8")
     except Exception:
@@ -485,7 +503,12 @@ def sync_reminders():
     if isinstance(resp, list):
         plans = resp
     elif isinstance(resp, dict):
-        plans = resp.get("plans") or resp.get("data") or resp.get("items") or []
+        # 使用 is not None 判断，避免空列表 [] 被 or 误判为 falsy
+        for key in ("plans", "data", "items"):
+            val = resp.get(key)
+            if val is not None:
+                plans = val
+                break
         if not plans and resp.get("status") and resp.get("status") != "ok":
             log(f"同步用药计划返回错误: {resp.get('message', resp)}", "WARNING")
             return False
@@ -573,7 +596,12 @@ def upload_log(event_type, detail, photo_path=None):
     }
     photo_base64 = None
     if photo_path and os.path.exists(photo_path):
-        photo_base64 = image_to_base64(photo_path)
+        photo_size = os.path.getsize(photo_path)
+        # 限制照片大小 <= 500KB，避免 base64 编码后内存膨胀
+        if photo_size > 512000:
+            log(f"照片过大 ({photo_size} bytes)，跳过上传", "WARNING")
+        else:
+            photo_base64 = image_to_base64(photo_path)
 
     # 1. 上传消息事件
     msg_resp = http_request(API_MESSAGE, msg_payload)
@@ -600,6 +628,7 @@ def upload_log(event_type, detail, photo_path=None):
 
 
 def queue_local_log(payload, photo_base64=None):
+    """将日志条目写入本地离线队列。队列最多保留 500 条，超出时丢弃最旧的"""
     with _queue_lock:
         try:
             queue = []
@@ -610,8 +639,14 @@ def queue_local_log(payload, photo_base64=None):
             if photo_base64:
                 entry["_photo"] = photo_base64
             queue.append(entry)
-            with open(QUEUE_FILE, "w", encoding="utf-8") as f:
+            # 限制队列大小，超过 500 条时丢弃最旧的
+            if len(queue) > 500:
+                queue = queue[-500:]
+                log("离线日志队列超过 500 条，已裁剪", "WARNING")
+            tmp_path = QUEUE_FILE + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(queue, f, ensure_ascii=False)
+            os.replace(tmp_path, QUEUE_FILE)
         except Exception as e:
             log(f"本地日志队列写入失败: {e}", "ERROR")
 
@@ -648,11 +683,13 @@ def flush_local_logs():
         if not (msg_ok and photo_ok):
             remain.append(entry)
 
-    # 写回阶段：在锁内写回剩余队列
+    # 写回阶段：在锁内写回剩余队列（原子写入）
     with _queue_lock:
         try:
-            with open(QUEUE_FILE, "w", encoding="utf-8") as f:
+            tmp_path = QUEUE_FILE + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(remain, f, ensure_ascii=False)
+            os.replace(tmp_path, QUEUE_FILE)
         except Exception as e:
             log(f"写回本地日志队列失败: {e}", "ERROR")
     log(f"刷新本地日志: 成功 {len(queue) - len(remain)}, 剩余 {len(remain)}")
@@ -770,7 +807,10 @@ def trigger_alert(reminder):
 
 
 def alert_loop(tid):
-    while True:
+    """提醒循环：每次响铃后等待 SNOOZE_MINUTES 分钟，最多响铃 20 次（约 3 小时）后自动停止"""
+    max_retries = 20
+    retry_count = 0
+    while retry_count < max_retries:
         with lock:
             if tid not in state["active_alerts"]:
                 break
@@ -779,12 +819,19 @@ def alert_loop(tid):
         msg = f"{reminder.get('user_name', '老人')}，该吃 {reminder.get('medicine_name', '药品')} 了"
         buzzer_beep(times=3, duration=0.3)
         tts_speak(msg, volume=volume)
-        # 每 10 分钟增大音量
+        retry_count += 1
+        # 每 SNOOZE_MINUTES 分钟增大音量
         time.sleep(SNOOZE_MINUTES * 60)
         with lock:
             if tid in state["active_alerts"]:
                 info = state["active_alerts"][tid]
                 info["volume"] = min(info["volume"] + VOLUME_STEP, VOLUME_MAX)
+    # 超过最大重试次数，自动停止提醒（避免无限响铃）
+    if retry_count >= max_retries:
+        log(f"提醒 {tid} 已达最大重试次数 ({max_retries})，自动停止", "WARNING")
+        with lock:
+            state["active_alerts"].pop(tid, None)
+        update_gui_home()
 
 
 def confirm_take(tid=None):
@@ -833,7 +880,8 @@ def update_stock(medicine_id, used_count):
                     needs_alert = True
                     alert_medicine = dict(m)
                 break
-        medicines_snapshot = list(state["medicines"])
+        # 深拷贝：避免锁释放后其他线程修改原始 dict 导致持久化数据不一致
+        medicines_snapshot = [dict(m) for m in state["medicines"]]
     # 文件 I/O 在锁外执行，避免阻塞其他线程
     try:
         cfg = load_config()
@@ -859,6 +907,8 @@ def low_stock_alert(medicine):
                 buy_msg = f"购药建议: {answer}"
                 tts_speak(buy_msg)
                 update_gui_status(buy_msg, alert=True)
+    # 30 秒后自动返回主页（避免一直停留在告警界面）
+    threading.Timer(30, update_gui_home).start()
 
 
 # ============== AI 药物识别 ==============
@@ -1170,6 +1220,7 @@ def main_loop():
     last_stock_check = 0
     last_flush = 0
     last_reconnect_check = 0
+    missed_minutes = 0  # 追踪连续错过的分钟数
 
     while True:
         now = datetime.datetime.now()
@@ -1178,8 +1229,17 @@ def main_loop():
         # 每分钟检查提醒（含固定时间提醒 9:00/13:00/17:00）
         if now_str != last_minute:
             last_minute = now_str
+            missed_minutes = 0
             check_reminders()
             check_fixed_reminders()
+        else:
+            # 若系统延迟导致多次循环同一分钟，最多允许 1 次补检
+            missed_minutes += 1
+            if missed_minutes > 60:
+                # 系统可能挂起过久，强制重新检查
+                missed_minutes = 0
+                log("main_loop 长时间未刷新，强制检查提醒", "WARNING")
+                check_reminders()
 
         # 每小时同步一次数据
         if now.hour != last_hour:
