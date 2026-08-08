@@ -9,13 +9,13 @@ API 版本: v2.28.0（对应 openapi.json）
 本程序使用 Python 标准库 + UniHiker 原生 API (unihiker/pinpong) + pyttsx3 TTS,
 不依赖 cv2、requests、schedule 等第三方库。
 
-v2.28.3 修复记录（共 33 项 bug 修复）：
-- state["online"]/state["camera_available"] 全面加锁保护（_get_online/_set_online 等辅助函数）
-- 新增 _config_lock 保护配置文件读写，防止多线程 JSON 损坏
-- init_network、confirm_take 改为异步执行，不再阻塞 button_thread
-- update_stock 在锁内采集 medicines_snapshot，消除锁外读竞态
-- _convert_plans_to_medicines 正确映射 remaining_quantity 和 frequency_per_day
-- notify_emergency 紧急联系人从配置文件读取
+v2.28.4 修复记录（共 40 项 bug 修复）：
+- state["device_token"] 全面加锁保护（_get_device_token/_set_device_token 辅助函数）
+- 新增 _queue_lock 保护离线日志队列文件，flush_local_logs 读锁内/网络锁外/写锁内
+- 新增 _log_lock 保护日志写入与 10MB 自动轮转
+- pyttsx3 预导入设 _PYTTSX3_AVAILABLE 标志，消除异常分支内动态 import
+- trigger_alert 存储 reminder 副本，消除引用风险
+- sync_reminders 增加完善的 API 响应校验
 """
 
 import os
@@ -34,6 +34,14 @@ import traceback
 import urllib.request
 import urllib.error
 from pathlib import Path
+
+# 可选依赖：pyttsx3（用于 TTS，缺失时自动回退到 espeak）
+try:
+    import pyttsx3
+    _PYTTSX3_AVAILABLE = True
+except ImportError:
+    pyttsx3 = None
+    _PYTTSX3_AVAILABLE = False
 
 # 适配 UniHiker 平台
 from unihiker import GUI
@@ -104,6 +112,8 @@ state = {
 lock = threading.RLock()
 _gui_lock = threading.Lock()
 _config_lock = threading.Lock()  # 保护配置文件的读写，避免多线程同时写入导致 JSON 损坏
+_queue_lock = threading.Lock()   # 保护离线日志队列文件的读写
+_log_lock = threading.Lock()      # 保护日志文件写入与轮转
 
 gui = None
 buzzer = None
@@ -133,14 +143,33 @@ def _set_camera_available(value):
     with lock:
         state["camera_available"] = value
 
+def _get_device_token():
+    """线程安全读取设备令牌"""
+    with lock:
+        return state.get("device_token")
+
+def _set_device_token(token):
+    """线程安全设置设备令牌"""
+    with lock:
+        state["device_token"] = token
+
+LOG_MAX_SIZE = 10 * 1024 * 1024  # 10 MB 日志轮转阈值
+
+
 def log(msg, level="INFO"):
     line = f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [{level}] {msg}"
     print(line)
-    try:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
+    with _log_lock:
+        try:
+            if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_MAX_SIZE:
+                rotated = LOG_FILE + ".old"
+                if os.path.exists(rotated):
+                    os.remove(rotated)
+                os.rename(LOG_FILE, rotated)
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
 
 
 def ensure_dirs():
@@ -236,14 +265,17 @@ _speech_lock = threading.Lock()
 def init_speech():
     """初始化 pyttsx3 TTS 引擎并启动后台播报线程"""
     global _speech_engine, _speech_thread
-    try:
-        import pyttsx3
-        _speech_engine = pyttsx3.init()
-        _speech_engine.setProperty('volume', VOLUME_INITIAL / 100)
-        _speech_engine.setProperty('rate', TTS_RATE)
-        log("pyttsx3 TTS 引擎初始化成功")
-    except Exception as e:
-        log(f"pyttsx3 初始化失败，将回退到 espeak: {e}", "WARNING")
+    if _PYTTSX3_AVAILABLE and pyttsx3 is not None:
+        try:
+            _speech_engine = pyttsx3.init()
+            _speech_engine.setProperty('volume', VOLUME_INITIAL / 100)
+            _speech_engine.setProperty('rate', TTS_RATE)
+            log("pyttsx3 TTS 引擎初始化成功")
+        except Exception as e:
+            log(f"pyttsx3 初始化失败，将回退到 espeak: {e}", "WARNING")
+            _speech_engine = None
+    else:
+        log("pyttsx3 未安装，使用 espeak 回退")
         _speech_engine = None
 
     _speech_thread = threading.Thread(target=_speak_worker, daemon=True)
@@ -277,11 +309,13 @@ def _speak_worker():
                 except Exception as e:
                     log(f"pyttsx3 播报失败: {e}", "ERROR")
                     # 尝试重新初始化引擎
-                    try:
-                        import pyttsx3
-                        _speech_engine = pyttsx3.init()
-                        _speech_engine.setProperty('rate', TTS_RATE)
-                    except Exception:
+                    if _PYTTSX3_AVAILABLE and pyttsx3 is not None:
+                        try:
+                            _speech_engine = pyttsx3.init()
+                            _speech_engine.setProperty('rate', TTS_RATE)
+                        except Exception:
+                            _speech_engine = None
+                    else:
                         _speech_engine = None
             else:
                 # 回退到 espeak
@@ -364,8 +398,7 @@ def image_to_base64(path):
 def _auth_headers(extra=None):
     """构建请求头，自动携带 X-Device-Token（已注册时）"""
     headers = {"Content-Type": "application/json"}
-    with lock:
-        token = state.get("device_token")
+    token = _get_device_token()
     if token:
         headers["X-Device-Token"] = token
     if extra:
@@ -400,7 +433,7 @@ def register_device():
     if resp and resp.get("status") == "ok":
         token = resp.get("device_token")
         if token:
-            state["device_token"] = token
+            _set_device_token(token)
             save_device_token(token)
         log("设备注册成功")
         return True
@@ -424,7 +457,7 @@ def load_device_token():
         cfg = load_config()
         token = cfg.get("device_token")
         if token:
-            state["device_token"] = token
+            _set_device_token(token)
             return True
     except Exception:
         pass
@@ -434,15 +467,23 @@ def load_device_token():
 def sync_reminders():
     """获取用药计划（新版 API：GET /device/schedule/{id}）"""
     resp = http_request(API_SCHEDULE)
-    if resp:
-        plans = resp if isinstance(resp, list) else resp.get("plans", resp.get("data", []))
-        with lock:
-            state["reminders"] = _convert_plans_to_reminders(plans)
-            state["medicines"] = _convert_plans_to_medicines(plans)
-            state["last_sync"] = datetime.datetime.now().isoformat()
-        log(f"同步用药计划: {len(plans)} 条")
-        return True
-    return False
+    if resp is None:
+        log("同步用药计划失败：网络请求无响应", "WARNING")
+        return False
+    plans = []
+    if isinstance(resp, list):
+        plans = resp
+    elif isinstance(resp, dict):
+        plans = resp.get("plans") or resp.get("data") or resp.get("items") or []
+        if not plans and resp.get("status") and resp.get("status") != "ok":
+            log(f"同步用药计划返回错误: {resp.get('message', resp)}", "WARNING")
+            return False
+    with lock:
+        state["reminders"] = _convert_plans_to_reminders(plans)
+        state["medicines"] = _convert_plans_to_medicines(plans)
+        state["last_sync"] = datetime.datetime.now().isoformat()
+    log(f"同步用药计划: {len(plans)} 条")
+    return True
 
 
 def _parse_frequency_per_day(frequency_str):
@@ -540,48 +581,62 @@ def upload_log(event_type, detail, photo_path=None):
 
 
 def queue_local_log(payload, photo_base64=None):
-    try:
-        queue = []
-        if os.path.exists(QUEUE_FILE):
-            with open(QUEUE_FILE, "r", encoding="utf-8") as f:
-                queue = json.load(f)
-        entry = payload.copy()
-        if photo_base64:
-            entry["_photo"] = photo_base64
-        queue.append(entry)
-        with open(QUEUE_FILE, "w", encoding="utf-8") as f:
-            json.dump(queue, f, ensure_ascii=False)
-    except Exception as e:
-        log(f"本地日志队列写入失败: {e}", "ERROR")
+    with _queue_lock:
+        try:
+            queue = []
+            if os.path.exists(QUEUE_FILE):
+                with open(QUEUE_FILE, "r", encoding="utf-8") as f:
+                    queue = json.load(f)
+            entry = payload.copy()
+            if photo_base64:
+                entry["_photo"] = photo_base64
+            queue.append(entry)
+            with open(QUEUE_FILE, "w", encoding="utf-8") as f:
+                json.dump(queue, f, ensure_ascii=False)
+        except Exception as e:
+            log(f"本地日志队列写入失败: {e}", "ERROR")
 
 
 def flush_local_logs():
     if not os.path.exists(QUEUE_FILE):
         return
-    try:
-        with open(QUEUE_FILE, "r", encoding="utf-8") as f:
-            queue = json.load(f)
-        remain = []
-        for entry in queue:
-            photo = entry.get("_photo")
-            msg_payload = {k: v for k, v in entry.items() if k != "_photo"}
-            msg_resp = http_request(API_MESSAGE, msg_payload)
-            msg_ok = msg_resp is not None
-            photo_ok = True
-            if photo:
-                upload_resp = http_request(API_UPLOAD, {
-                    "device_id": DEVICE_ID,
-                    "image_base64": photo,
-                    "note": "offline upload",
-                })
-                photo_ok = upload_resp is not None
-            if not (msg_ok and photo_ok):
-                remain.append(entry)
-        with open(QUEUE_FILE, "w", encoding="utf-8") as f:
-            json.dump(remain, f, ensure_ascii=False)
-        log(f"刷新本地日志: 成功 {len(queue) - len(remain)}, 剩余 {len(remain)}")
-    except Exception as e:
-        log(f"刷新本地日志失败: {e}", "ERROR")
+    # 读取阶段：在锁内读取队列快照后释放锁，网络请求在锁外执行
+    with _queue_lock:
+        try:
+            with open(QUEUE_FILE, "r", encoding="utf-8") as f:
+                queue = json.load(f)
+        except Exception as e:
+            log(f"读取本地日志队列失败: {e}", "ERROR")
+            return
+
+    if not queue:
+        return
+
+    remain = []
+    for entry in queue:
+        photo = entry.get("_photo")
+        msg_payload = {k: v for k, v in entry.items() if k != "_photo"}
+        msg_resp = http_request(API_MESSAGE, msg_payload)
+        msg_ok = msg_resp is not None
+        photo_ok = True
+        if photo:
+            upload_resp = http_request(API_UPLOAD, {
+                "device_id": DEVICE_ID,
+                "image_base64": photo,
+                "note": "offline upload",
+            })
+            photo_ok = upload_resp is not None
+        if not (msg_ok and photo_ok):
+            remain.append(entry)
+
+    # 写回阶段：在锁内写回剩余队列
+    with _queue_lock:
+        try:
+            with open(QUEUE_FILE, "w", encoding="utf-8") as f:
+                json.dump(remain, f, ensure_ascii=False)
+        except Exception as e:
+            log(f"写回本地日志队列失败: {e}", "ERROR")
+    log(f"刷新本地日志: 成功 {len(queue) - len(remain)}, 剩余 {len(remain)}")
 
 
 def query_drug_by_ocr(text):
@@ -687,7 +742,7 @@ def trigger_alert(reminder):
         state["active_alerts"][tid] = {
             "started_at": datetime.datetime.now(),
             "volume": VOLUME_INITIAL,
-            "reminder": reminder,
+            "reminder": dict(reminder),  # 副本，避免原始字典被修改
         }
     msg = f"{name}，该吃 {drug} 了，每次 {dose}"
     log(f"触发提醒: {msg}")

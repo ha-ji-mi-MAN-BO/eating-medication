@@ -335,7 +335,7 @@ m10.py
 - 旧版 `sync_reminders()` 接收 `{code, data: {reminders, medicines}}`
 - 新版 `sync_reminders()` 接收 `FamilyMedicationPlan[]`，通过 `_convert_plans_to_reminders()` / `_convert_plans_to_medicines()` 自动转换为兼容的内部格式
 
-### 已完成的 Bug 修复（v2.28.3，共 33 项）
+### 已完成的 Bug 修复（v2.28.4，共 40 项）
 
 | # | 严重度 | 描述 | 修复方案 |
 |---|--------|------|----------|
@@ -372,6 +372,13 @@ m10.py
 | 31 | 🟡 | `_convert_plans_to_medicines()` `remaining` 字段丢失（默认 0） | 改用 `int(remaining_quantity)` |
 | 32 | 🟡 | `notify_emergency()` 紧急联系人硬编码 "120" | 从配置文件 `emergency_contact` 读取，默认 "120" |
 | 33 | 🟢 | `import re` 在 `_parse_frequency_per_day()` 内动态导入 | 移至文件顶部导入 |
+| 34 | 🔴 | `state["device_token"]` 在 `register_device()`/`load_device_token()` 写入无锁保护 | 新增 `_get_device_token()`/`_set_device_token()` 辅助函数 |
+| 35 | 🔴 | 离线日志队列文件 `QUEUE_FILE` 无锁读写，多线程并发可能导致 JSON 损坏 | 新增 `_queue_lock`；`flush_local_logs()` 读取在锁内、网络请求在锁外、写回在锁内 |
+| 36 | 🔴 | `log()` 文件写入与轮转无锁保护，多线程并发可能丢失日志或破坏文件 | 新增 `_log_lock` 保护；>10MB 自动轮转（保留 `.old`） |
+| 37 | 🟡 | `import pyttsx3` 在 `init_speech()` 和 `_speak_worker` 异常分支内动态导入 | 移至文件顶部 try/except 预导入，设 `_PYTTSX3_AVAILABLE` 标志 |
+| 38 | 🟡 | `trigger_alert()` 将 `reminder` 字典引用直接存入 `active_alerts`，后续 `sync_reminders` 替换列表后可能导致数据不一致 | 改用 `dict(reminder)` 创建副本 |
+| 39 | 🟡 | `sync_reminders()` 对 API 错误响应缺乏校验，可能静默清空提醒 | 增加 `resp is None` 检查、`status != "ok"` 错误检测、`items` 字段兼容 |
+| 40 | 🟢 | 锁体系统一 | 锁数量从 3 把增至 6 把：`lock`(RLock)、`_gui_lock`、`_config_lock`、`_queue_lock`、`_log_lock`，每把锁职责单一 |
 
 ## 版本与更新
 
