@@ -948,6 +948,9 @@ def send_heartbeat():
     服务端据此区分：
     - token 匹配 → 仅更新心跳，不返回 token（正常心跳）
     - 无 token / token 不匹配 → 重新生成并返回新 token（token 丢失恢复）
+    
+    修复 v2.37.0：简化逻辑分支，移除永远不会执行的 elif 分支，
+    直接在 status != "ok" 时检查 _error 标记。
     """
     payload = {
         "device_id": DEVICE_ID,
@@ -963,7 +966,13 @@ def send_heartbeat():
         log("心跳请求无响应（网络可能已断开）", "WARNING")
         return False
 
-    if isinstance(resp, dict) and resp.get("status") == "ok":
+    if not isinstance(resp, dict):
+        log(f"心跳响应格式异常: {type(resp).__name__}", "ERROR")
+        return False
+
+    # 检查业务状态码
+    status = resp.get("status")
+    if status == "ok":
         # token 匹配时服务端不返回 token（心跳模式）
         # 无 token 或 token 不匹配时服务端返回新 token（恢复模式）
         token = resp.get("device_token")
@@ -974,18 +983,11 @@ def send_heartbeat():
         else:
             log("心跳发送成功", "INFO")
         return True
-    # 修复：检查业务错误（_error 标记），区分网络错误和业务错误
-    elif isinstance(resp, dict) and resp.get("_error"):
-        error_msg = resp.get("message", "未知错误")
-        log(f"心跳业务错误: {error_msg}", "ERROR")
-        return False
     
-    # 响应格式异常或非预期状态
-    if not isinstance(resp, dict):
-        log(f"心跳响应格式异常: {type(resp).__name__}", "ERROR")
-    else:
-        log(f"心跳返回非预期状态: {resp.get('status', '无状态')}", "ERROR")
-    return False  # 非预期情况统一返回 False
+    # status != "ok" 或存在业务错误标记
+    error_msg = resp.get("message", "未知错误")
+    log(f"心跳业务错误: {error_msg}", "ERROR")
+    return False
 
 
 def save_device_token(token):
