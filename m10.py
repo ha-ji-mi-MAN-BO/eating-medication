@@ -5,10 +5,13 @@ UniHiker M10 智能服药提醒终端主程序
 项目地址适配: https://my-website.ccwu.cc/eating-medication/server/
 设备配对码: 2AIDMUNIHIKER13
 API 版本: v2.28.0（对应 openapi.json）
-当前代码版本: v2.33.0
+当前代码版本: v2.33.1
 
 本程序使用 Python 标准库 + UniHiker 原生 API (unihiker/pinpong) + pyttsx3 TTS,
 不依赖 cv2、requests、schedule 等第三方库。
+
+v2.33.1 修复记录（共 1 项 bug 修复，涵盖搜索药品时二哈模式切换失效）：
+- 【严重】alert_loop() 提醒循环在搜索药品模式下仍调用 detect_face_id()，其内部的 huskylens.getResult(ALGORITHM_FACE_RECOGNITION) 会把二哈从条形码识别切回人脸识别，导致搜索药品时二哈模式切换失效。修复：在 alert_loop() 循环开头检查 _searching_medicine 事件，搜索药品时暂停提醒循环（不检测人脸、不播报、不增加重试次数）
 
 v2.33.0 修复记录（共 6 项，新增搜索药品功能和二哈初始化逻辑调整）：
 - 【新增】搜索药品功能：主页和提醒吃药界面底部新增"搜索药品"触摸按钮，点击后切换 HuskyLens 到条形码识别模式
@@ -258,7 +261,7 @@ SERVER_BASE_URL = "https://my-website.ccwu.cc/eating-medication/server"
 PAIR_CODE = "2AIDMUNIHIKER13"
 DEVICE_ID = "m10_" + PAIR_CODE
 
-# API 端点（v2.28.0，对应 openapi.json，m10.py 当前版本 v2.33.0）
+# API 端点（v2.28.0，对应 openapi.json，m10.py 当前版本 v2.33.1）
 API_REGISTER = f"{SERVER_BASE_URL}/api/v1/public/device/register"
 API_SCHEDULE = f"{SERVER_BASE_URL}/api/v1/public/device/schedule/{DEVICE_ID}"
 API_MESSAGE = f"{SERVER_BASE_URL}/api/v1/public/device/message"
@@ -1815,6 +1818,12 @@ def alert_loop(tid):
                 break
             volume = state["active_alerts"][tid]["volume"]
             reminder = state["active_alerts"][tid]["reminder"]
+
+        # 搜索药品模式下暂停提醒循环（不检测人脸、不播报、不增加重试次数）
+        # 避免 detect_face_id() 调用 getResult(ALGORITHM_FACE_RECOGNITION) 把二哈切回人脸识别
+        if _searching_medicine.is_set():
+            time.sleep(0.5)
+            continue
 
         # 检测目标人脸
         face_found = detect_face_id(TARGET_FACE_ID)
