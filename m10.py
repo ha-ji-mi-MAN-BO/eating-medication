@@ -5,10 +5,18 @@ UniHiker M10 智能服药提醒终端主程序
 项目地址适配: https://my-website.ccwu.cc/eating-medication/server/
 设备配对码: 2AIDMUNIHIKER13
 API 版本: v2.28.0（对应 openapi.json）
-当前代码版本: v2.32.1
+当前代码版本: v2.33.0
 
 本程序使用 Python 标准库 + UniHiker 原生 API (unihiker/pinpong) + pyttsx3 TTS,
 不依赖 cv2、requests、schedule 等第三方库。
+
+v2.33.0 修复记录（共 6 项，新增搜索药品功能和二哈初始化逻辑调整）：
+- 【新增】搜索药品功能：主页和提醒吃药界面底部新增"搜索药品"触摸按钮，点击后切换 HuskyLens 到条形码识别模式
+- 【新增】搜索药品界面：中间偏上显示"药品为："和实时识别到的条形码名字，底部"返回"按钮恢复前一界面
+- 【新增】enter_search_medicine()/exit_search_medicine() 模式切换函数，记录前一界面（home/reminder）并正确恢复
+- 【新增】_barcode_detect_thread() 条形码检测线程，每 0.5 秒检测一次并实时更新界面显示
+- 【修改】init_hardware() 中 HuskyLens 仅初始化硬件（knock 握手），移除开机自动切换人脸识别模式，改为在 trigger_alert() 触发提醒时才切换
+- 【修改】face_id_thread() 搜索药品模式下（_searching_medicine 事件 set）暂停人脸检测，避免与条形码识别冲突；exit_search_medicine() 返回时统一切换回人脸识别模式
 
 v2.32.1 修复记录（共 1 项 bug 修复，涵盖人脸检测）：
 - 【致命】get_face_name()/detect_face_id()/get_current_face_ids() 缺少 getResult()+available() 预检，直接调用 getCachedResultByID 导致永远检测不到人脸（日志报"获取人脸id失败"）。按 HuskyLens 官方实例代码流程修正：先 getResult() 请求识别 → available() 检查结果 → 再 getCachedResultByID()
@@ -250,7 +258,7 @@ SERVER_BASE_URL = "https://my-website.ccwu.cc/eating-medication/server"
 PAIR_CODE = "2AIDMUNIHIKER13"
 DEVICE_ID = "m10_" + PAIR_CODE
 
-# API 端点（v2.28.0，对应 openapi.json，m10.py 当前版本 v2.29.7）
+# API 端点（v2.28.0，对应 openapi.json，m10.py 当前版本 v2.33.0）
 API_REGISTER = f"{SERVER_BASE_URL}/api/v1/public/device/register"
 API_SCHEDULE = f"{SERVER_BASE_URL}/api/v1/public/device/schedule/{DEVICE_ID}"
 API_MESSAGE = f"{SERVER_BASE_URL}/api/v1/public/device/message"
@@ -279,6 +287,14 @@ huskylens = None
 _face_id_text = "ID: --"       # 当前检测到的人脸ID文本
 _face_id_obj = None            # GUI 文本对象（左下角）
 _face_id_stop_event = threading.Event()  # 人脸ID检测线程停止信号
+
+# 搜索药品功能相关全局变量
+_searching_medicine = threading.Event()  # 搜索药品模式标志（True时暂停人脸检测）
+_previous_gui_mode = "home"  # 进入搜索药品前的界面（home/reminder），用于返回
+_search_button_obj = None    # "搜索药品"按钮对象
+_back_button_obj = None      # "返回"按钮对象
+_barcode_text_obj = None     # 条形码名字文本对象
+_barcode_thread_stop = threading.Event()  # 条形码检测线程停止信号
 
 # 提醒时需要检测的目标人脸ID（id1 对应的老人）
 TARGET_FACE_ID = 1
@@ -2212,7 +2228,7 @@ def update_gui_status(text, alert=False):
 
 def update_gui_home():
     """返回主页界面，绘制日期与时分秒（由 clock_thread 每秒刷新）"""
-    global _gui_mode, _clock_date_obj, _clock_time_obj, _face_id_obj
+    global _gui_mode, _clock_date_obj, _clock_time_obj, _face_id_obj, _search_button_obj
     if not gui:
         return
     try:
@@ -2221,6 +2237,7 @@ def update_gui_home():
             _clock_date_obj = None
             _clock_time_obj = None
             _face_id_obj = None  # gui.clear() 会销毁对象，重置引用
+            _search_button_obj = None
         with _gui_draw_lock:
             gui.clear()
             gui.draw_text(x=120, y=30, text="智能服药提醒", font_size=18, color=COLOR_TITLE, origin="center")
@@ -2241,26 +2258,47 @@ def update_gui_home():
                 _clock_date_obj = date_obj
                 _clock_time_obj = time_obj
                 _gui_mode = "home"
-            gui.draw_text(x=120, y=220, text="B键启动提醒 A键紧急", font_size=11, color=COLOR_TEXT_GRAY, origin="center")
+            gui.draw_text(x=120, y=210, text="B键启动提醒 A键紧急", font_size=11, color=COLOR_TEXT_GRAY, origin="center")
+            # 底部搜索药品按钮（触摸屏）
+            add_button = getattr(gui, "add_button", None)
+            if callable(add_button):
+                _search_button_obj = add_button(
+                    x=120, y=245, w=120, h=36,
+                    text="搜索药品", origin="center",
+                    onclick=enter_search_medicine,
+                )
+            else:
+                gui.draw_text(x=120, y=245, text="[搜索药品]", font_size=14, color=COLOR_TEXT_GRAY, origin="center")
     except Exception as e:
         log(f"GUI 更新失败: {e}", "ERROR")
 
 
 def update_gui_reminder(name, drug, dose):
     """显示吃药提醒界面（分两行避免文字过长换行）"""
-    global _gui_mode, _face_id_obj
+    global _gui_mode, _face_id_obj, _search_button_obj
     if not gui:
         return
     try:
         with _gui_lock:
             _gui_mode = "reminder"
             _face_id_obj = None
+            _search_button_obj = None
         with _gui_draw_lock:
             gui.clear()
             gui.draw_text(x=120, y=40, text="该吃药了", font_size=20, color=COLOR_ALERT_DARK, origin="center")
             gui.draw_text(x=120, y=100, text=f"{name}，该吃 {drug}", font_size=16, color=COLOR_ALERT_RED, origin="center")
             gui.draw_text(x=120, y=140, text=f"每次 {dose}", font_size=16, color=COLOR_ALERT_RED, origin="center")
-            gui.draw_text(x=120, y=220, text="按~A键确认已吃药", font_size=12, color=COLOR_TEXT_GRAY, origin="center")
+            gui.draw_text(x=120, y=210, text="按~A键确认已吃药", font_size=12, color=COLOR_TEXT_GRAY, origin="center")
+            # 底部搜索药品按钮（触摸屏）
+            add_button = getattr(gui, "add_button", None)
+            if callable(add_button):
+                _search_button_obj = add_button(
+                    x=120, y=245, w=120, h=36,
+                    text="搜索药品", origin="center",
+                    onclick=enter_search_medicine,
+                )
+            else:
+                gui.draw_text(x=120, y=245, text="[搜索药品]", font_size=14, color=COLOR_TEXT_GRAY, origin="center")
     except Exception as e:
         log(f"GUI 更新失败: {e}", "ERROR")
 
@@ -2504,10 +2542,15 @@ def face_id_thread():
     持续读取 HuskyLens 人脸识别结果，更新左下角显示。
     HuskyLens 未初始化时跳过。
     每 0.5 秒检测一次，避免 I2C 总线过载。
+    搜索药品模式下（_searching_medicine 事件被 set）暂停检测，避免与条形码识别冲突。
     """
     log("人脸ID检测线程已启动")
     while not _face_id_stop_event.is_set():
         try:
+            # 搜索药品模式下暂停人脸检测（二哈已切换到条形码识别）
+            if _searching_medicine.is_set():
+                time.sleep(0.5)
+                continue
             if huskylens is not None and _HUSKYLENS_AVAILABLE:
                 ids = get_current_face_ids()
                 if ids:
@@ -2528,6 +2571,129 @@ def _set_face_id_text(text):
     _face_id_text = text
 
 
+def update_gui_search_medicine(barcode_name=""):
+    """搜索药品界面：中间偏上显示"药品为："和条形码名字，底部返回按钮
+
+    Args:
+        barcode_name: 当前检测到的条形码名字（空字符串时显示"等待识别..."）
+    """
+    global _gui_mode, _face_id_obj, _back_button_obj, _barcode_text_obj
+    if not gui:
+        return
+    try:
+        with _gui_lock:
+            _gui_mode = "search"
+            _face_id_obj = None
+            _barcode_text_obj = None
+            _back_button_obj = None
+        with _gui_draw_lock:
+            gui.clear()
+            gui.draw_text(x=120, y=40, text="搜索药品", font_size=20, color=COLOR_TITLE, origin="center")
+            gui.draw_text(x=120, y=90, text="药品为：", font_size=16, color=COLOR_TEXT_DARK, origin="center")
+            display_name = barcode_name if barcode_name else "等待识别..."
+            _barcode_text_obj = gui.draw_text(
+                x=120, y=125, text=display_name,
+                font_size=16, color=COLOR_ALERT_RED, origin="center",
+            )
+            # 底部返回按钮（触摸屏）
+            add_button = getattr(gui, "add_button", None)
+            if callable(add_button):
+                _back_button_obj = add_button(
+                    x=120, y=230, w=120, h=36,
+                    text="返回", origin="center",
+                    onclick=exit_search_medicine,
+                )
+            else:
+                gui.draw_text(x=120, y=230, text="[返回]", font_size=14, color=COLOR_TEXT_GRAY, origin="center")
+    except Exception as e:
+        log(f"GUI 搜索药品界面更新失败: {e}", "ERROR")
+
+
+def _barcode_detect_thread():
+    """条形码检测线程：持续检测条形码并更新界面显示"""
+    log("条形码检测线程已启动")
+    while not _barcode_thread_stop.is_set():
+        try:
+            name = get_barcode_name()
+            if name:
+                # 更新条形码名字显示
+                if _barcode_text_obj is not None:
+                    try:
+                        _barcode_text_obj.config(text=name)
+                    except Exception:
+                        pass
+                log(f"检测到条形码: {name}")
+            time.sleep(0.5)
+        except Exception as e:
+            log(f"条形码检测线程异常: {e}", "WARNING")
+            time.sleep(1)
+    log("条形码检测线程已停止")
+
+
+def enter_search_medicine():
+    """进入搜索药品模式
+
+    1. 记录当前界面（home/reminder）
+    2. 暂停人脸ID检测
+    3. 切换 HuskyLens 到条形码识别模式
+    4. 显示搜索药品界面
+    5. 启动条形码检测线程
+    """
+    global _previous_gui_mode
+    # 记录当前界面
+    with _gui_lock:
+        _previous_gui_mode = _gui_mode
+    log(f"进入搜索药品模式，前一界面: {_previous_gui_mode}")
+    # 暂停人脸检测
+    _searching_medicine.set()
+    # 切换到条形码识别
+    switch_huskylens_to_barcode()
+    # 显示搜索界面
+    update_gui_search_medicine()
+    # 启动条形码检测线程
+    _barcode_thread_stop.clear()
+    threading.Thread(target=_barcode_detect_thread, daemon=True).start()
+
+
+def exit_search_medicine():
+    """退出搜索药品模式，返回前一界面
+
+    1. 停止条形码检测线程
+    2. 切换 HuskyLens 回人脸识别模式（无论返回主页还是提醒界面）
+    3. 恢复前一界面（home/reminder）
+    4. 恢复人脸ID检测
+    """
+    log("退出搜索药品模式")
+    # 停止条形码检测
+    _barcode_thread_stop.set()
+    # 切换回人脸识别模式（主页和提醒界面均需要）
+    switch_huskylens_to_face()
+    # 恢复前一界面
+    prev = _previous_gui_mode
+    if prev == "reminder":
+        # 返回提醒界面，从 active_alerts 恢复提醒数据
+        with lock:
+            if state["active_alerts"]:
+                tid = next(iter(state["active_alerts"]), None)
+                if tid:
+                    reminder = state["active_alerts"][tid]["reminder"]
+                    update_gui_reminder(
+                        reminder.get("user_name", "老人"),
+                        reminder.get("medicine_name", "药品"),
+                        reminder.get("dose", ""),
+                    )
+                else:
+                    update_gui_home()
+            else:
+                # 提醒已被停止，回主页
+                update_gui_home()
+    else:
+        # 返回主页
+        update_gui_home()
+    # 恢复人脸ID检测
+    _searching_medicine.clear()
+
+
 def switch_huskylens_to_face():
     """切换 HuskyLens 到人脸识别模式
 
@@ -2545,6 +2711,52 @@ def switch_huskylens_to_face():
         log("HuskyLens 已切换到人脸识别模式")
     except Exception as e:
         log(f"HuskyLens 切换人脸识别模式失败: {e}", "ERROR")
+
+
+def switch_huskylens_to_barcode():
+    """切换 HuskyLens 到条形码识别模式
+
+    在搜索药品时调用，切换到 ALGORITHM_BARCODE_RECOGNITION。
+    HuskyLens 未初始化时跳过。
+    """
+    global huskylens
+    if not _HUSKYLENS_AVAILABLE or huskylens is None:
+        log("HuskyLens 未初始化，跳过切换条形码识别模式", "WARNING")
+        return
+    try:
+        huskylens.switchAlgorithm(ALGORITHM_BARCODE_RECOGNITION)
+        time.sleep(HUSKYLENS_SWITCH_DELAY)
+        log("HuskyLens 已切换到条形码识别模式")
+    except Exception as e:
+        log(f"HuskyLens 切换条形码识别模式失败: {e}", "ERROR")
+
+
+def get_barcode_name():
+    """获取当前检测到的条形码名字
+
+    按 HuskyLens 实例代码流程：
+    1. getResult() 请求识别
+    2. available() 检查是否有结果
+    3. 遍历 ID 1-7，用 getCachedResultByID 获取条形码信息
+
+    Returns:
+        str: 条形码名字，无检测或异常时返回空字符串
+    """
+    if not _HUSKYLENS_AVAILABLE or huskylens is None:
+        return ""
+    try:
+        huskylens.getResult(ALGORITHM_BARCODE_RECOGNITION)
+        if not huskylens.available(ALGORITHM_BARCODE_RECOGNITION):
+            return ""
+        for bid in range(1, 8):
+            result = huskylens.getCachedResultByID(ALGORITHM_BARCODE_RECOGNITION, bid)
+            if result is not None:
+                # 条形码的 name 字段可能存储条形码内容或自定义名称
+                return result.name if result.name else f"条形码{bid}"
+        return ""
+    except Exception as e:
+        log(f"获取条形码名字失败: {e}", "WARNING")
+        return ""
 
 
 def init_hardware():
@@ -2590,16 +2802,12 @@ def init_hardware():
         except Exception as e:
             log(f"GUI 初始化失败，将以无界面模式运行: {e}", "WARNING")
             gui = None
-        # 初始化 HuskyLens 二哈识图（I2C 连接 + knock 握手 + 切换人脸识别模式）
+        # 初始化 HuskyLens 二哈识图（仅 I2C 连接 + knock 握手，不切换算法）
         try:
             if _HUSKYLENS_AVAILABLE:
                 huskylens = HuskylensV2_I2C()
                 huskylens.knock()
                 log("HuskyLens 初始化成功")
-                # 开机即切换到人脸识别模式（左下角持续显示人脸ID）
-                huskylens.switchAlgorithm(ALGORITHM_FACE_RECOGNITION)
-                time.sleep(HUSKYLENS_SWITCH_DELAY)
-                log("HuskyLens 已切换到人脸识别模式")
             else:
                 log("HuskyLens 模块不可用，跳过初始化", "WARNING")
         except Exception as e:
