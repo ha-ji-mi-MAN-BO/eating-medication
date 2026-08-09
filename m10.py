@@ -12,10 +12,13 @@ UniHiker M10 智能服药提醒终端主程序
 项目地址适配: https://my-website.ccwu.cc/eating-medication/server/
 设备配对码: 2AIDMUNIHIKER13
 API 版本: v2.28.0（对应 openapi.json）
-当前代码版本: v2.37.0
+当前代码版本: v2.37.1
 
 本程序使用 Python 标准库 + UniHiker 原生 API (unihiker/pinpong) + pyttsx3 TTS,
 不依赖 cv2、requests、schedule 等第三方库。
+
+v2.37.1 修复记录（共 1 项 bug 修复，涵盖搜索药品时卡顿严重）：
+- 【严重】_barcode_detect_thread 每 0.5 秒调用 get_barcode_name()（9 次 I2C 操作）+ 持续检测到条形码时每 0.5 秒写日志 + 即使名字没变也调用 config() 更新 tkinter，导致搜索药品时卡顿严重。修复：(1) 只在条形码名字变化时更新 GUI 和写日志，避免重复 tkinter 操作和日志刷屏；(2) 检测间隔从 0.5 秒增加到 1 秒，减少 I2C 压力
 
 v2.37.0 修复记录（共 6 项 bug 修复，涵盖优雅退出、逻辑正确性、代码可维护性）：
 - 【致命】`button_thread()` 使用 `while True` 无限循环，无法优雅退出；修复：添加 `_button_thread_stop_event` 停止事件，改用可中断等待
@@ -107,7 +110,7 @@ DEVICE_ID = "m10_" + PAIR_CODE
 # User-Agent 常量，避免 Cloudflare 1010 拦截（urllib 默认 UA 被封禁）
 USER_AGENT = "Mozilla/5.0 (compatible; M10MedicationChecker/1.0)"
 
-# API 端点（v2.28.0，对应 openapi.json，m10.py 当前版本 v2.37.0）
+# API 端点（v2.28.0，对应 openapi.json，m10.py 当前版本 v2.37.1）
 API_REGISTER = f"{SERVER_BASE_URL}/api/v1/public/device/register"
 API_SCHEDULE = f"{SERVER_BASE_URL}/api/v1/public/device/schedule/{DEVICE_ID}"
 API_MESSAGE = f"{SERVER_BASE_URL}/api/v1/public/device/message"
@@ -2821,15 +2824,20 @@ def update_gui_search_medicine(barcode_name=""):
 def _barcode_detect_thread():
     """条形码检测线程：持续检测条形码并更新界面显示
     
-    修复 v2.36.0：使用 _barcode_thread_stop.wait(timeout=0.5) 
-    替代 time.sleep(0.5)，实现可中断等待，确保程序退出时线程能立即响应停止信号。
+    优化：
+    1. 只在条形码名字变化时更新 GUI 和写日志，避免重复 tkinter 操作和日志刷屏
+    2. 使用 _barcode_thread_stop.wait(timeout=1.0) 替代 time.sleep，减少 I2C 压力
+    3. 可中断等待，确保程序退出时线程能立即响应停止信号
     """
     log("条形码检测线程已启动")
+    last_name = ""  # 记录上次检测到的条形码名字，避免重复更新
     while not _barcode_thread_stop.is_set():
         try:
             name = get_barcode_name()
-            if name:
-                # 使用 _gui_draw_lock 保护 GUI 对象读取和更新
+            # 只在名字变化时更新 GUI 和日志，避免重复操作导致卡顿
+            if name and name != last_name:
+                last_name = name
+                # 使用 _gui_draw_lock 保护 GUI 对象更新
                 with _gui_draw_lock:
                     if _barcode_text_obj is not None:
                         try:
@@ -2837,8 +2845,8 @@ def _barcode_detect_thread():
                         except Exception:
                             pass
                 log(f"检测到条形码: {name}")
-            # 可中断等待：使用事件等待替代 time.sleep，便于立即响应退出信号
-            _barcode_thread_stop.wait(timeout=0.5)
+            # 可中断等待：1 秒间隔减少 I2C 压力
+            _barcode_thread_stop.wait(timeout=1.0)
         except Exception as e:
             log(f"条形码检测线程异常: {e}", "WARNING")
             _barcode_thread_stop.wait(timeout=1)
@@ -3041,6 +3049,8 @@ def get_barcode_name():
     2. available() 检查是否有结果
     3. 遍历 ID 1-7，用 getCachedResultByID 获取条形码信息
 
+    优化：找到第一个有效结果立即返回，避免遍历全部 7 个 ID 减少 I2C 操作。
+
     Returns:
         str: 条形码名字，无检测或异常时返回空字符串
     """
@@ -3050,6 +3060,7 @@ def get_barcode_name():
         huskylens.getResult(ALGORITHM_BARCODE_RECOGNITION)
         if not huskylens.available(ALGORITHM_BARCODE_RECOGNITION):
             return ""
+        # 遍历 ID 1-7，找到第一个有效结果立即返回（减少 I2C 操作）
         for bid in range(1, 8):
             result = huskylens.getCachedResultByID(ALGORITHM_BARCODE_RECOGNITION, bid)
             if result is not None:

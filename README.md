@@ -253,7 +253,7 @@ m10.py
 | 项目 | 值 |
 |------|-----|
 | 服务端基础路径 | `/eating-medication/server` |
-| API 版本 | v2.28.0（当前修复版：v2.37.0） |
+| API 版本 | v2.28.0（当前修复版：v2.37.1） |
 | 认证方式 | 设备注册后返回 `device_token`，后续请求通过 `X-Device-Token` Header 校验 |
 | 限流 | 设备端基于 IP 限流；部分接口需 `device_token` |
 
@@ -537,6 +537,12 @@ m10.py
 | 8 | 🟢 | `clock_thread()` 中 Tkinter 对象可能在刷新过程中被销毁 | 增加 `winfo_exists()` 检查，防止对象被销毁后调用 `config()` 抛出异常 |
 | 9 | 🟢 | `notify_emergency()` 紧急联系人缓存在配置更新后不会自动刷新 | 增加缓存过期机制（EMERGENCY_CACHE_TTL = 300 秒），过期后自动重新读取配置；新增 `invalidate_emergency_contact_cache()` 手动清除缓存接口 |
 | 10 | 🔵 | `capture_photo()` 文件名正则缺少路径安全校验，可能存在路径遍历攻击 | 使用 `os.path.basename()` 提取纯文件名；添加文件名长度检查；使用 `os.path.realpath()` 验证最终路径在 PHOTO_DIR 下 |
+
+### 已完成的 Bug 修复（v2.37.1，共 1 项）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `_barcode_detect_thread` 每 0.5 秒调用 `get_barcode_name()`（9 次 I2C 操作）+ 持续检测到条形码时每 0.5 秒写日志 + 即使名字没变也调用 `config()` 更新 tkinter，导致搜索药品时卡顿严重 | (1) 只在条形码名字变化时更新 GUI 和写日志，避免重复 tkinter 操作和日志刷屏；(2) 检测间隔从 0.5 秒增加到 1 秒，减少 I2C 压力 |
 
 ### 已完成的 Bug 修复（v2.37.0，共 6 项，涵盖优雅退出、逻辑正确性、代码可维护性）
 
