@@ -219,6 +219,10 @@ _face_id_text = "ID: --"       # 当前检测到的人脸ID文本
 _face_id_obj = None            # GUI 文本对象（左下角）
 _face_id_stop_event = threading.Event()  # 人脸ID检测线程停止信号
 
+# 按钮线程和主循环停止事件（v2.37.0：支持优雅退出）
+_button_thread_stop_event = threading.Event()
+_main_loop_stop_event = threading.Event()
+
 # 搜索药品功能相关全局变量
 _searching_medicine = threading.Event()  # 搜索药品模式标志（True时暂停人脸检测）
 _previous_gui_mode = "home"  # 进入搜索药品前的界面（home/reminder），用于返回
@@ -2835,26 +2839,49 @@ def _enter_search_medicine_impl():
     
     修复 v2.36.0：将日志移到锁内执行，确保日志输出使用的是加锁读取的一致值，
     防止与 _exit_search_medicine_impl 中的读取操作竞态。
+    
+    修复 v2.37.0：添加异常保护，确保异常发生时状态能正确恢复，
+    防止 _searching_medicine 被 set 但未被 clear 导致状态不一致。
+    使用可中断等待替代 time.sleep，支持优雅退出。
     """
     global _previous_gui_mode
-    # 记录当前界面并在锁内输出日志，确保一致性
-    with _gui_lock:
-        _previous_gui_mode = _gui_mode
-        log(f"进入搜索药品模式，前一界面: {_previous_gui_mode}")
-    # 暂停人脸检测
-    _searching_medicine.set()
-    # 等待 face_id_thread 检测到事件并暂停（检测周期 0.5 秒，等 SEARCH_MEDICINE_PAUSE_DELAY 秒确保暂停）
-    time.sleep(SEARCH_MEDICINE_PAUSE_DELAY)
-    # 切换到条形码识别
-    switch_ok = switch_huskylens_to_barcode()
-    if not switch_ok:
-        log("HuskyLens 条形码识别切换失败，将在无识别模式下显示搜索界面", "WARNING")
-    # 显示搜索界面
-    update_gui_search_medicine()
-    # 仅在切换成功时启动条形码检测线程
-    if switch_ok:
-        _barcode_thread_stop.clear()
-        threading.Thread(target=_barcode_detect_thread, daemon=True).start()
+    try:
+        # 记录当前界面并在锁内输出日志，确保一致性
+        with _gui_lock:
+            _previous_gui_mode = _gui_mode
+            log(f"进入搜索药品模式，前一界面: {_previous_gui_mode}")
+        # 暂停人脸检测
+        _searching_medicine.set()
+        # 等待 face_id_thread 检测到事件并暂停（检测周期 0.5 秒，等 SEARCH_MEDICINE_PAUSE_DELAY 秒确保暂停）
+        # 修复 v2.37.0：使用可中断等待
+        wait_start = time.time()
+        while time.time() - wait_start < SEARCH_MEDICINE_PAUSE_DELAY:
+            if _button_thread_stop_event.is_set() or _main_loop_stop_event.is_set():
+                # 程序正在退出，清除标志并返回
+                _searching_medicine.clear()
+                log("搜索药品模式因程序退出而中断", "INFO")
+                return
+            time.sleep(0.1)
+        # 切换到条形码识别
+        switch_ok = switch_huskylens_to_barcode()
+        if not switch_ok:
+            log("HuskyLens 条形码识别切换失败，将在无识别模式下显示搜索界面", "WARNING")
+        # 显示搜索界面
+        update_gui_search_medicine()
+        # 仅在切换成功时启动条形码检测线程
+        if switch_ok:
+            _barcode_thread_stop.clear()
+            threading.Thread(target=_barcode_detect_thread, daemon=True).start()
+    except Exception as e:
+        log(f"进入搜索药品模式异常: {e}", "ERROR")
+        # 异常时确保状态恢复：清除搜索模式标志
+        # 注意：此时 _searching_medicine 可能已被 set，需要在退出时清除
+        # 但我们保持 set 状态，让 _exit_search_medicine_impl 负责恢复
+        # 如果是严重异常，直接调用退出逻辑
+        try:
+            _exit_search_medicine_impl()
+        except Exception as e2:
+            log(f"异常恢复失败: {e2}", "ERROR")
 
 
 def exit_search_medicine():
@@ -3164,11 +3191,14 @@ def button_thread():
     
     修复 v2.35.1：添加按钮读取异常保护，防止引脚访问失败导致线程崩溃。
     当引脚对象为 None 或读取失败时，记录警告并继续循环。
+    
+    修复 v2.37.0：使用 _button_thread_stop_event.wait(timeout=0.1) 
+    替代 time.sleep(0.1)，实现可中断等待，支持优雅退出。
     """
     last_take = 0
     last_emergency = 0
     last_remind = 0
-    while True:
+    while not _button_thread_stop_event.is_set():
         now = time.time()
         # P21 已吃药按钮（~A）：按下高电平（1），松开低电平（0）
         try:
@@ -3191,7 +3221,8 @@ def button_thread():
                 on_emergency_button_pressed()
         except Exception as e:
             log(f"紧急按钮读取异常: {e}", "WARNING")
-        time.sleep(0.1)
+        # 可中断等待：使用事件等待替代 time.sleep，便于立即响应退出信号
+        _button_thread_stop_event.wait(timeout=0.1)
 
 
 def _do_network_recovery_sync():
@@ -3218,7 +3249,11 @@ def _do_network_recovery_sync():
 
 
 def main_loop():
-    """主循环：定时检查提醒、同步数据、网络恢复等"""
+    """主循环：定时检查提醒、同步数据、网络恢复等
+    
+    修复 v2.37.0：使用 _main_loop_stop_event.wait(timeout=CHECK_INTERVAL) 
+    替代 time.sleep(CHECK_INTERVAL)，实现可中断等待，支持优雅退出。
+    """
     last_minute = ""
     last_hour = -1
     last_stock_check = 0
@@ -3230,7 +3265,7 @@ def main_loop():
     last_heartbeat = 0  # 上次心跳时间戳
     heartbeat_fail_count = 0  # 连续心跳失败计数
 
-    while True:
+    while not _main_loop_stop_event.is_set():
         now = datetime.datetime.now()
         now_str = now.strftime("%H:%M")
 
@@ -3324,7 +3359,8 @@ def main_loop():
                         except Exception as e:
                             log(f"WiFi 重连失败: {type(e).__name__}: {e}", "ERROR")
 
-        time.sleep(CHECK_INTERVAL)
+            # 可中断等待：使用事件等待替代 time.sleep，便于立即响应退出信号
+        _main_loop_stop_event.wait(timeout=CHECK_INTERVAL)
 
 
 def main():
