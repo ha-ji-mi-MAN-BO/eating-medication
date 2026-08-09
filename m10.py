@@ -172,33 +172,18 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 import uuid
+from dfrobot_huskylensv2 import *
+
 
 
 # 可选依赖：pyttsx3（用于 TTS，缺失时自动回退到 espeak）
-try:
-    import pyttsx3
-    _PYTTSX3_AVAILABLE = True
-except ImportError:
-    pyttsx3 = None
-    _PYTTSX3_AVAILABLE = False
-
+import pyttsx3
 # 适配 UniHiker 平台
 # GUI 模块：可选依赖
-try:
-    from unihiker import GUI
-    _GUI_AVAILABLE = True
-except ImportError:
-    GUI = None
-    _GUI_AVAILABLE = False
+from unihiker import GUI
 
 # 硬件引脚模块：可选依赖
-try:
-    from pinpong.board import Board, Pin
-    _PINPONG_AVAILABLE = True
-except ImportError:
-    Board = None
-    Pin = None
-    _PINPONG_AVAILABLE = False
+from pinpong.board import Board, Pin
 
 # WiFi 模块：可选依赖，缺失时优雅降级
 _WIFI_AVAILABLE = False
