@@ -280,8 +280,8 @@ _face_id_text = "ID: --"       # 当前检测到的人脸ID文本
 _face_id_obj = None            # GUI 文本对象（左下角）
 _face_id_stop_event = threading.Event()  # 人脸ID检测线程停止信号
 
-# 提醒时需要检测的目标人脸ID（id2 对应的老人）
-TARGET_FACE_ID = 2
+# 提醒时需要检测的目标人脸ID（id1 对应的老人）
+TARGET_FACE_ID = 1
 
 # 提醒音量递增参数（每 10 分钟递增一次）
 VOLUME_INITIAL = 30
@@ -1776,7 +1776,7 @@ def alert_loop(tid):
     """提醒循环：检测人脸ID，循环播报直到按"已吃药"按钮确认
 
     流程：
-    1. 检测目标人脸ID（TARGET_FACE_ID=2）
+    1. 检测目标人脸ID（TARGET_FACE_ID=1）
     2. 未检测到时：循环播报"请{老人名字}来吃药"
     3. 检测到时：循环播报用药信息（在线用计划，离线用测试药品）
     4. 持续直到按"已吃药"按钮（active_alerts 移除）或达到最大重试次数
