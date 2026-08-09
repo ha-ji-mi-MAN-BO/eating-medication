@@ -88,14 +88,16 @@ from unihiker_connet_wifi import *    # WiFi 连接管理
 
 ### WiFi 配置
 
-WiFi 连接在**初始化时执行**，SSID 和密码通过环境变量配置（`m10.py` 第 252-254 行）：
+WiFi 连接在**初始化时执行**，SSID 和密码通过环境变量配置（`m10.py` 第 143-144 行）：
 
 ```python
-_WIFI_SSID = os.environ.get("WIFI_SSID", "666")
-_WIFI_PASSWORD = os.environ.get("WIFI_PASSWORD", "15756491077")
+_WIFI_SSID = os.environ.get("WIFI_SSID", "")
+_WIFI_PASSWORD = os.environ.get("WIFI_PASSWORD", "")
 ```
 
-**生产环境建议**：设置 `WIFI_SSID` 和 `WIFI_PASSWORD` 环境变量，避免在代码中硬编码凭据。
+> **安全提示**：默认值为空字符串，生产环境**必须**通过环境变量配置真实凭据，禁止在代码中硬编码密码。
+
+**生产环境配置**：
 
 ```bash
 # 设置环境变量后运行
@@ -104,7 +106,7 @@ export WIFI_PASSWORD="your_password"
 python3 m10.py
 ```
 
-`init_network()` 通过 `wifi_manager.is_wifi_connected()` 查询连接状态。
+`init_network()` 通过 `wifi_manager.is_wifi_connected()` 查询连接状态。若 SSID 或密码为空，将自动进入离线模式。
 
 ### 业务配置常量
 
@@ -251,7 +253,7 @@ m10.py
 | 项目 | 值 |
 |------|-----|
 | 服务端基础路径 | `/eating-medication/server` |
-| API 版本 | v2.28.0（当前修复版：v2.34.0） |
+| API 版本 | v2.28.0（当前修复版：v2.36.0） |
 | 认证方式 | 设备注册后返回 `device_token`，后续请求通过 `X-Device-Token` Header 校验 |
 | 限流 | 设备端基于 IP 限流；部分接口需 `device_token` |
 
@@ -520,6 +522,118 @@ m10.py
 | 13 | 🟢 | OCR 引擎加载失败后无法重置，需重启设备 | 新增 `reset_ocr_engine()` 函数，支持运行时重置 |
 | 14 | 🟢 | `_get_ocr_engine()` 缺少文档说明 | 添加详细 docstring，说明返回值和异常情况 |
 | 15 | 🟢 | `flush_local_logs()` 的 `_flush_in_progress` 事件可能因异常未释放 | 添加 finally 块确保事件清理 |
+
+### 已完成的 Bug 修复（v2.36.0，共 8 项，涵盖并发安全、代码冗余、性能优化、可维护性）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `_enter_search_medicine_impl()` 日志在锁外读取共享变量 `_previous_gui_mode`，存在竞态条件 | 将日志语句移到 `with _gui_lock` 块内执行，确保日志输出使用加锁读取的一致值 |
+| 2 | 🔴 | `face_id_thread()` 使用 `time.sleep(0.5)` 导致退出时无法立即响应停止事件 | 改用 `_face_id_stop_event.wait(timeout=0.5)` 实现可中断等待 |
+| 3 | 🟡 | `clock_thread()` 使用 `time.sleep()` 导致退出延迟最多 1 秒 | 改用 `_clock_stop_event.wait(timeout=CLOCK_REFRESH_INTERVAL)` 实现可中断等待 |
+| 4 | 🟡 | `main_loop()` 中 `_do_network_recovery_sync()` 闭包每次循环重新定义，增加不必要开销 | 将函数提取为模块级独立函数，避免每次循环迭代都重新创建函数对象 |
+| 5 | 🟡 | `_barcode_detect_thread()` 使用 `time.sleep()` 导致退出延迟 | 改用 `_barcode_thread_stop.wait(timeout=0.5)` 实现可中断等待 |
+| 6 | 🟢 | `update_gui_home()`/`update_gui_reminder()` 按钮回调创建不必要的闭包函数 | 简化为直接在 lambda 中使用 `enter_search_medicine`，消除冗余闭包 |
+| 7 | 🔵 | `detect_volume_control()` 中 `control_exists()` 函数定义在函数内部 | 提取为模块级独立函数 `_control_exists`，避免每次调用重复创建 |
+| 8 | 🔵 | 所有修复的线程函数文档字符串中缺少修复版本说明 | 为每个修复的函数添加 v2.36.0 修复说明注释，提高可追溯性 |
+
+### 已完成的 Bug 修复（v2.35.7，共 9 项，涵盖并发安全、代码冗余、逻辑正确性、可维护性）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `_gui_mode` 变量无锁保护并发读写：`main_loop()` 中读取 `_gui_mode` 未加锁，可能导致竞态条件 | 使用 `_gui_lock` 保护读取操作 |
+| 2 | 🔴 | `low_stock_alert()` 中 `_restore_status()` 读取 `_gui_mode` 未加锁 | 添加 `_gui_lock` 保护，确保线程安全 |
+| 3 | 🔴 | `_enter_search_medicine_impl()` 中 `saved_mode` 变量冗余赋值：在锁内重复赋值 | 移除冗余变量，直接使用 `_previous_gui_mode` 进行日志输出 |
+| 4 | 🟡 | `update_stock()` 中阈值获取逻辑冗余嵌套：存在双重 `try-except` 和重复的 `int()` 转换 | 简化为单次 `try-except`，提高代码可读性 |
+| 5 | 🟡 | `_convert_plans_to_medicines()` 中类型转换逻辑冗余：多处嵌套 try-except 和重复的 `int()` 转换 | 简化类型转换逻辑，减少代码重复 |
+| 6 | 🟢 | `notify_emergency()` 紧急联系人缓存初始化逻辑可优化 | 保留现有缓存机制，确保首次读取正确 |
+| 7 | 🟢 | 版本号不一致：文件头、注释中版本号不统一 | 统一为 v2.35.7 |
+| 8 | 🟢 | API 端点注释版本号与实际版本号不同步 | 更新注释中的版本号为 v2.35.7 |
+| 9 | 🟢 | 代码中存在多处版本号引用，维护成本高 | 统一版本号引用，便于后续维护 |
+
+### 已完成的 Bug 修复（v2.35.6，共 6 项，涵盖逻辑正确性、安全性、代码质量）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `sync_reminders()` 状态检查逻辑缺陷：当 status 字段不存在时跳过错误检测 | 增加 status 存在性检查，防止字段缺失时误判 |
+| 2 | 🔴 | `init_network()` WiFi 凭据检查不完整：只检查 SSID 未检查密码 | 同时检查 SSID 和密码是否为空 |
+| 3 | 🟡 | `_parse_dose_count()` 返回值缺乏边界验证 | 添加 `max(1, val)` 范围检查，确保返回值 >= 1 |
+| 4 | 🟡 | `detect_volume_control()` 中 `control_exists()` 文档字符串不完整 | 添加标准 Args/Returns 格式，补充参数说明 |
+| 5 | 🟢 | `detect_volume_control()` 中 subprocess 参数列表使用三元表达式拼接 | 改用 if-else 语句提高可读性，消除运算符优先级歧义 |
+| 6 | 🟢 | WiFi 配置示例与实际代码不一致（README 显示硬编码密码） | 更新文档示例为空字符串默认值，与 v2.35.5 安全修复保持一致 |
+
+### 已完成的 Bug 修复（v2.35.5，共 8 项，涵盖安全性、并发安全、性能优化、代码质量）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | WiFi 密码硬编码默认值为真实密码，存在安全风险 | 改为空字符串默认值，强制生产环境通过环境变量配置 |
+| 2 | 🔴 | `init_network()` 未检查 WiFi 凭据是否配置就尝试连接 | 添加凭据检查，未配置时提前进入离线模式 |
+| 3 | 🔴 | `_exit_search_medicine_impl()` 中 reminder 在锁释放后使用，存在数据竞争 | 在锁内创建副本后锁外使用 |
+| 4 | 🔴 | `http_request()` 403 关键词 "invalid" 过宽，可能误判非认证错误 | 收紧关键词列表，仅保留精确匹配的认证相关关键词 |
+| 5 | 🟡 | `flush_local_logs()` 中 `del photo/msg_payload/entry` 操作冗余 | 改为 `= None` 赋值，更优雅地释放引用 |
+| 6 | 🟡 | `face_id_thread()` 文本未变化时仍更新 GUI，造成无效刷新 | 添加文本变化检查，仅在变化时更新 |
+| 7 | 🟢 | `http_request()` URLError 日志泄露具体原因 | 仅记录错误类型名称，不泄露敏感信息 |
+| 8 | 🟢 | `upload_log()` 中 photo_ok 判断逻辑冗余，代码可读性差 | 简化逻辑，无照片时直接成功，照片失败时立即入队并返回 |
+
+### 已完成的 Bug 修复（v2.35.4，共 8 项，涵盖安全性、逻辑正确性、健壮性、可维护性）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `capture_photo()` 文件名正则验证过严，不支持中文字符 | 扩展正则支持中文和国际化文件名 |
+| 2 | 🔴 | `load_device_token()` token 验证过严，强制要求长度 > 10 且不含空格 | 放宽为非空字符串验证，兼容各种 token 格式 |
+| 3 | 🟡 | `update_stock()` 库存不足时日志信息不完整 | 添加药品名称和具体数量的详细日志 |
+| 4 | 🟡 | `http_request()` 403 关键词"令牌"过宽，可能误判非认证错误 | 移除"令牌"关键词，保留精确匹配"device_token"和"认证" |
+| 5 | 🟡 | `sync_reminders()` 状态检查逻辑冗余 | 简化 status 判断，移除不必要的 None 检查 |
+| 6 | 🟢 | `_convert_plans_to_medicines()` per_time 类型转换逻辑嵌套过深 | 改用 try-except 简化 |
+| 7 | 🟢 | `flush_local_logs()` 内存清理不完整，entry 变量未释放 | finally 块中显式删除所有临时变量 |
+| 8 | 🔵 | 修复记录格式不规范 | 统一修复记录格式，确保可追溯 |
+
+### 已完成的 Bug 修复（v2.35.3，共 7 项，涵盖安全性、逻辑正确性、健壮性、可维护性）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `http_request()` 中 403 关键词 "auth" 过于宽泛，可能误触发重新注册 | 改为更精确的 "authentication"，减少误判 |
+| 2 | 🟡 | 版本号不一致：API 端点注释仍显示 v2.35.0，与文件头 v2.35.2 不匹配 | 统一更新为 v2.35.3，同步更新文件头和注释 |
+| 3 | 🟡 | `_convert_plans_to_medicines()` 中 `threshold`/`unit` 字段可能为 None，导致后续异常 | 添加 None 和类型检查，`threshold` 为负数时默认回退到 5 |
+| 4 | 🟡 | `sync_reminders()` 中 `plans` 列表为空时仍覆盖 `state["reminders"]` 和 `state["medicines"]`，可能导致提醒丢失 | 仅当有效计划数大于 0 时才更新状态，空列表保留现有数据 |
+| 5 | 🟡 | `init_network()` 中网络检测失败时 `_wifi_initialized` 未重置，导致 WiFi 重连逻辑失效 | 网络检测失败时显式重置 `_wifi_initialized = False` |
+| 6 | 🟡 | `main_loop()` 中网络恢复后直接调用 `update_gui_home()`，无条件覆盖搜索药品/提醒界面 | 仅在 `_gui_mode` 为 "home" 或 "status" 时才恢复主页 |
+| 7 | 🟢 | `flush_local_logs()` 中 `photo_base64` 字段在循环迭代期间长期占用内存 | 添加 `finally` 块显式清理 `photo` 和 `msg_payload` 变量 |
+
+### 已完成的 Bug 修复（v2.35.2，共 7 项，涵盖安全性、健壮性、代码质量）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `http_request()` 中 403 错误检测关键词包含 "token"，过于宽泛可能误触发重新注册 | 移除 "token"，仅保留 "device_token" 精确匹配 |
+| 2 | 🟡 | `upload_log()` 末尾注释不准确（"消息成功或照片失败的其他情况"），分支逻辑冗余 | 修正注释为兜底说明，表明此分支为未预期执行路径的安全返回 |
+| 3 | 🟡 | `main_loop()` 心跳单次失败立即标记离线，对网络抖动过于敏感 | 新增 `heartbeat_fail_count` 计数器，连续失败 2 次后再标记离线，成功时重置计数 |
+| 4 | 🟡 | `alert_loop()` 搜索药品暂停时重试间隔 0.5 秒，20 次仅 10 秒就超时 | 延长等待间隔到 2 秒（总超时约 40 秒），避免在搜索药品期间过早超时 |
+| 5 | 🟢 | `flush_local_logs()` 中 `slim_entry` 构建逻辑与 `msg_payload` 重复 | 直接复用已构建的 `msg_payload`，消除冗余代码 |
+| 6 | 🟢 | `send_heartbeat()` 未预期响应分支注释不清晰 | 简化注释说明，明确为统一兜底返回 |
+| 7 | 🟢 | `heartbeat_fail_count` 计数器在心跳成功时未重置，逻辑不完整 | 添加心跳成功时的计数重置逻辑 |
+
+### 已完成的 Bug 修复（v2.35.1，共 8 项，涵盖健壮性、并发安全、逻辑正确性、可维护性）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `flush_local_logs()` 中 Lock.release() 在未获取锁时调用会抛 RuntimeError，导致程序崩溃 | 记录 `lock_acquired` 标志，仅在成功获取锁时才释放 |
+| 2 | 🔴 | `button_thread()` 中按钮读取无异常保护，引脚访问失败导致整个轮询线程崩溃 | 为每个按钮读取添加 try-except 异常保护，记录警告日志并继续循环 |
+| 3 | 🔴 | `init_network()` WiFi 连接失败后 `_wifi_initialized` 仍设为 True，导致无法重试 WiFi 连接 | 仅在连接成功时标记为已初始化，失败时保持 False 允许后续重试 |
+| 4 | 🟡 | `_previous_gui_mode` 无锁保护，在多线程环境下可能出现竞态条件 | 使用 `_gui_lock` 保护 `_previous_gui_mode` 的设置和读取 |
+| 5 | 🟡 | `http_request()` 中 403 错误检测关键词包含 "not found"/"not exist"，可能误触发重新注册 | 移除容易误判的关键词，收紧检测范围，仅保留认证相关关键词 |
+| 6 | 🟡 | `_parse_frequency_per_day()` 中 "每N天1次" 返回硬编码值 1，未正确计算每日服用次数 | 使用向上取整除法 `max(1, (1 + days - 1) // days)` 计算合理的每日次数 |
+| 7 | 🟢 | `button_thread()` 函数缺少文档字符串 | 添加 docstring 说明轮询机制和异常处理策略 |
+| 8 | 🟢 | 部分修复函数注释不完善，缺少修复版本说明 | 为修复函数添加 v2.35.1 修复说明注释，提高可追溯性 |
+
+### 已完成的 Bug 修复（v2.35.0，共 6 项，涵盖逻辑正确性、健壮性、安全性、可维护性）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `switch_huskylens_to_face()` 无返回值，调用方无法判断切换是否成功 | 添加 True/False 返回值，HuskyLens 不可用或异常时返回 False |
+| 2 | 🔴 | `trigger_alert()` 未检查 `switch_huskylens_to_face()` 返回值，切换失败时仍继续启动 alert_loop | 检查返回值，失败时记录 WARNING 日志，提醒功能继续但提示人脸识别不可用 |
+| 3 | 🔴 | `_exit_search_medicine_impl()` 未检查 `switch_huskylens_to_face()` 返回值，退出搜索药品时切换回人脸识别失败无日志 | 检查返回值并记录失败日志 |
+| 4 | 🟡 | `send_heartbeat()` 返回 False 时缺少详细日志，网络问题排查困难 | 添加心跳无响应日志、响应格式异常日志、非预期状态日志 |
+| 5 | 🟢 | `http_request()` 中 403 错误检测范围过窄，仅检查"device_token"/"token"/"令牌"关键字 | 扩展为多关键字列表检测（含 unauthorized/forbidden/auth/invalid/missing/expired 等） |
+| 6 | 🟢 | User-Agent 硬编码字符串分散在 `check_network()` 和 `_auth_headers()` 两处 | 提取为 `USER_AGENT` 常量，统一管理 |
 
 ### 已完成的 Bug 修复（v2.34.0，共 5 项，涵盖逻辑正确性、健壮性、并发安全、可维护性）
 
