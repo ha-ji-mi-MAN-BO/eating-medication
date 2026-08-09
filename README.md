@@ -226,7 +226,7 @@ m10.py
 | 项目 | 值 |
 |------|-----|
 | 服务端基础路径 | `/eating-medication/server` |
-| API 版本 | v2.28.0（当前修复版：v2.31.0） |
+| API 版本 | v2.28.0（当前修复版：v2.32.0） |
 | 认证方式 | 设备注册后返回 `device_token`，后续请求通过 `X-Device-Token` Header 校验 |
 | 限流 | 设备端基于 IP 限流；部分接口需 `device_token` |
 
@@ -495,6 +495,16 @@ m10.py
 | 13 | 🟢 | OCR 引擎加载失败后无法重置，需重启设备 | 新增 `reset_ocr_engine()` 函数，支持运行时重置 |
 | 14 | 🟢 | `_get_ocr_engine()` 缺少文档说明 | 添加详细 docstring，说明返回值和异常情况 |
 | 15 | 🟢 | `flush_local_logs()` 的 `_flush_in_progress` 事件可能因异常未释放 | 添加 finally 块确保事件清理 |
+
+### 已完成的 Bug 修复（v2.32.0，共 5 项）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🟢 新增 | 缺少人脸名字获取和ID检测函数 | 新增 `get_face_name()`/`detect_face_id()`/`get_current_face_ids()`，通过 `getCachedResultByID` 获取人脸信息 |
+| 2 | 🟢 新增 | GUI 左下角无人脸ID显示 | 新增 `face_id_thread()` 后台线程，每 0.5 秒检测人脸ID并更新左下角显示 |
+| 3 | 🟢 新增 | 开机后 HuskyLens 未切换到人脸识别模式 | `init_hardware()` 中初始化后即切换到 `ALGORITHM_FACE_RECOGNITION` |
+| 4 | 🟡 修改 | `alert_loop()` 无人脸检测，固定播报提醒内容 | 改为检测 id2：检测到前播报"请{名字}来吃药"，检测到后播报用药信息（在线用计划，离线播报"吃1个测试药品"），循环播报直到按"已吃药"按钮 |
+| 5 | 🟡 修改 | `gui.clear()` 后 `_face_id_obj` 引用未重置 | `update_gui_home/status/reminder()` 中重置 `_face_id_obj = None`，由 `face_id_thread` 自动重建 |
 
 ### 已完成的 Bug 修复（v2.31.0，共 3 项）
 

@@ -5,10 +5,17 @@ UniHiker M10 智能服药提醒终端主程序
 项目地址适配: https://my-website.ccwu.cc/eating-medication/server/
 设备配对码: 2AIDMUNIHIKER13
 API 版本: v2.28.0（对应 openapi.json）
-当前代码版本: v2.31.0
+当前代码版本: v2.32.0
 
 本程序使用 Python 标准库 + UniHiker 原生 API (unihiker/pinpong) + pyttsx3 TTS,
 不依赖 cv2、requests、schedule 等第三方库。
+
+v2.32.0 修复记录（共 5 项，新增人脸检测和左下角ID显示）：
+- 【新增】get_face_name()/detect_face_id()/get_current_face_ids() 辅助函数，通过 HuskyLens getCachedResultByID 获取人脸名字和检测指定ID
+- 【新增】face_id_thread() 后台线程，每 0.5 秒检测人脸ID并更新 GUI 左下角显示（如"ID: 2"或"ID: --"）
+- 【新增】init_hardware() 中 HuskyLens 初始化后即切换到人脸识别模式（开机即开始检测）
+- 【修改】alert_loop() 加入人脸检测逻辑：检测到id2前播报"请{名字}来吃药"，检测到后播报用药信息（在线用计划，离线播报"吃1个测试药品"），循环播报直到按"已吃药"按钮
+- 【修改】update_gui_home/status/reminder() 在 gui.clear() 后重置 _face_id_obj，face_id_thread 自动重建左下角标签
 
 v2.31.0 修复记录（共 3 项，新增 HuskyLens 初始化和模式切换）：
 - 【新增】init_hardware() 中添加 HuskyLens 二哈识图初始化：huskylens = HuskylensV2_I2C() + huskylens.knock()，开机自动初始化
@@ -264,6 +271,14 @@ HUSKYLENS_SWITCH_DELAY = 5
 
 # HuskyLens 全局实例（init_hardware 中初始化）
 huskylens = None
+
+# 人脸ID显示相关全局变量
+_face_id_text = "ID: --"       # 当前检测到的人脸ID文本
+_face_id_obj = None            # GUI 文本对象（左下角）
+_face_id_stop_event = threading.Event()  # 人脸ID检测线程停止信号
+
+# 提醒时需要检测的目标人脸ID（id2 对应的老人）
+TARGET_FACE_ID = 2
 
 # 提醒音量递增参数（每 10 分钟递增一次）
 VOLUME_INITIAL = 30
@@ -1755,53 +1770,68 @@ def trigger_alert(reminder):
 
 
 def alert_loop(tid):
-    """提醒循环：每次响铃后等待 SNOOZE_MINUTES 分钟，最多响铃 MAX_ALERT_RETRIES 次后自动停止
-    
-    使用 threading.Event.wait 实现可中断等待，响应更灵敏。
-    每响铃一次后自动增大音量（VOLUME_STEP），直到达到最大音量（VOLUME_MAX）。
-    
+    """提醒循环：检测人脸ID，循环播报直到按"已吃药"按钮确认
+
+    流程：
+    1. 检测目标人脸ID（TARGET_FACE_ID=2）
+    2. 未检测到时：循环播报"请{老人名字}来吃药"
+    3. 检测到时：循环播报用药信息（在线用计划，离线用测试药品）
+    4. 持续直到按"已吃药"按钮（active_alerts 移除）或达到最大重试次数
+
     Args:
         tid: 提醒 ID
-    
+
     Returns:
         None
     """
     retry_count = 0
+    target_name = get_face_name(TARGET_FACE_ID)
+    log(f"提醒循环启动，目标人脸ID={TARGET_FACE_ID}，名字={target_name}")
+
     while retry_count < MAX_ALERT_RETRIES:
-        # 检查提醒是否仍然活跃
+        # 检查提醒是否仍然活跃（按"已吃药"按钮会移除）
         with lock:
             if tid not in state["active_alerts"]:
-                log(f"提醒 {tid} 已被停止")
+                log(f"提醒 {tid} 已被停止（已吃药确认）")
                 break
             volume = state["active_alerts"][tid]["volume"]
             reminder = state["active_alerts"][tid]["reminder"]
-        
-        # 响铃和语音播报
-        msg = f"{reminder.get('user_name', '老人')}，该吃 {reminder.get('medicine_name', '药品')} 了"
+
+        # 检测目标人脸
+        face_found = detect_face_id(TARGET_FACE_ID)
+
+        if face_found:
+            # 检测到目标老人，播报用药信息
+            name = get_face_name(TARGET_FACE_ID)
+            if _get_online() and reminder:
+                drug = reminder.get("medicine_name", "药品")
+                dose = reminder.get("dose", "")
+                msg = f"{name}，该吃 {drug} 了，每次 {dose}"
+            else:
+                # 离线或无用药计划，提醒吃测试药品
+                msg = f"{name}，请吃1个测试药品"
+        else:
+            # 未检测到目标老人，呼叫其来吃药
+            msg = f"请{target_name}来吃药"
+
         buzzer_beep(times=3, duration=0.3)
         tts_speak(msg, volume=volume)
         retry_count += 1
-        
-        # 可中断等待：每 1 秒检查一次是否需要退出
-        wait_end = time.time() + SNOOZE_MINUTES * 60
+
+        # 可中断等待：每 1 秒检查一次是否需要退出（缩短为 10 秒间隔，加快循环播报）
+        wait_end = time.time() + 10
         should_break = False
         while time.time() < wait_end:
-            if not _get_online():
-                # 离线时缩短等待时间，加快网络恢复后的响应
-                time.sleep(1)
-            else:
-                time.sleep(min(1.0, wait_end - time.time()))
-            
-            # 检查提醒是否已被外部停止
+            time.sleep(min(1.0, wait_end - time.time()))
             with lock:
                 if tid not in state["active_alerts"]:
                     should_break = True
                     break
-        
+
         if should_break:
             log(f"提醒 {tid} 被中断")
             break
-            
+
         # 增大音量
         with lock:
             if tid in state["active_alerts"]:
@@ -1810,7 +1840,7 @@ def alert_loop(tid):
                 info["volume"] = min(info["volume"] + VOLUME_STEP, VOLUME_MAX)
                 if info["volume"] != old_volume:
                     log(f"提醒 {tid} 音量提升: {old_volume} -> {info['volume']}")
-    
+
     # 超过最大重试次数，自动停止提醒（避免无限响铃）
     if retry_count >= MAX_ALERT_RETRIES:
         log(f"提醒 {tid} 已达最大重试次数 ({MAX_ALERT_RETRIES})，自动停止", "WARNING")
@@ -2159,12 +2189,13 @@ def _format_time(now):
 
 def update_gui_status(text, alert=False):
     """临时状态界面（不显示时钟，时钟线程会跳过非 home 模式）"""
-    global _gui_mode
+    global _gui_mode, _face_id_obj
     if not gui:
         return
     try:
         with _gui_lock:
             _gui_mode = "status"
+            _face_id_obj = None
         with _gui_draw_lock:
             color = COLOR_ALERT_RED if alert else COLOR_TEXT_DARK
             gui.clear()
@@ -2178,7 +2209,7 @@ def update_gui_status(text, alert=False):
 
 def update_gui_home():
     """返回主页界面，绘制日期与时分秒（由 clock_thread 每秒刷新）"""
-    global _gui_mode, _clock_date_obj, _clock_time_obj
+    global _gui_mode, _clock_date_obj, _clock_time_obj, _face_id_obj
     if not gui:
         return
     try:
@@ -2186,6 +2217,7 @@ def update_gui_home():
         with _gui_lock:
             _clock_date_obj = None
             _clock_time_obj = None
+            _face_id_obj = None  # gui.clear() 会销毁对象，重置引用
         with _gui_draw_lock:
             gui.clear()
             gui.draw_text(x=120, y=30, text="智能服药提醒", font_size=18, color=COLOR_TITLE, origin="center")
@@ -2213,12 +2245,13 @@ def update_gui_home():
 
 def update_gui_reminder(name, drug, dose):
     """显示吃药提醒界面（分两行避免文字过长换行）"""
-    global _gui_mode
+    global _gui_mode, _face_id_obj
     if not gui:
         return
     try:
         with _gui_lock:
             _gui_mode = "reminder"
+            _face_id_obj = None
         with _gui_draw_lock:
             gui.clear()
             gui.draw_text(x=120, y=40, text="该吃药了", font_size=20, color=COLOR_ALERT_DARK, origin="center")
@@ -2352,6 +2385,135 @@ def on_remind_button_pressed():
 
 # ============== 初始化与主循环 ==============
 
+def get_face_name(face_id):
+    """从 HuskyLens 获取指定人脸 ID 的名字
+
+    使用 getCachedResultByID 获取已学习的人脸信息。
+    先 request() 刷新缓存，再读取 name 字段。
+
+    Args:
+        face_id: 人脸 ID（如 2）
+
+    Returns:
+        str: 人脸名字，获取失败时返回 "id{face_id}"
+    """
+    if not _HUSKYLENS_AVAILABLE or huskylens is None:
+        return f"id{face_id}"
+    try:
+        huskylens.request()
+        result = huskylens.getCachedResultByID(ALGORITHM_FACE_RECOGNITION, face_id)
+        if result and result.name:
+            return result.name
+        return f"id{face_id}"
+    except Exception as e:
+        log(f"获取人脸ID{face_id}名字失败: {e}", "WARNING")
+        return f"id{face_id}"
+
+
+def detect_face_id(face_id):
+    """检测当前帧中是否存在指定 ID 的人脸
+
+    通过 request() 请求一次识别，再用 getCachedResultByID 检查目标 ID。
+    注意：getCachedResultByID 返回的是当前帧缓存，若该 ID 未出现在画面中则返回 None。
+
+    Args:
+        face_id: 目标人脸 ID
+
+    Returns:
+        bool: True 表示检测到目标人脸
+    """
+    if not _HUSKYLENS_AVAILABLE or huskylens is None:
+        return False
+    try:
+        huskylens.request()
+        result = huskylens.getCachedResultByID(ALGORITHM_FACE_RECOGNITION, face_id)
+        return result is not None
+    except Exception as e:
+        log(f"检测人脸ID{face_id}失败: {e}", "WARNING")
+        return False
+
+
+def get_current_face_ids():
+    """获取当前帧中检测到的所有人脸 ID 列表
+
+    遍历 ID 1-7，用 getCachedResultByID 检查哪些在当前帧中。
+
+    Returns:
+        list: 检测到的人脸 ID 列表（如 [1, 2]），无检测或异常时返回空列表
+    """
+    if not _HUSKYLENS_AVAILABLE or huskylens is None:
+        return []
+    try:
+        huskylens.request()
+        ids = []
+        for fid in range(1, 8):
+            result = huskylens.getCachedResultByID(ALGORITHM_FACE_RECOGNITION, fid)
+            if result is not None:
+                ids.append(fid)
+        return ids
+    except Exception as e:
+        log(f"获取当前人脸ID列表失败: {e}", "WARNING")
+        return []
+
+
+def update_face_id_label():
+    """在 GUI 左下角绘制/更新人脸 ID 文本
+
+    使用全局 _face_id_text 作为内容，若文本对象不存在则创建。
+    每次调用时更新文本对象的 text 属性。
+    """
+    global _face_id_obj
+    if not gui:
+        return
+    try:
+        with _gui_draw_lock:
+            if _face_id_obj is None:
+                _face_id_obj = gui.draw_text(
+                    x=5, y=225, text=_face_id_text,
+                    font_size=10, color=COLOR_TEXT_GRAY, origin="top_left",
+                )
+            else:
+                try:
+                    _face_id_obj.config(text=_face_id_text)
+                except Exception:
+                    _face_id_obj = gui.draw_text(
+                        x=5, y=225, text=_face_id_text,
+                        font_size=10, color=COLOR_TEXT_GRAY, origin="top_left",
+                    )
+    except Exception as e:
+        log(f"更新人脸ID标签失败: {e}", "WARNING")
+
+
+def face_id_thread():
+    """后台人脸 ID 检测线程
+
+    持续读取 HuskyLens 人脸识别结果，更新左下角显示。
+    HuskyLens 未初始化时跳过。
+    每 0.5 秒检测一次，避免 I2C 总线过载。
+    """
+    log("人脸ID检测线程已启动")
+    while not _face_id_stop_event.is_set():
+        try:
+            if huskylens is not None and _HUSKYLENS_AVAILABLE:
+                ids = get_current_face_ids()
+                if ids:
+                    _set_face_id_text(f"ID: {','.join(str(i) for i in ids)}")
+                else:
+                    _set_face_id_text("ID: --")
+                update_face_id_label()
+            time.sleep(0.5)
+        except Exception as e:
+            log(f"人脸ID检测线程异常: {e}", "WARNING")
+            time.sleep(1)
+    log("人脸ID检测线程已停止")
+
+
+def _set_face_id_text(text):
+    """线程安全设置人脸ID文本"""
+    global _face_id_text
+    _face_id_text = text
+
+
 def switch_huskylens_to_face():
     """切换 HuskyLens 到人脸识别模式
 
@@ -2414,12 +2576,16 @@ def init_hardware():
         except Exception as e:
             log(f"GUI 初始化失败，将以无界面模式运行: {e}", "WARNING")
             gui = None
-        # 初始化 HuskyLens 二哈识图（I2C 连接 + knock 握手）
+        # 初始化 HuskyLens 二哈识图（I2C 连接 + knock 握手 + 切换人脸识别模式）
         try:
             if _HUSKYLENS_AVAILABLE:
                 huskylens = HuskylensV2_I2C()
                 huskylens.knock()
                 log("HuskyLens 初始化成功")
+                # 开机即切换到人脸识别模式（左下角持续显示人脸ID）
+                huskylens.switchAlgorithm(ALGORITHM_FACE_RECOGNITION)
+                time.sleep(HUSKYLENS_SWITCH_DELAY)
+                log("HuskyLens 已切换到人脸识别模式")
             else:
                 log("HuskyLens 模块不可用，跳过初始化", "WARNING")
         except Exception as e:
@@ -2675,6 +2841,8 @@ def main():
     threading.Thread(target=button_thread, daemon=True).start()
     # 启动主界面时钟刷新线程（每秒更新年月日时分秒）
     threading.Thread(target=clock_thread, daemon=True).start()
+    # 启动人脸ID检测线程（持续读取HuskyLens结果，更新左下角显示）
+    threading.Thread(target=face_id_thread, daemon=True).start()
 
     update_gui_home()
     tts_speak("智能服药提醒已启动")
