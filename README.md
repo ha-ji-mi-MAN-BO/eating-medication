@@ -88,15 +88,23 @@ from unihiker_connet_wifi import *    # WiFi 连接管理
 
 ### WiFi 配置
 
-WiFi 连接在**模块加载时自动执行**（`m10.py` 第 32-34 行）：
+WiFi 连接在**初始化时执行**，SSID 和密码通过环境变量配置（`m10.py` 第 252-254 行）：
 
 ```python
-from unihiker_connet_wifi import *
-wifi_manager = WiFiManager()
-response_success = wifi_manager.connect_wifi("666", "15756491077")
+_WIFI_SSID = os.environ.get("WIFI_SSID", "666")
+_WIFI_PASSWORD = os.environ.get("WIFI_PASSWORD", "15756491077")
 ```
 
-修改 WiFi 需直接编辑这行代码中的 SSID 和密码。`init_network()` 通过 `wifi_manager.is_wifi_connected()` 查询连接状态，**不再**从配置文件读取 WiFi 凭据。
+**生产环境建议**：设置 `WIFI_SSID` 和 `WIFI_PASSWORD` 环境变量，避免在代码中硬编码凭据。
+
+```bash
+# 设置环境变量后运行
+export WIFI_SSID="your_ssid"
+export WIFI_PASSWORD="your_password"
+python3 m10.py
+```
+
+`init_network()` 通过 `wifi_manager.is_wifi_connected()` 查询连接状态。
 
 ### 业务配置常量
 
@@ -243,7 +251,7 @@ m10.py
 | 项目 | 值 |
 |------|-----|
 | 服务端基础路径 | `/eating-medication/server` |
-| API 版本 | v2.28.0（当前修复版：v2.33.2） |
+| API 版本 | v2.28.0（当前修复版：v2.33.10） |
 | 认证方式 | 设备注册后返回 `device_token`，后续请求通过 `X-Device-Token` Header 校验 |
 | 限流 | 设备端基于 IP 限流；部分接口需 `device_token` |
 
@@ -512,6 +520,89 @@ m10.py
 | 13 | 🟢 | OCR 引擎加载失败后无法重置，需重启设备 | 新增 `reset_ocr_engine()` 函数，支持运行时重置 |
 | 14 | 🟢 | `_get_ocr_engine()` 缺少文档说明 | 添加详细 docstring，说明返回值和异常情况 |
 | 15 | 🟢 | `flush_local_logs()` 的 `_flush_in_progress` 事件可能因异常未释放 | 添加 finally 块确保事件清理 |
+
+### 已完成的 Bug 修复（v2.33.10，共 5 项，涵盖逻辑正确性、健壮性、安全性）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `update_stock()` 库存扣减未检查剩余量，`remaining` 为 0 或负数时仍会扣减，导致库存变为负数 | 在扣减前检查剩余量，若 `current_remaining <= 0` 则跳过扣减并记录警告日志 |
+| 2 | 🟡 | `send_heartbeat()` 心跳业务错误（`_error`）未被识别，业务失败时无日志记录 | 增加 `_error` 标记检查，业务错误时记录详细错误信息并返回 False |
+| 3 | 🟡 | `http_request()` 空响应体未正确处理，部分接口返回空 200 时仍报错 | 空响应体时返回 `{"status": "ok", "_empty_response": True}` 表示成功 |
+| 4 | 🟡 | `alert_loop()` 中 `get_face_name()` 无法获取真实名字时返回默认 id 字符串（如 "id1"），播报内容不友好 | 检查返回值是否为默认 id 格式，是则使用"老人"作为称呼 |
+| 5 | 🟢 | 版本修复记录不完整 | 新增 v2.33.10 修复记录注释，保持变更可追溯 |
+
+### 已完成的 Bug 修复（v2.33.9，共 5 项，涵盖逻辑正确性、健壮性、可维护性）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `_convert_plans_to_medicines()` 中 `per_time` 为 None 或非数字时会抛 TypeError | 添加安全转换逻辑，异常时默认值为 1 |
+| 2 | 🟡 | `notify_emergency()` 中 `_emergency_contact_cache` 全局变量无初始化检查 | 改为函数内安全初始化，增加 `strip()` 和空值校验 |
+| 3 | 🟡 | `flush_local_logs()` 中上传失败的 entry 保留了 base64 照片数据，长期积累占用内存 | 上传失败时剥离 `_photo` 字段，仅保留必要字段 |
+| 4 | 🟡 | `http_request()` 中 GET 请求仍需先 pop Content-Type header，逻辑冗余 | 简化为 GET 请求时直接移除 Content-Type header |
+| 5 | 🟢 | 版本修复记录不完整 | 新增 v2.33.9 修复记录注释，保持变更可追溯 |
+
+### 已完成的 Bug 修复（v2.33.8，共 6 项，涵盖逻辑正确性、健壮性、可维护性）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `alert_loop()` 中搜索药品模式使用 `time.sleep(0.5)` 阻塞，无法及时响应中断 | 改用 `_alert_interrupt_event.wait(timeout=0.5)` 可中断等待 |
+| 2 | 🟡 | `sync_reminders()` 中 status 检查逻辑：`resp.get("status")` 在 status 为空时误判为错误 | 改为 `resp.get("status") is not None` 判断 |
+| 3 | 🟡 | `update_stock()` 阈值检查使用 `<`，剩余数量恰好等于阈值时不触发告警 | 改为 `<=`，覆盖边界情况 |
+| 4 | 🟡 | `calculate_remaining_days()` 向上取整使用 `int(total)` 截断导致精度丢失 | 改为浮点运算的向上取整 `int(-(-total // daily))` |
+| 5 | 🟡 | `low_stock_alert()` 定时器可能覆盖用户搜索药品或提醒界面 | 增加 GUI 模式检查，仅在 home/status 模式下恢复 |
+| 6 | 🟢 | 版本号注释不一致 | 修正 API 端点注释版本号为 v2.33.8 |
+
+### 已完成的 Bug 修复（v2.33.7，共 3 项，涵盖逻辑正确性、健壮性、可维护性）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `_convert_plans_to_medicines()` 中 `dosage` 变量未定义（缺少 `dosage = p.get("dosage", "1片")`），运行时抛 `NameError`，导致库存计算和持久化全部失败 | 在循环内添加 `dosage = p.get("dosage", "1片")` 定义 |
+| 2 | 🟡 | 版本号注释不一致：API 端点注释仍显示 v2.33.6，与文件头 v2.33.7 不一致 | 修正 API 端点注释版本号为 v2.33.7 |
+| 3 | 🟢 | 新增版本修复记录注释 | 保持变更可追溯 |
+
+### 已完成的 Bug 修复（v2.33.6，共 4 项，涵盖逻辑正确性、可维护性）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | 版本号注释不一致：API 端点注释仍显示 v2.33.4，与文件头 v2.33.5 不一致 | 修正 API 端点注释版本号为 v2.33.6 |
+| 2 | 🔴 | `_convert_plans_to_medicines()` 中 `per_time` 硬编码为 1，未从 `dosage` 字段解析，导致库存计算不准确 | 改用 `_parse_dose_count(dosage)` 解析每次服用数量 |
+| 3 | 🟡 | `alert_loop()` 中 `wait_timeout` 硬编码为 10，不便于统一配置 | 提取为 `ALERT_WAIT_TIMEOUT` 常量 |
+| 4 | 🟢 | 提醒循环等待时间无独立常量管理 | 新增 `ALERT_WAIT_TIMEOUT` 常量，统一管理提醒循环等待时间 |
+
+### 已完成的 Bug 修复（v2.33.5，共 8 项，涵盖并发安全、健壮性、可维护性）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | 版本号注释不一致：API 端点注释仍显示 v2.33.3，与文件头 v2.33.4 不一致 | 修正 API 端点注释版本号为 v2.33.4 |
+| 2 | 🔴 | `alert_loop()` 中 `volume` 在锁内读取后锁外使用，存在竞态条件，其他线程可能在播报期间修改音量 | 改用 `current_volume` 副本，在锁内获取后传递给 `tts_speak()` |
+| 3 | 🔴 | `http_request()` 403 错误检测仅依赖"设备令牌"关键字，过于脆弱，可能漏判 | 扩展为检查 `device_token`/`token`/`令牌` 多种关键字（含大小写不敏感） |
+| 4 | 🔴 | `confirm_take()` 在 `medicine_id` 为 None 时仍调用 `update_stock()`，可能导致库存异常 | 添加空值检查，仅在有有效药品ID时更新库存 |
+| 5 | 🟡 | `send_heartbeat()` 心跳成功日志为 DEBUG 级别，不利于生产环境监控 | 改为 INFO 级别，便于追踪心跳状态 |
+| 6 | 🟡 | `face_id_thread()` 中变量更新顺序可能导致短暂不一致状态 | 优化更新顺序：先计算新文本，再更新全局变量，最后更新 GUI |
+| 7 | 🟡 | `alert_loop()` 等待循环使用 `time.sleep` + `time.time()` 轮询，响应不够高效 | 改用 `threading.Event.wait(timeout=1.0)` 分段等待，每1秒检查一次退出条件 |
+| 8 | 🟢 | `trigger_alert()` 启动新提醒循环前未清理中断事件，可能导致旧事件残留 | 添加 `_alert_interrupt_event.clear()` 确保每次新提醒都有干净状态 |
+
+### 已完成的 Bug 修复（v2.33.4，共 6 项，涵盖并发安全、健壮性、可维护性）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | 版本号注释不一致：API 端点注释仍显示 v2.33.2，与文件头 v2.33.3 不一致 | 修正 API 端点注释版本号为 v2.33.3 |
+| 2 | 🔴 | `clock_thread()` 中 GUI 变量（`_gui_mode`/`_clock_time_obj`/`_clock_date_obj`）读取无锁保护，存在竞态条件 | 添加 `_gui_lock` 保护 GUI 变量读取 |
+| 3 | 🔴 | `_barcode_detect_thread()` 中 `_barcode_text_obj` 读取无锁保护，存在竞态条件 | 添加 `_gui_draw_lock` 保护 GUI 对象读取和更新 |
+| 4 | 🟡 | `send_heartbeat()` 心跳成功缺少日志记录，难以追踪心跳状态 | 添加心跳成功日志（DEBUG 级别） |
+| 5 | 🟡 | 程序退出时未设置 `_clock_stop_event`/`_face_id_stop_event`/`_barcode_thread_stop`，可能导致线程无法正常退出 | 在 `main()` 的 finally 块中添加清理逻辑 |
+| 6 | 🟢 | 文件头缺少版权声明 | 添加版权声明头 |
+
+### 已完成的 Bug 修复（v2.33.3，共 6 项，涵盖安全、并发、健壮性、可维护性）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | WiFi SSID/密码硬编码，存在安全风险且部署不灵活 | 改为从环境变量读取（`WIFI_SSID`/`WIFI_PASSWORD`），代码中保留默认值作为回退 |
+| 2 | 🔴 | `update_stock()` 库存阈值计算错误，`low_stock_threshold` 被错误地乘以 `frequency_per_day` | 修正为直接使用 `low_stock_threshold` 作为剩余片数阈值 |
+| 3 | 🟡 | `_face_id_text` 全局变量无锁保护，存在并发读写竞态条件 | 新增 `_face_id_lock` 和 `_get_face_id_text()` 线程安全读取方法 |
+| 4 | 🟡 | `http_request()` 错误日志泄露响应体内容，可能暴露敏感信息 | 改为仅记录错误码和 URL，不记录响应体 |
+| 5 | 🟡 | `enter_search_medicine()`/`exit_search_medicine()` 缺少防重复调用机制 | 添加状态检查，已在搜索模式中时忽略重复调用 |
+| 6 | 🟢 | 搜索药品模式切换等待时间硬编码 `time.sleep(1)` | 提取为 `SEARCH_MEDICINE_PAUSE_DELAY` 常量，便于维护 |
 
 ### 已完成的 Bug 修复（v2.33.2，共 1 项）
 

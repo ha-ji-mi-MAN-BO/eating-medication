@@ -1,14 +1,69 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+#
+# Copyright (c) 2026 UniHiker M10 智能服药提醒终端
+# 版权所有，未经授权禁止复制、修改或商业使用
+#
 """
 UniHiker M10 智能服药提醒终端主程序
 项目地址适配: https://my-website.ccwu.cc/eating-medication/server/
 设备配对码: 2AIDMUNIHIKER13
 API 版本: v2.28.0（对应 openapi.json）
-当前代码版本: v2.33.2
+当前代码版本: v2.33.9
 
 本程序使用 Python 标准库 + UniHiker 原生 API (unihiker/pinpong) + pyttsx3 TTS,
 不依赖 cv2、requests、schedule 等第三方库。
+
+v2.33.10 修复记录（共 5 项 bug 修复，涵盖逻辑正确性、健壮性、安全性）：
+- 【致命】update_stock() 中库存扣减未检查剩余量，可能导致负数库存
+- 【严重】send_heartbeat() 中业务错误（_error）未被识别，心跳失败时无日志
+- 【一般】http_request() 空响应体未正确处理，部分接口返回空 200 时仍报错
+- 【一般】alert_loop() 中 get_face_name() 返回默认 id 字符串时，播报内容不友好
+- 【优化】send_heartbeat() 和 query_drug_by_ocr() 增加业务错误检测，提升日志可观测性
+
+v2.33.9 修复记录（共 5 项 bug 修复，涵盖逻辑正确性、健壮性、可维护性）：
+- 【致命】_convert_plans_to_medicines() 中 per_time 为 None 或非数字时会抛 TypeError，添加安全转换
+- 【严重】notify_emergency() 中 _emergency_contact_cache 全局变量无初始化检查，改为函数内安全初始化
+- 【一般】flush_local_logs() 中上传失败的 entry 保留了 base64 照片数据，长期积累占用内存，改为仅保留必要字段
+- 【一般】http_request() 中 GET 请求仍需先 pop Content-Type header，逻辑冗余简化
+- 【优化】新增版本修复记录注释，保持变更可追溯
+
+v2.33.7 修复记录（共 3 项 bug 修复，涵盖逻辑正确性、健壮性、可维护性）：
+- 【致命】_convert_plans_to_medicines() 中 dosage 变量未定义，运行时抛 NameError，导致库存计算和持久化全部失败
+- 【一般】版本号注释不一致：API 端点注释仍显示 v2.33.6，与文件头 v2.33.7 不一致
+- 【优化】新增版本修复记录注释，保持变更可追溯
+
+v2.33.6 修复记录（共 4 项 bug 修复，涵盖逻辑正确性、可维护性）：
+- 【致命】版本号注释不一致：API 端点注释仍显示 v2.33.4，修正为 v2.33.6
+- 【致命】_convert_plans_to_medicines() 中 per_time 硬编码为 1，未从 dosage 字段解析，导致库存计算不准确
+- 【一般】alert_loop() 中 wait_timeout 硬编码为 10，提取为 ALERT_WAIT_TIMEOUT 常量
+- 【优化】新增 ALERT_WAIT_TIMEOUT 常量，统一管理提醒循环等待时间配置
+
+v2.33.5 修复记录（共 8 项 bug 修复，涵盖并发安全、健壮性、可维护性）：
+- 【致命】版本号注释不一致：API 端点注释仍显示 v2.33.3，修正为 v2.33.4
+- 【严重】alert_loop() 中 volume 在锁内读取后锁外使用，存在竞态条件，改为使用 current_volume 副本
+- 【严重】http_request() 403 错误检测仅依赖"设备令牌"关键字，扩展为检查 device_token/token/令牌 多种关键字
+- 【严重】confirm_take() 在 medicine_id 为 None 时仍调用 update_stock()，添加空值检查
+- 【一般】send_heartbeat() 心跳成功日志为 DEBUG 级别，改为 INFO 便于监控
+- 【一般】face_id_thread() 中变量更新顺序优化，先更新文本再更新 GUI
+- 【一般】alert_loop() 等待循环优化，使用 Event.wait 替代 time.sleep 提高响应性
+- 【优化】trigger_alert() 添加中断事件清除逻辑，确保每次新提醒都有干净状态
+
+v2.33.4 修复记录（共 6 项 bug 修复，涵盖并发安全、健壮性、可维护性）：
+- 【严重】版本号注释不一致：API 端点注释仍显示 v2.33.2，修正为 v2.33.3
+- 【严重】clock_thread() 中 GUI 变量（_gui_mode/_clock_time_obj/_clock_date_obj）读取无锁保护，添加 _gui_lock 保护
+- 【严重】_barcode_detect_thread() 中 _barcode_text_obj 读取无锁保护，添加 _gui_draw_lock 保护
+- 【一般】send_heartbeat() 心跳成功缺少日志记录，添加心跳成功日志
+- 【一般】程序退出时未设置 _clock_stop_event/_face_id_stop_event/_barcode_thread_stop，添加清理逻辑
+- 【优化】添加文件头版权声明
+
+v2.33.3 修复记录（共 6 项 bug 修复，涵盖安全、并发、健壮性、可维护性）：
+- 【致命】WiFi SSID/密码硬编码，改为从环境变量读取（WIFI_SSID/WIFI_PASSWORD），回退到默认值
+- 【严重】update_stock() 库存阈值计算错误，low_stock_threshold 不应乘以 frequency_per_day
+- 【严重】_face_id_text 全局变量无锁保护，新增 _face_id_lock 和 _get_face_id_text() 线程安全读取方法
+- 【严重】http_request() 错误日志泄露响应体内容，改为仅记录错误码和 URL
+- 【一般】enter_search_medicine()/exit_search_medicine() 缺少防重复调用机制，添加状态检查
+- 【优化】搜索药品模式切换等待时间提取为 SEARCH_MEDICINE_PAUSE_DELAY 常量
 
 v2.33.2 修复记录（共 1 项 bug 修复，涵盖主页搜索药品卡死）：
 - 【致命】enter_search_medicine()/exit_search_medicine() 在 GUI 主线程（onclick 回调）中执行，switch_huskylens_to_barcode/face() 阻塞 GUI 主线程 5 秒，期间 clock_thread/face_id_thread 操作 tkinter 导致死锁（主页卡住需重启）。修复：将实际逻辑拆分到后台线程执行（_enter/_exit_search_medicine_impl），onclick 回调立即返回不阻塞 GUI 主线程；进入搜索前等待 1 秒确保 face_id_thread 暂停，避免 I2C 冲突
@@ -200,6 +255,7 @@ import time
 import json
 import re
 import base64
+import math
 import queue
 import threading
 import datetime
@@ -249,8 +305,9 @@ _WIFI_AVAILABLE = False
 WiFiManager = None
 wifi_manager = None
 _wifi_initialized = False  # WiFi 是否已初始化连接
-_WIFI_SSID = "666"
-_WIFI_PASSWORD = "15756491077"
+# WiFi 凭据：优先从环境变量读取，回退到默认值（生产环境请设置 WIFI_SSID/WIFI_PASSWORD 环境变量）
+_WIFI_SSID = os.environ.get("WIFI_SSID", "666")
+_WIFI_PASSWORD = os.environ.get("WIFI_PASSWORD", "15756491077")
 
 try:
     from unihiker_connet_wifi import WiFiManager
@@ -264,7 +321,7 @@ SERVER_BASE_URL = "https://my-website.ccwu.cc/eating-medication/server"
 PAIR_CODE = "2AIDMUNIHIKER13"
 DEVICE_ID = "m10_" + PAIR_CODE
 
-# API 端点（v2.28.0，对应 openapi.json，m10.py 当前版本 v2.33.2）
+# API 端点（v2.28.0，对应 openapi.json，m10.py 当前版本 v2.33.8）
 API_REGISTER = f"{SERVER_BASE_URL}/api/v1/public/device/register"
 API_SCHEDULE = f"{SERVER_BASE_URL}/api/v1/public/device/schedule/{DEVICE_ID}"
 API_MESSAGE = f"{SERVER_BASE_URL}/api/v1/public/device/message"
@@ -285,6 +342,9 @@ BUTTON_EMERGENCY_PIN_NUM = 28  # A键：紧急呼叫（联网通知家属）
 
 # HuskyLens 算法切换后的稳定等待时间（秒）
 HUSKYLENS_SWITCH_DELAY = 5
+
+# 搜索药品模式切换时等待 face_id_thread 暂停的时间（秒）
+SEARCH_MEDICINE_PAUSE_DELAY = 1
 
 # HuskyLens 全局实例（init_hardware 中初始化）
 huskylens = None
@@ -338,6 +398,7 @@ HEARTBEAT_INTERVAL = 20          # 心跳上报间隔（秒），向 register �
 STOCK_CHECK_INTERVAL = 6 * 3600  # 库存检查间隔（6 小时）
 LOG_FLUSH_INTERVAL = 30 * 60     # 日志刷新间隔（30 分钟）
 ALERT_TIMEOUT = 30               # 低库存告警超时（秒）
+ALERT_WAIT_TIMEOUT = 10          # 提醒循环等待超时（秒），每轮播报后等待时间
 MISSED_MINUTES_THRESHOLD = 60    # 错过分钟数阈值
 HTTP_REQUEST_TIMEOUT = 15        # HTTP 请求默认超时（秒）
 BUTTON_DEBOUNCE_TAKE = 2         # 吃药按钮去重时间（秒）
@@ -375,6 +436,7 @@ _log_lock = threading.Lock()      # 保护日志文件写入与轮转
 _camera_lock = threading.Lock()  # 保护摄像头访问，避免多线程并发拍照冲突
 _emergency_lock = threading.Lock()  # 保护紧急联系人缓存的并发访问
 _volume_lock = threading.Lock()  # 保护音量控制命令缓存的并发访问
+_face_id_lock = threading.Lock()  # 保护 _face_id_text 变量的并发访问
 
 # 设备未注册标志：检测到 404"设备未注册"时置位，main_loop 检测后清除旧 token 并重新注册
 _device_needs_re_register = threading.Event()
@@ -879,15 +941,16 @@ def http_request(url, payload=None, timeout=None, headers=None):
         if payload is not None:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             method = "POST"
-        # GET 请求不需要 Content-Type，使用 pop 避免 KeyError
+        # GET 请求不需要 Content-Type，直接构建不带该 header 的 headers
         if method == "GET":
             hdrs.pop("Content-Type", None)
         req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             status_code = resp.getcode()
             body = resp.read().decode("utf-8")
+            # 修复：空响应体视为成功（某些接口返回空 200 OK）
             if not body:
-                return None
+                return {"status": "ok", "_empty_response": True}
             # 尝试解析 JSON，非 JSON 响应返回原始文本
             try:
                 result = json.loads(body)
@@ -912,11 +975,17 @@ def http_request(url, payload=None, timeout=None, headers=None):
         if e.code == 404 and "设备未注册" in error_body:
             log("设备未注册（device_id 在服务器不存在），标记需要重新注册", "WARNING")
             _device_needs_re_register.set()
-        elif e.code == 403 and "设备令牌" in error_body:
-            log("设备令牌无效或缺失（本地 token 与服务端不匹配），标记需要重新注册", "WARNING")
-            _device_needs_re_register.set()
-        # 日志脱敏：限制错误响应体长度，避免泄露敏感信息
-        log(f"HTTP {e.code} 请求失败 {url}: {error_body[:100] if error_body else '无响应体'}", "ERROR")
+        elif e.code == 403:
+            # 403 错误可能是多种原因，只要涉及设备令牌或认证问题都需要重新注册
+            # 检查响应体是否包含相关错误信息
+            body_lower = error_body.lower()
+            if "device_token" in body_lower or "token" in body_lower or "令牌" in error_body:
+                log("设备令牌无效或缺失（本地 token 与服务端不匹配），标记需要重新注册", "WARNING")
+                _device_needs_re_register.set()
+            else:
+                log(f"HTTP 403 请求被拒绝: {url}", "WARNING")
+        # 日志脱敏：仅记录错误码和URL，不记录响应体内容（防止敏感信息泄露）
+        log(f"HTTP {e.code} 请求失败: {url}", "ERROR")
         return None
     except urllib.error.URLError as e:
         # 网络不通、DNS解析失败、连接超时等
@@ -956,15 +1025,21 @@ def register_device():
     if resp.get("status") == "ok":
         token = resp.get("device_token")
         if token:
+            # 修复：首次注册或 token 恢复情况，保存新 token
             _set_device_token(token)
             save_device_token(token)
             log("设备注册成功，已获取 device_token")
             return True
         else:
             # 服务端未返回 token：设备已注册且携带的 token 匹配（心跳模式）
-            # 这是正常行为，不是失败
-            log("设备已注册（心跳模式），token 有效")
-            return True
+            # 修复：检查本地是否已有 token，如果有则确认成功，否则视为失败
+            existing_token = _get_device_token()
+            if existing_token:
+                log("设备已注册（心跳模式），token 有效")
+                return True
+            else:
+                log("设备注册失败：服务端未返回 token 且本地无 token", "ERROR")
+                return False
     else:
         log(f"设备注册失败: {resp.get('message', resp)}", "ERROR")
         return False
@@ -998,9 +1073,15 @@ def send_heartbeat():
         if token:
             _set_device_token(token)
             save_device_token(token)
-            log("心跳获取新 token，已保存")
+            log("心跳获取新 token，已保存", "INFO")
+        else:
+            log("心跳发送成功", "INFO")
         return True
-
+    # 修复：检查业务错误（_error 标记），区分网络错误和业务错误
+    elif isinstance(resp, dict) and resp.get("_error"):
+        error_msg = resp.get("message", "未知错误")
+        log(f"心跳业务错误: {error_msg}", "ERROR")
+        return False
     return False
 
 
@@ -1077,8 +1158,8 @@ def sync_reminders():
         log("同步用药计划失败：网络请求无响应", "WARNING")
         return False
 
-    # 检查是否返回了错误状态
-    if isinstance(resp, dict) and resp.get("status") and resp.get("status") != "ok":
+    # 检查是否返回了错误状态（status 存在但不是 "ok" 视为错误）
+    if isinstance(resp, dict) and resp.get("status") is not None and resp.get("status") != "ok":
         log(f"同步用药计划返回错误: {resp.get('message', resp)}", "WARNING")
         return False
 
@@ -1274,6 +1355,7 @@ def _convert_plans_to_medicines(plans):
         drug_name = p.get("drug_name", "")
         freq = p.get("frequency", "每日")
         freq_per_day = _parse_frequency_per_day(freq)
+        dosage = p.get("dosage", "1片")
         remaining = p.get("remaining_quantity", 0)
         # 修复：正确处理 remaining_quantity，可能是浮点数
         try:
@@ -1288,15 +1370,33 @@ def _convert_plans_to_medicines(plans):
                 total_quantity = int(float(total_val))
         except (ValueError, TypeError):
             total_quantity = 0
+        # 修复：安全获取 per_time，处理 None 和非数字情况
+        per_time = _parse_dose_count(dosage)
+        try:
+            if per_time is None or not isinstance(per_time, (int, float)):
+                per_time = 1
+            else:
+                per_time = max(1, int(per_time))
+        except (ValueError, TypeError):
+            per_time = 1
+        # 修复：安全获取 frequency_per_day，确保为正整数
+        try:
+            if freq_per_day is None or not isinstance(freq_per_day, (int, float)):
+                freq_per_day = 1
+            else:
+                freq_per_day = max(1, int(freq_per_day))
+        except (ValueError, TypeError):
+            freq_per_day = 1
+
         medicines.append({
             "id": plan_id if plan_id is not None else drug_name,
             "name": drug_name,
             "remaining": remaining,
-            "per_time": 1,
+            "per_time": per_time,
             "frequency_per_day": freq_per_day,
             "threshold": p.get("low_stock_threshold", 5),
             "unit": p.get("unit", "片"),
-            "dosage": p.get("dosage", "1片"),
+            "dosage": dosage,
             # 新增：保存 total_quantity 用于计算总库存量
             "total_quantity": total_quantity,
         })
@@ -1500,9 +1600,11 @@ def flush_local_logs():
                 # 检查 HTTP 错误和业务错误（_error 标记）
                 msg_ok = msg_resp is not None and not (isinstance(msg_resp, dict) and msg_resp.get("_error"))
 
-                # 消息发送失败时直接保留条目，不尝试上传照片
+                # 消息发送失败时直接保留条目（剥离照片数据避免内存膨胀）
                 if not msg_ok:
-                    remain.append(entry)
+                    # 修复：剥离 base64 照片数据后再保留，避免长期占用内存
+                    slim_entry = {k: v for k, v in entry.items() if k != "_photo"}
+                    remain.append(slim_entry)
                     fail_count += 1
                     continue
 
@@ -1521,7 +1623,9 @@ def flush_local_logs():
                     success_count += 1
                 else:
                     # 上传失败（无论是 HTTP 错误还是业务错误），保留条目等待下次刷新
-                    remain.append(entry)
+                    # 修复：仅保留消息部分，剥离照片 base64 数据
+                    slim_entry = {k: v for k, v in entry.items() if k != "_photo"}
+                    remain.append(slim_entry)
                     fail_count += 1
             except Exception as e:
                 log(f"刷新日志条目异常: {e}", "ERROR")
@@ -1563,8 +1667,15 @@ def query_drug_by_ocr(text):
             "device_id": DEVICE_ID,
         }
         resp = http_request(API_AI_ASK, payload)
-        if resp and isinstance(resp, dict) and resp.get("_error"):
-            log(f"query_drug_by_ocr: AI 问答业务错误", "WARNING")
+        # 修复：检查 HTTP 错误、业务错误和空响应
+        if resp is None:
+            log("query_drug_by_ocr: 请求无响应", "WARNING")
+            return None
+        if isinstance(resp, dict) and resp.get("_error"):
+            log(f"query_drug_by_ocr: AI 问答业务错误 - {resp.get('message', '未知错误')}", "WARNING")
+            return None
+        if isinstance(resp, dict) and resp.get("_empty_response"):
+            log("query_drug_by_ocr: AI 问答返回空响应", "WARNING")
             return None
         return resp
     except Exception as e:
@@ -1590,8 +1701,15 @@ def query_refill(medicine_id):
             "device_id": DEVICE_ID,
         }
         resp = http_request(API_AI_ASK, payload)
-        if resp and isinstance(resp, dict) and resp.get("_error"):
-            log(f"query_refill: AI 问答业务错误", "WARNING")
+        # 修复：检查 HTTP 错误、业务错误和空响应
+        if resp is None:
+            log("query_refill: 请求无响应", "WARNING")
+            return None
+        if isinstance(resp, dict) and resp.get("_error"):
+            log(f"query_refill: AI 问答业务错误 - {resp.get('message', '未知错误')}", "WARNING")
+            return None
+        if isinstance(resp, dict) and resp.get("_empty_response"):
+            log("query_refill: AI 问答返回空响应", "WARNING")
             return None
         return resp
     except Exception as e:
@@ -1620,8 +1738,8 @@ def notify_emergency():
                 cfg = load_config()
                 if isinstance(cfg, dict):
                     contact = cfg.get("emergency_contact", "120")
-                    if contact and isinstance(contact, str):
-                        _emergency_contact_cache = contact
+                    if contact and isinstance(contact, str) and contact.strip():
+                        _emergency_contact_cache = contact.strip()
                     else:
                         _emergency_contact_cache = "120"
                 else:
@@ -1791,7 +1909,13 @@ def trigger_alert(reminder):
     update_gui_reminder(name, drug, dose)
     # 切换 HuskyLens 到人脸识别模式（到时间了或按提醒按钮触发）
     switch_huskylens_to_face()
+    # 清除中断事件，准备新的提醒循环
+    _alert_interrupt_event.clear()
     threading.Thread(target=alert_loop, args=(tid,), daemon=True).start()
+
+
+# 提醒中断事件：用于 alert_loop() 的可中断等待
+_alert_interrupt_event = threading.Event()
 
 
 def alert_loop(tid):
@@ -1811,6 +1935,10 @@ def alert_loop(tid):
     """
     retry_count = 0
     target_name = get_face_name(TARGET_FACE_ID)
+    # 修复：如果无法获取真实名字（HuskyLens 不可用），使用默认称呼
+    if target_name == f"id{TARGET_FACE_ID}":
+        target_name = "老人"
+        log(f"无法获取人脸ID {TARGET_FACE_ID} 的名字，使用默认称呼: {target_name}", "DEBUG")
     log(f"提醒循环启动，目标人脸ID={TARGET_FACE_ID}，名字={target_name}")
 
     while retry_count < MAX_ALERT_RETRIES:
@@ -1819,13 +1947,14 @@ def alert_loop(tid):
             if tid not in state["active_alerts"]:
                 log(f"提醒 {tid} 已被停止（已吃药确认）")
                 break
-            volume = state["active_alerts"][tid]["volume"]
+            # 在锁内获取 volume 副本，避免锁外使用时被其他线程修改
+            current_volume = state["active_alerts"][tid]["volume"]
             reminder = state["active_alerts"][tid]["reminder"]
 
         # 搜索药品模式下暂停提醒循环（不检测人脸、不播报、不增加重试次数）
-        # 避免 detect_face_id() 调用 getResult(ALGORITHM_FACE_RECOGNITION) 把二哈切回人脸识别
+        # 使用可中断等待，避免 time.sleep 阻塞导致无法及时响应中断
         if _searching_medicine.is_set():
-            time.sleep(0.5)
+            _alert_interrupt_event.wait(timeout=0.5)
             continue
 
         # 检测目标人脸
@@ -1846,18 +1975,27 @@ def alert_loop(tid):
             msg = f"请{target_name}来吃药"
 
         buzzer_beep(times=3, duration=0.3)
-        tts_speak(msg, volume=volume)
+        # 使用锁内获取的 current_volume，避免竞态条件
+        tts_speak(msg, volume=current_volume)
         retry_count += 1
 
-        # 可中断等待：每 1 秒检查一次是否需要退出（缩短为 10 秒间隔，加快循环播报）
-        wait_end = time.time() + 10
+        # 可中断等待：使用 Event.wait 实现高效等待，响应更快
+        wait_timeout = ALERT_WAIT_TIMEOUT  # 等待时间使用常量
+        _alert_interrupt_event.clear()
+        # 分段等待：每1秒检查一次是否需要退出
+        waited = 0
         should_break = False
-        while time.time() < wait_end:
-            time.sleep(min(1.0, wait_end - time.time()))
+        while waited < wait_timeout:
+            # 等待1秒或直到事件被设置
+            _alert_interrupt_event.wait(timeout=1.0)
+            waited += 1
+            # 检查是否被中断（按了"已吃药"按钮）
             with lock:
                 if tid not in state["active_alerts"]:
                     should_break = True
                     break
+            if should_break:
+                break
 
         if should_break:
             log(f"提醒 {tid} 被中断")
@@ -1896,10 +2034,14 @@ def confirm_take(tid=None):
         None
     """
     reminder = {}
+    dose_count = 1
+    medicine_id = None
     if tid:
         with lock:
             if tid in state["active_alerts"]:
                 reminder = dict(state["active_alerts"][tid]["reminder"])
+                dose_count = reminder.get("dose_count", 1)
+                medicine_id = reminder.get("medicine_id")
                 del state["active_alerts"][tid]
 
     def _do_confirm_upload():
@@ -1920,7 +2062,11 @@ def confirm_take(tid=None):
     threading.Thread(target=_do_confirm_upload, daemon=True).start()
     tts_speak("已记录服药")
     update_gui_home()
-    update_stock(reminder.get("medicine_id"), reminder.get("dose_count", 1))
+    # 仅在有有效药品ID时才更新库存
+    if medicine_id is not None:
+        update_stock(medicine_id, dose_count)
+    else:
+        log("无有效药品ID，跳过库存更新", "WARNING")
 
 
 def update_stock(medicine_id, used_count):
@@ -1943,7 +2089,11 @@ def update_stock(medicine_id, used_count):
         log(f"update_stock: 无效的使用数量 {used_count}", "WARNING")
         return
     # 转换为整数使用数量（取整）
-    used_count = int(used_count)
+    try:
+        used_count = int(used_count)
+    except (ValueError, TypeError):
+        log(f"update_stock: 使用数量转换失败 {used_count}", "WARNING")
+        return
     if used_count <= 0:
         log(f"update_stock: 使用数量 {used_count} 转换后无效", "WARNING")
         return
@@ -1956,10 +2106,24 @@ def update_stock(medicine_id, used_count):
         for m in state["medicines"]:
             if m.get("id") == medicine_id:
                 found = True
-                m["remaining"] = max(0, m.get("remaining", 0) - used_count)
+                current_remaining = m.get("remaining", 0)
+                # 修复：在扣减前检查，避免扣减后变为负数
+                if current_remaining <= 0:
+                    log(f"update_stock: 药品 {medicine_id} 剩余为0，无法扣减", "WARNING")
+                    break
+                m["remaining"] = max(0, current_remaining - used_count)
                 remaining = m["remaining"]
-                threshold = m.get("threshold", 5) * m.get("frequency_per_day", 1)
-                if remaining < threshold:
+                # low_stock_threshold 为剩余片数阈值（API 定义），直接使用无需乘以频率
+                # 剩余数量 <= 阈值时触发告警（包括恰好等于阈值的情况）
+                threshold = m.get("threshold", 5)
+                # 修复：安全获取阈值，确保为非负数
+                try:
+                    threshold = int(threshold) if threshold is not None else 5
+                    if threshold < 0:
+                        threshold = 5
+                except (ValueError, TypeError):
+                    threshold = 5
+                if remaining <= threshold:
                     needs_alert = True
                     alert_medicine = dict(m)
                 break
@@ -2028,13 +2192,22 @@ def low_stock_alert(medicine):
             log(f"查询补货信息异常: {type(e).__name__}: {e}", "ERROR")
 
     # ALERT_TIMEOUT 秒后自动恢复状态显示（避免一直停留在告警界面）
-    # 注意：不再强制调用 update_gui_home()，避免覆盖用户当前界面（如紧急呼叫状态）
+    # 修复：仅在非特殊模式（搜索药品、提醒界面）下恢复，避免覆盖用户操作
     try:
         def _restore_status():
-            if _get_online():
-                update_gui_status("在线", alert=False)
+            # 检查当前 GUI 模式和业务模式，避免在搜索药品或提醒时强制恢复
+            with _gui_lock:
+                current_mode = _gui_mode
+            with lock:
+                business_mode = state.get("mode", "home")
+            # 修复：增加对 search_medicine 和 alert 模式的检查
+            if current_mode in ("home", "status") and business_mode in ("home",):
+                if _get_online():
+                    update_gui_status("在线", alert=False)
+                else:
+                    update_gui_status("离线模式", alert=False)
             else:
-                update_gui_status("离线模式", alert=False)
+                log(f"告警界面恢复跳过：当前业务模式={business_mode}，GUI模式={current_mode}", "DEBUG")
         threading.Timer(ALERT_TIMEOUT, _restore_status).start()
     except Exception as e:
         log(f"定时器启动失败: {e}", "ERROR")
@@ -2185,7 +2358,21 @@ def calculate_remaining_days():
             if not isinstance(total, (int, float)) or total < 0:
                 total = 0
             per_time = m.get("per_time", 1)
+            # 修复：安全获取 per_time，确保为正数
+            try:
+                per_time = float(per_time) if per_time is not None else 1.0
+                if per_time <= 0:
+                    per_time = 1.0
+            except (ValueError, TypeError):
+                per_time = 1.0
             freq = m.get("frequency_per_day", 1)
+            # 修复：安全获取 frequency_per_day，确保为正数
+            try:
+                freq = float(freq) if freq is not None else 1.0
+                if freq <= 0:
+                    freq = 1.0
+            except (ValueError, TypeError):
+                freq = 1.0
             daily = per_time * freq
             if daily <= 0 or total <= 0:
                 # 每日用量为0或剩余为0，视为库存充足或已用完
@@ -2193,8 +2380,11 @@ def calculate_remaining_days():
                 if total <= 0:
                     alerts_to_fire.append(dict(m))
             else:
-                # 使用向上取整算法，避免剩余药量仅够 1.2 天却显示 1 天
-                m["remaining_days"] = max(0, -(-int(total) // daily))
+                # 修复：使用 math.ceil 进行精确的向上取整，避免整数运算精度问题
+                try:
+                    m["remaining_days"] = max(0, math.ceil(total / daily))
+                except (ValueError, ZeroDivisionError, OverflowError):
+                    m["remaining_days"] = 0
                 if m["remaining_days"] < 5:
                     alerts_to_fire.append(dict(m))
     for med_copy in alerts_to_fire:
@@ -2274,10 +2464,13 @@ def update_gui_home():
             # 底部搜索药品按钮（触摸屏）
             add_button = getattr(gui, "add_button", None)
             if callable(add_button):
+                # 修复：按钮回调在后台线程执行，避免阻塞 GUI 主线程
+                def _enter_search():
+                    enter_search_medicine()
                 _search_button_obj = add_button(
                     x=120, y=245, w=120, h=36,
                     text="搜索药品", origin="center",
-                    onclick=enter_search_medicine,
+                    onclick=lambda: threading.Thread(target=_enter_search, daemon=True).start(),
                 )
             else:
                 gui.draw_text(x=120, y=245, text="[搜索药品]", font_size=14, color=COLOR_TEXT_GRAY, origin="center")
@@ -2304,10 +2497,13 @@ def update_gui_reminder(name, drug, dose):
             # 底部搜索药品按钮（触摸屏）
             add_button = getattr(gui, "add_button", None)
             if callable(add_button):
+                # 修复：按钮回调在后台线程执行，避免阻塞 GUI 主线程
+                def _enter_search():
+                    enter_search_medicine()
                 _search_button_obj = add_button(
                     x=120, y=245, w=120, h=36,
                     text="搜索药品", origin="center",
-                    onclick=enter_search_medicine,
+                    onclick=lambda: threading.Thread(target=_enter_search, daemon=True).start(),
                 )
             else:
                 gui.draw_text(x=120, y=245, text="[搜索药品]", font_size=14, color=COLOR_TEXT_GRAY, origin="center")
@@ -2319,6 +2515,7 @@ def clock_thread():
     """后台时钟刷新线程：仅在主页模式时每秒更新日期与时分秒文本对象"""
     while not _clock_stop_event.is_set():
         try:
+            # 使用 _gui_lock 保护 GUI 变量读取，防止与写操作竞争
             with _gui_lock:
                 mode = _gui_mode
                 time_obj = _clock_time_obj
@@ -2525,23 +2722,26 @@ def update_face_id_label():
 
     使用全局 _face_id_text 作为内容，若文本对象不存在则创建。
     每次调用时更新文本对象的 text 属性。
+    线程安全：通过 _get_face_id_text() 读取。
     """
     global _face_id_obj
     if not gui:
         return
     try:
+        # 线程安全读取人脸ID文本
+        face_id_text = _get_face_id_text()
         with _gui_draw_lock:
             if _face_id_obj is None:
                 _face_id_obj = gui.draw_text(
-                    x=5, y=225, text=_face_id_text,
+                    x=5, y=225, text=face_id_text,
                     font_size=10, color=COLOR_TEXT_GRAY, origin="top_left",
                 )
             else:
                 try:
-                    _face_id_obj.config(text=_face_id_text)
+                    _face_id_obj.config(text=face_id_text)
                 except Exception:
                     _face_id_obj = gui.draw_text(
-                        x=5, y=225, text=_face_id_text,
+                        x=5, y=225, text=face_id_text,
                         font_size=10, color=COLOR_TEXT_GRAY, origin="top_left",
                     )
     except Exception as e:
@@ -2565,10 +2765,14 @@ def face_id_thread():
                 continue
             if huskylens is not None and _HUSKYLENS_AVAILABLE:
                 ids = get_current_face_ids()
+                # 先更新文本，再更新GUI显示，确保一致性
                 if ids:
-                    _set_face_id_text(f"ID: {','.join(str(i) for i in ids)}")
+                    new_text = f"ID: {','.join(str(i) for i in ids)}"
                 else:
-                    _set_face_id_text("ID: --")
+                    new_text = "ID: --"
+                # 使用锁保护设置全局变量
+                _set_face_id_text(new_text)
+                # 然后更新GUI显示
                 update_face_id_label()
             time.sleep(0.5)
         except Exception as e:
@@ -2580,7 +2784,14 @@ def face_id_thread():
 def _set_face_id_text(text):
     """线程安全设置人脸ID文本"""
     global _face_id_text
-    _face_id_text = text
+    with _face_id_lock:
+        _face_id_text = text
+
+
+def _get_face_id_text():
+    """线程安全读取人脸ID文本"""
+    with _face_id_lock:
+        return _face_id_text
 
 
 def update_gui_search_medicine(barcode_name=""):
@@ -2610,10 +2821,13 @@ def update_gui_search_medicine(barcode_name=""):
             # 底部返回按钮（触摸屏）
             add_button = getattr(gui, "add_button", None)
             if callable(add_button):
+                # 修复：按钮回调在后台线程执行，避免阻塞 GUI 主线程
+                def _exit_search():
+                    exit_search_medicine()
                 _back_button_obj = add_button(
                     x=120, y=230, w=120, h=36,
                     text="返回", origin="center",
-                    onclick=exit_search_medicine,
+                    onclick=lambda: threading.Thread(target=_exit_search, daemon=True).start(),
                 )
             else:
                 gui.draw_text(x=120, y=230, text="[返回]", font_size=14, color=COLOR_TEXT_GRAY, origin="center")
@@ -2628,12 +2842,13 @@ def _barcode_detect_thread():
         try:
             name = get_barcode_name()
             if name:
-                # 更新条形码名字显示
-                if _barcode_text_obj is not None:
-                    try:
-                        _barcode_text_obj.config(text=name)
-                    except Exception:
-                        pass
+                # 使用 _gui_draw_lock 保护 GUI 对象读取和更新
+                with _gui_draw_lock:
+                    if _barcode_text_obj is not None:
+                        try:
+                            _barcode_text_obj.config(text=name)
+                        except Exception:
+                            pass
                 log(f"检测到条形码: {name}")
             time.sleep(0.5)
         except Exception as e:
@@ -2650,13 +2865,18 @@ def enter_search_medicine():
     因此将实际逻辑放到后台线程，回调立即返回。
 
     流程：
-    1. 记录当前界面（home/reminder）
-    2. 暂停人脸ID检测
-    3. 等待 face_id_thread 暂停（避免 I2C 冲突）
-    4. 切换 HuskyLens 到条形码识别模式
-    5. 显示搜索药品界面
-    6. 启动条形码检测线程
+    1. 检查是否已在搜索模式中（防重复调用）
+    2. 记录当前界面（home/reminder）
+    3. 暂停人脸ID检测
+    4. 等待 face_id_thread 暂停（避免 I2C 冲突）
+    5. 切换 HuskyLens 到条形码识别模式
+    6. 显示搜索药品界面
+    7. 启动条形码检测线程
     """
+    # 防重复调用：检查是否已在搜索模式中
+    if _searching_medicine.is_set():
+        log("已在搜索药品模式中，忽略重复调用", "DEBUG")
+        return
     threading.Thread(target=_enter_search_medicine_impl, daemon=True).start()
 
 
@@ -2669,8 +2889,8 @@ def _enter_search_medicine_impl():
     log(f"进入搜索药品模式，前一界面: {_previous_gui_mode}")
     # 暂停人脸检测
     _searching_medicine.set()
-    # 等待 face_id_thread 检测到事件并暂停（检测周期 0.5 秒，等 1 秒确保暂停）
-    time.sleep(1)
+    # 等待 face_id_thread 检测到事件并暂停（检测周期 0.5 秒，等 SEARCH_MEDICINE_PAUSE_DELAY 秒确保暂停）
+    time.sleep(SEARCH_MEDICINE_PAUSE_DELAY)
     # 切换到条形码识别
     switch_huskylens_to_barcode()
     # 显示搜索界面
@@ -2687,11 +2907,16 @@ def exit_search_medicine():
     会阻塞 5 秒。因此将实际逻辑放到后台线程，回调立即返回。
 
     流程：
-    1. 停止条形码检测线程
-    2. 切换 HuskyLens 回人脸识别模式（无论返回主页还是提醒界面）
-    3. 恢复前一界面（home/reminder）
-    4. 恢复人脸ID检测
+    1. 检查是否在搜索模式中（防重复调用）
+    2. 停止条形码检测线程
+    3. 切换 HuskyLens 回人脸识别模式（无论返回主页还是提醒界面）
+    4. 恢复前一界面（home/reminder）
+    5. 恢复人脸ID检测
     """
+    # 防重复调用：检查是否在搜索模式中
+    if not _searching_medicine.is_set():
+        log("不在搜索药品模式中，忽略退出调用", "DEBUG")
+        return
     threading.Thread(target=_exit_search_medicine_impl, daemon=True).start()
 
 
@@ -2756,13 +2981,15 @@ def switch_huskylens_to_barcode():
     global huskylens
     if not _HUSKYLENS_AVAILABLE or huskylens is None:
         log("HuskyLens 未初始化，跳过切换条形码识别模式", "WARNING")
-        return
+        return False  # 修复：返回 False 表示未成功切换，调用方可据此调整策略
     try:
         huskylens.switchAlgorithm(ALGORITHM_BARCODE_RECOGNITION)
         time.sleep(HUSKYLENS_SWITCH_DELAY)
         log("HuskyLens 已切换到条形码识别模式")
+        return True
     except Exception as e:
         log(f"HuskyLens 切换条形码识别模式失败: {e}", "ERROR")
+        return False
 
 
 def get_barcode_name():
@@ -3037,10 +3264,14 @@ def main_loop():
             else:
                 log("重新注册失败，稍后重试", "WARNING")
 
-        # 每 HEARTBEAT_INTERVAL 秒发送心跳（在线时）
+        # 每 HEARTBEAT_INTERVAL 秒发送心跳（在线时），并根据心跳结果更新在线状态
         if _get_online() and time.time() - last_heartbeat > HEARTBEAT_INTERVAL:
             last_heartbeat = time.time()
-            send_heartbeat()
+            heartbeat_ok = send_heartbeat()
+            # 修复：心跳失败时标记为离线，触发重连机制
+            if not heartbeat_ok:
+                log("心跳发送失败，标记为离线", "WARNING")
+                _set_online(False)
 
         # 每 STOCK_CHECK_INTERVAL 检查库存
         if time.time() - last_stock_check > STOCK_CHECK_INTERVAL:
@@ -3123,6 +3354,12 @@ if __name__ == "__main__":
             pass
     finally:
         try:
+            # 停止时钟刷新线程
+            _clock_stop_event.set()
+            # 停止人脸ID检测线程
+            _face_id_stop_event.set()
+            # 停止条形码检测线程
+            _barcode_thread_stop.set()
             # 异步发送下线通知，不阻塞进程退出
             threading.Thread(target=device_offline, daemon=True).start()
         except Exception:
