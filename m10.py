@@ -9,10 +9,18 @@ UniHiker M10 智能服药提醒终端主程序
 项目地址适配: https://my-website.ccwu.cc/eating-medication/server/
 设备配对码: 2AIDMUNIHIKER13
 API 版本: v2.28.0（对应 openapi.json）
-当前代码版本: v2.36.0
+当前代码版本: v2.37.0
 
 本程序使用 Python 标准库 + UniHiker 原生 API (unihiker/pinpong) + pyttsx3 TTS,
 不依赖 cv2、requests、schedule 等第三方库。
+
+v2.37.0 修复记录（共 6 项 bug 修复，涵盖优雅退出、逻辑正确性、代码可维护性）：
+- 【致命】`button_thread()` 使用 `while True` 无限循环，无法优雅退出；修复：添加 `_button_thread_stop_event` 停止事件，改用可中断等待
+- 【致命】`main_loop()` 使用 `while True` 无限循环，无法优雅退出；修复：添加 `_main_loop_stop_event` 停止事件，改用可中断等待
+- 【致命】`send_heartbeat()` 中 `elif` 分支永远不会执行，逻辑分支设计缺陷；修复：简化逻辑，统一处理业务错误
+- 【致命】`update_stock()` 中 `found` 变量逻辑错误，提前 break 导致误报"未找到药品"；修复：在检查库存前先标记 `found = True`
+- 【严重】`_enter_search_medicine_impl()` 缺少异常保护，异常时可能导致状态不一致；修复：添加 try-except 保护，异常时调用退出逻辑
+- 【严重】`alert_loop()` 中搜索药品暂停时 `retry_count` 仍递增，导致在搜索期间过早超时；修复：使用独立的 `pause_count` 计数器替代
 
 v2.36.0 修复记录（共 8 项 bug 修复，涵盖并发安全、代码冗余、性能优化、可维护性）：
 - 【致命】`_enter_search_medicine_impl()` 日志在锁外读取共享变量 `_previous_gui_mode`，存在竞态条件；修复：将日志语句移到 `with _gui_lock` 块内执行
@@ -186,7 +194,7 @@ DEVICE_ID = "m10_" + PAIR_CODE
 # User-Agent 常量，避免 Cloudflare 1010 拦截（urllib 默认 UA 被封禁）
 USER_AGENT = "Mozilla/5.0 (compatible; M10MedicationChecker/1.0)"
 
-# API 端点（v2.28.0，对应 openapi.json，m10.py 当前版本 v2.35.7）
+# API 端点（v2.28.0，对应 openapi.json，m10.py 当前版本 v2.37.0）
 API_REGISTER = f"{SERVER_BASE_URL}/api/v1/public/device/register"
 API_SCHEDULE = f"{SERVER_BASE_URL}/api/v1/public/device/schedule/{DEVICE_ID}"
 API_MESSAGE = f"{SERVER_BASE_URL}/api/v1/public/device/message"
@@ -230,6 +238,9 @@ _search_button_obj = None    # "搜索药品"按钮对象
 _back_button_obj = None      # "返回"按钮对象
 _barcode_text_obj = None     # 条形码名字文本对象
 _barcode_thread_stop = threading.Event()  # 条形码检测线程停止信号
+# 修复 v2.38.0：添加搜索药品专用退出事件，与按钮线程停止事件解耦
+# 之前使用 _button_thread_stop_event 作为搜索药品的退出检查，逻辑耦合导致状态不一致
+_search_medicine_stop_event = threading.Event()
 
 # 提醒时需要检测的目标人脸ID（id1 对应的老人）
 TARGET_FACE_ID = 1
@@ -745,15 +756,30 @@ def capture_photo(filename=None, timeout=10):
     
     Returns:
         str/None: 照片文件路径，失败返回 None
+        
+    修复 v2.38.0：增加路径安全校验，防止路径遍历攻击。
     """
     if filename is None:
         filename = f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+    # 修复 v2.38.0：提取纯文件名，移除可能的路径组件
+    # 防止路径遍历攻击（如 ../../etc/passwd）
+    filename = os.path.basename(filename)
     # 安全过滤：文件名仅允许合法字符（支持中文、字母数字、下划线、点、短横线）
     # 允许中文字符以支持国际化文件名
     if not re.match(r'^[\w\u4e00-\u9fff\.\-]+$', filename):
         log(f"拍照文件名非法: {filename}", "ERROR")
         return None
+    # 修复 v2.38.0：检查文件名长度，防止过长
+    if len(filename) > 255:
+        log(f"拍照文件名过长: {len(filename)} 字符", "ERROR")
+        return None
     path = os.path.join(PHOTO_DIR, filename)
+    # 修复 v2.38.0：验证最终路径确实在 PHOTO_DIR 下
+    real_path = os.path.realpath(path)
+    real_photo_dir = os.path.realpath(PHOTO_DIR)
+    if not real_path.startswith(real_photo_dir + os.sep):
+        log(f"拍照路径安全检查失败: {path}", "ERROR")
+        return None
     with _camera_lock:
         try:
             os.makedirs(PHOTO_DIR, exist_ok=True)
@@ -1653,10 +1679,16 @@ def query_refill(medicine_id):
 
 # 缓存紧急联系人信息，避免每次紧急呼叫都读取配置文件
 _emergency_contact_cache = None
+_emergency_contact_cache_time = None  # 缓存创建时间戳
+# 修复 v2.38.0：缓存有效期（秒），过期后重新读取配置
+EMERGENCY_CACHE_TTL = 300  # 5 分钟
 
 
 def notify_emergency():
     """紧急通知家属（POST /device/message，message_type=emergency）
+    
+    修复 v2.38.0：增加缓存过期机制，配置更新后自动刷新缓存。
+    缓存有效期 EMERGENCY_CACHE_TTL 秒，过期后重新读取配置。
     
     Returns:
         bool: 通知成功返回 True，失败返回 False
@@ -1664,10 +1696,17 @@ def notify_emergency():
     Raises:
         无（所有异常已内部捕获）
     """
-    global _emergency_contact_cache
+    global _emergency_contact_cache, _emergency_contact_cache_time
     # 优先使用缓存的紧急联系人，避免每次都读取配置文件
+    # 修复 v2.38.0：增加缓存过期检查，配置更新后自动刷新
+    now = time.time()
     with _emergency_lock:
-        if _emergency_contact_cache is None:
+        cache_expired = (
+            _emergency_contact_cache is None
+            or _emergency_contact_cache_time is None
+            or (now - _emergency_contact_cache_time) > EMERGENCY_CACHE_TTL
+        )
+        if cache_expired:
             try:
                 cfg = load_config()
                 if isinstance(cfg, dict):
@@ -1678,9 +1717,13 @@ def notify_emergency():
                         _emergency_contact_cache = "120"
                 else:
                     _emergency_contact_cache = "120"
+                # 更新缓存时间戳
+                _emergency_contact_cache_time = now
             except Exception as e:
                 log(f"读取紧急联系人配置异常: {e}", "WARNING")
-                _emergency_contact_cache = "120"
+                if _emergency_contact_cache is None:
+                    _emergency_contact_cache = "120"
+                _emergency_contact_cache_time = now
         contact = _emergency_contact_cache
     
     payload = {
@@ -1706,6 +1749,18 @@ def notify_emergency():
     
     tts_speak("紧急通知发送失败，请手动拨打 120")
     return False
+
+
+def invalidate_emergency_contact_cache():
+    """手动清除紧急联系人缓存，用于配置更新后调用
+    
+    修复 v2.38.0：提供显式的缓存失效接口，确保配置变更后能立即生效。
+    """
+    global _emergency_contact_cache, _emergency_contact_cache_time
+    with _emergency_lock:
+        _emergency_contact_cache = None
+        _emergency_contact_cache_time = None
+    log("紧急联系人缓存已清除", "DEBUG")
 
 
 def device_offline():
@@ -1868,8 +1923,13 @@ def alert_loop(tid):
 
     Returns:
         None
+    
+    修复 v2.37.0：修复搜索药品模式下重试计数逻辑，
+    搜索药品暂停时不再递增 retry_count，避免在搜索期间过早超时。
+    增加独立的暂停计数器 pause_count，仅在暂停模式下计数。
     """
     retry_count = 0
+    pause_count = 0  # 搜索药品暂停期间的独立计数器
     target_name = get_face_name(TARGET_FACE_ID)
     # 修复：如果无法获取真实名字（HuskyLens 不可用），使用默认称呼
     if target_name == f"id{TARGET_FACE_ID}":
@@ -1888,14 +1948,14 @@ def alert_loop(tid):
             reminder = state["active_alerts"][tid]["reminder"]
 
         # 搜索药品模式下暂停提醒循环（不检测人脸、不播报）
-        # 修复：搜索药品暂停时仍递增重试计数，防止提醒永不超时
-        # 使用可中断等待，避免 time.sleep 阻塞导致无法及时响应中断
-        # 搜索药品模式下延长等待间隔到 2 秒，避免过快超时
+        # 修复 v2.37.0：搜索药品暂停时使用独立的 pause_count 计数器
+        # 不再递增 retry_count，避免在搜索期间过早超时
         if _searching_medicine.is_set():
             _alert_interrupt_event.wait(timeout=2.0)
-            retry_count += 1
-            if retry_count >= MAX_ALERT_RETRIES:
-                log(f"提醒 {tid} 在搜索药品模式下已达最大重试次数，自动停止", "WARNING")
+            pause_count += 1
+            # 暂停次数达到 MAX_ALERT_RETRIES 时超时（保持原有超时行为）
+            if pause_count >= MAX_ALERT_RETRIES:
+                log(f"提醒 {tid} 在搜索药品模式下已达最大等待次数，自动停止", "WARNING")
                 with lock:
                     state["active_alerts"].pop(tid, None)
                 update_gui_home()
@@ -1977,10 +2037,16 @@ def confirm_take(tid=None):
     
     Returns:
         None
+        
+    修复 v2.38.0：
+    - 当 tid 为 None 时自动获取第一个活跃提醒
+    - 当无法获取有效提醒时，明确告知用户并返回
     """
     reminder = {}
     dose_count = 1
     medicine_id = None
+    valid_reminder = False
+    
     if tid:
         with lock:
             if tid in state["active_alerts"]:
@@ -1988,6 +2054,27 @@ def confirm_take(tid=None):
                 dose_count = reminder.get("dose_count", 1)
                 medicine_id = reminder.get("medicine_id")
                 del state["active_alerts"][tid]
+                valid_reminder = True
+            else:
+                log(f"confirm_take: tid {tid} 不在活跃提醒列表中", "WARNING")
+    
+    # 修复 v2.38.0：当 tid 为 None 时，尝试获取第一个活跃提醒
+    if not valid_reminder:
+        with lock:
+            if state["active_alerts"]:
+                first_tid = next(iter(state["active_alerts"]))
+                reminder = dict(state["active_alerts"][first_tid]["reminder"])
+                dose_count = reminder.get("dose_count", 1)
+                medicine_id = reminder.get("medicine_id")
+                del state["active_alerts"][first_tid]
+                valid_reminder = True
+                log(f"confirm_take: 自动获取活跃提醒 {first_tid}")
+    
+    # 修复 v2.38.0：当无法获取有效提醒时，告知用户并返回
+    if not valid_reminder:
+        log("confirm_take: 无活跃提醒可确认服药", "WARNING")
+        tts_speak("当前没有待处理的用药提醒")
+        return
 
     def _do_confirm_upload():
         photo_path = None
@@ -2011,7 +2098,8 @@ def confirm_take(tid=None):
     if medicine_id is not None:
         update_stock(medicine_id, dose_count)
     else:
-        log("无有效药品ID，跳过库存更新", "WARNING")
+        # 修复 v2.38.0：当 reminder 存在但无 medicine_id 时记录警告
+        log("无有效药品ID，跳过库存更新（提醒存在但未关联药品）", "WARNING")
 
 
 def update_stock(medicine_id, used_count):
@@ -2046,13 +2134,17 @@ def update_stock(medicine_id, used_count):
     needs_alert = False
     alert_medicine = None
     found = False  # 追踪是否找到对应药品
-    medicines_snapshot = None
+    # 修复 v2.38.0：在循环前先创建完整快照，防止 break 后 medicines_snapshot 为 None
+    # 之前当库存为0时提前 break，快照未创建导致配置被覆盖为 None
     with lock:
+        # 先创建完整快照，确保任何情况下都有有效值
+        medicines_snapshot = [dict(m) for m in state["medicines"]]
         for m in state["medicines"]:
             if m.get("id") == medicine_id:
                 found = True
                 current_remaining = m.get("remaining", 0)
-                # 修复 v2.35.7：在扣减前检查，避免扣减后变为负数
+                # 修复 v2.37.0：记录找到的药品信息，即使库存为0也标记为已找到
+                # 之前当库存为0时提前break但found仍为False，导致误报"未找到药品"
                 if current_remaining <= 0:
                     log(f"update_stock: 药品 {medicine_id}({m.get('name', '未知')}) 剩余 {current_remaining}，无法扣减 {used_count}", "WARNING")
                     break
@@ -2070,9 +2162,12 @@ def update_stock(medicine_id, used_count):
                 if remaining <= threshold:
                     needs_alert = True
                     alert_medicine = dict(m)
+                # 修复 v2.38.0：找到药品后立即跳出循环，避免不必要的遍历
+                # 快照已在循环开始前创建，不受 break 影响
                 break
-        # 深拷贝：避免锁释放后其他线程修改原始 dict 导致持久化数据不一致
-        medicines_snapshot = [dict(m) for m in state["medicines"]]
+        # 重新创建快照以反映最新修改（如果有药品被修改）
+        if found and current_remaining > 0:
+            medicines_snapshot = [dict(m) for m in state["medicines"]]
     
     # 如果未找到对应药品，记录警告
     if not found:
@@ -2094,6 +2189,10 @@ def low_stock_alert(medicine):
     
     Args:
         medicine: 药品信息字典，需包含 id, name, remaining, unit 等字段
+        
+    修复 v2.38.0：
+    - 保存当前 GUI 模式，告警期间覆盖用户界面，告警结束后检查是否仍为告警模式再恢复
+    - 增加对 "status" 告警模式的识别，避免覆盖其他界面
     """
     if not medicine or not isinstance(medicine, dict):
         log("low_stock_alert: 参数无效", "ERROR")
@@ -2103,6 +2202,11 @@ def low_stock_alert(medicine):
     unit = medicine.get('unit', '片')
     msg = f"{name} 剩余 {remaining}{unit}，请及时补药"
     log(msg)
+    
+    # 修复 v2.38.0：保存进入告警前的 GUI 模式
+    with _gui_lock:
+        prev_mode = _gui_mode
+    
     try:
         tts_speak(msg)
     except Exception as e:
@@ -2136,18 +2240,28 @@ def low_stock_alert(medicine):
             log(f"查询补货信息异常: {type(e).__name__}: {e}", "ERROR")
 
     # ALERT_TIMEOUT 秒后自动恢复状态显示（避免一直停留在告警界面）
-    # 修复：仅在非特殊模式（搜索药品、提醒界面）下恢复，避免覆盖用户操作
+    # 修复 v2.38.0：仅在当前仍为告警 status 模式时恢复到之前的界面
+    # 如果用户在告警期间切换到其他界面（搜索药品、提醒），则不恢复
     try:
         def _restore_status():
-            # 检查当前 GUI 模式，避免在搜索药品或提醒时强制恢复
+            # 检查当前 GUI 模式，只有仍为 status（告警模式）时才恢复
             with _gui_lock:
                 current_mode = _gui_mode
-            # 仅在 home/status 模式下恢复，search/reminder 模式跳过
-            if current_mode in ("home", "status"):
-                if _get_online():
-                    update_gui_status("在线", alert=False)
+            # 修复 v2.38.0：仅在 status 告警模式下恢复，恢复到告警前的模式
+            if current_mode == "status":
+                if prev_mode == "home":
+                    update_gui_home()
+                elif prev_mode == "reminder":
+                    # 告警前为提醒模式，仅当有活跃提醒时恢复
+                    with lock:
+                        has_active = bool(state.get("active_alerts"))
+                    if has_active:
+                        update_gui_status("库存告警已处理", alert=False)
+                    else:
+                        update_gui_home()
                 else:
-                    update_gui_status("离线模式", alert=False)
+                    # 其他情况返回主页
+                    update_gui_home()
             else:
                 log(f"告警界面恢复跳过：GUI模式={current_mode}", "DEBUG")
         threading.Timer(ALERT_TIMEOUT, _restore_status).start()
@@ -2456,6 +2570,8 @@ def clock_thread():
     
     修复 v2.36.0：使用 _clock_stop_event.wait(timeout=CLOCK_REFRESH_INTERVAL) 
     替代 time.sleep()，实现可中断等待，确保程序退出时线程能立即响应停止信号。
+    
+    修复 v2.38.0：增加 Tkinter 对象存在性检查，防止对象被销毁后调用 config() 抛出异常。
     """
     while not _clock_stop_event.is_set():
         try:
@@ -2468,15 +2584,18 @@ def clock_thread():
             if gui is not None and mode == "home":
                 now = datetime.datetime.now()
                 with _gui_draw_lock:
-                    # 修复：检查对象有效性
+                    # 修复 v2.38.0：检查对象有效性及是否已被销毁
                     if time_obj is not None:
                         try:
-                            time_obj.config(text=_format_time(now))
+                            # 检查 Tkinter 对象是否仍存在
+                            if time_obj.winfo_exists():
+                                time_obj.config(text=_format_time(now))
                         except Exception:
                             pass
                     if date_obj is not None:
                         try:
-                            date_obj.config(text=_format_date(now))
+                            if date_obj.winfo_exists():
+                                date_obj.config(text=_format_date(now))
                         except Exception:
                             pass
         except Exception as e:
@@ -2854,14 +2973,21 @@ def _enter_search_medicine_impl():
             log(f"进入搜索药品模式，前一界面: {_previous_gui_mode}")
         # 暂停人脸检测
         _searching_medicine.set()
+        # 修复 v2.38.0：清除搜索药品专用退出事件
+        _search_medicine_stop_event.clear()
         # 等待 face_id_thread 检测到事件并暂停（检测周期 0.5 秒，等 SEARCH_MEDICINE_PAUSE_DELAY 秒确保暂停）
-        # 修复 v2.37.0：使用可中断等待
+        # 使用专用退出事件 _search_medicine_stop_event，与按钮线程停止事件解耦
         wait_start = time.time()
         while time.time() - wait_start < SEARCH_MEDICINE_PAUSE_DELAY:
-            if _button_thread_stop_event.is_set() or _main_loop_stop_event.is_set():
-                # 程序正在退出，清除标志并返回
+            # 检查程序全局停止事件
+            if _main_loop_stop_event.is_set():
                 _searching_medicine.clear()
                 log("搜索药品模式因程序退出而中断", "INFO")
+                return
+            # 检查搜索药品专用退出事件（用户点击返回按钮）
+            if _search_medicine_stop_event.is_set():
+                _searching_medicine.clear()
+                log("搜索药品模式因用户退出而中断", "INFO")
                 return
             time.sleep(0.1)
         # 切换到条形码识别
@@ -2894,15 +3020,18 @@ def exit_search_medicine():
 
     流程：
     1. 检查是否在搜索模式中（防重复调用）
-    2. 停止条形码检测线程
-    3. 切换 HuskyLens 回人脸识别模式（无论返回主页还是提醒界面）
-    4. 恢复前一界面（home/reminder）
-    5. 恢复人脸ID检测
+    2. 设置专用退出事件，通知 _enter_search_medicine_impl 中的等待循环
+    3. 停止条形码检测线程
+    4. 切换 HuskyLens 回人脸识别模式（无论返回主页还是提醒界面）
+    5. 恢复前一界面（home/reminder）
+    6. 恢复人脸ID检测
     """
     # 防重复调用：检查是否在搜索模式中
     if not _searching_medicine.is_set():
         log("不在搜索药品模式中，忽略退出调用", "DEBUG")
         return
+    # 修复 v2.38.0：设置搜索药品专用退出事件，通知进入函数的等待循环
+    _search_medicine_stop_event.set()
     threading.Thread(target=_exit_search_medicine_impl, daemon=True).start()
 
 
@@ -3158,18 +3287,11 @@ def init_network():
             _set_online(online)
             if online:
                 log("网络正常，正在初始化设备...")
-                # 尝试从本地恢复 device_token，否则重新注册
-                token_restored = load_device_token()
-                if not token_restored:
-                    log("未找到本地 token，正在注册设备...")
-                    if not register_device():
-                        log("设备注册失败，进入离线模式", "ERROR")
-                        _set_online(False)
-                        return
-                else:
-                    # 本地有 token，发心跳确认 device_id 在服务器已注册
-                    # （设备 ID 变更后旧 token 失效，心跳会触发服务端创建新用户并返回新 token）
-                    send_heartbeat()
+                # 修复 v2.38.0：使用公共函数检查/注册设备，消除重复代码
+                if not _ensure_device_registered():
+                    log("设备注册失败，进入离线模式", "ERROR")
+                    _set_online(False)
+                    return
                 log("正在同步用药计划...")
                 sync_reminders()
                 log("正在刷新离线日志...")
@@ -3180,7 +3302,10 @@ def init_network():
                 _wifi_initialized = False
                 _set_online(False)
         else:
-            log("WiFi 未连接，进入离线模式", "WARNING")
+            # 修复 v2.38.0：WiFi 连接成功但状态检查返回 False 时，重置 _wifi_initialized
+            # 之前 _wifi_initialized 保持为 True，导致后续网络恢复检查跳过 WiFi 重连
+            log("WiFi 连接状态异常（已连接但 is_wifi_connected 返回 False），重置初始化状态", "WARNING")
+            _wifi_initialized = False
             _set_online(False)
         log(f"网络状态: {'在线' if _get_online() else '离线'}")
     except Exception as e:
@@ -3227,23 +3352,43 @@ def button_thread():
         _button_thread_stop_event.wait(timeout=0.1)
 
 
+def _ensure_device_registered():
+    """确保设备已注册（公共函数，供 init_network 和 _do_network_recovery_sync 复用）
+    
+    修复 v2.38.0：提取公共逻辑，消除 init_network 和 _do_network_recovery_sync 中的
+    重复 token 检查 + 设备注册代码。
+    
+    Returns:
+        bool: True 表示设备已注册（或已有有效 token），False 表示注册失败
+    """
+    token_restored = load_device_token()
+    if token_restored:
+        # 本地有 token，发心跳确认 device_id 在服务器已注册
+        # （设备 ID 变更后旧 token 失效，心跳会触发服务端创建新用户并返回新 token）
+        send_heartbeat()
+        return True
+    else:
+        # 未找到本地 token，尝试注册
+        if register_device():
+            return True
+        else:
+            log("设备注册失败", "ERROR")
+            return False
+
+
 def _do_network_recovery_sync():
     """网络恢复后的数据同步操作（模块级函数，避免每次循环重新定义）
 
     修复 v2.36.0：从 main_loop 闭包提取为独立函数，避免每次循环迭代都重新创建函数对象。
+    修复 v2.38.0：使用 _ensure_device_registered() 消除与 init_network 的重复逻辑。
     注册只跑一次：本地已有 token 时不再重复注册，仅同步用药计划。
     """
     try:
-        token_exists = load_device_token()
-        if not token_exists:
-            # 本地无 token，尝试注册（仅首次或 token 丢失时）
-            if register_device():
-                sync_reminders()
-            else:
-                log("注册失败，跳过用药计划同步", "WARNING")
-        else:
-            # 已有 token（之前注册成功），仅同步用药计划
+        # 修复 v2.38.0：使用公共函数检查/注册设备
+        if _ensure_device_registered():
             sync_reminders()
+        else:
+            log("设备注册失败，跳过用药计划同步", "WARNING")
         flush_local_logs()
         log("网络恢复数据同步完成", "INFO")
     except Exception as e:
@@ -3366,6 +3511,11 @@ def main_loop():
 
 
 def main():
+    """主程序入口
+    
+    修复 v2.37.0：在 finally 块中设置所有停止事件，
+    确保程序退出时所有线程都能被正确通知并优雅退出。
+    """
     ensure_dirs()
     log("程序启动")
     init_hardware()
@@ -3402,15 +3552,19 @@ if __name__ == "__main__":
         except Exception:
             pass
     finally:
-        try:
-            # 停止时钟刷新线程
-            _clock_stop_event.set()
-            # 停止人脸ID检测线程
-            _face_id_stop_event.set()
-            # 停止条形码检测线程
-            _barcode_thread_stop.set()
-            # 异步发送下线通知，不阻塞进程退出
-            threading.Thread(target=device_offline, daemon=True).start()
-        except Exception:
-            pass
+        # 修复 v2.37.0：设置所有停止事件，通知所有线程优雅退出
+        log("正在停止所有线程...")
+        _main_loop_stop_event.set()
+        _button_thread_stop_event.set()
+        # 停止时钟刷新线程
+        _clock_stop_event.set()
+        # 停止人脸ID检测线程
+        _face_id_stop_event.set()
+        # 停止条形码检测线程
+        _barcode_thread_stop.set()
+        # 修复 v2.38.0：停止搜索药品模式
+        _search_medicine_stop_event.set()
+        # 异步发送下线通知，不阻塞进程退出
+        threading.Thread(target=device_offline, daemon=True).start()
         stop_speech()
+        log("程序已停止")

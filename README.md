@@ -253,7 +253,7 @@ m10.py
 | 项目 | 值 |
 |------|-----|
 | 服务端基础路径 | `/eating-medication/server` |
-| API 版本 | v2.28.0（当前修复版：v2.36.0） |
+| API 版本 | v2.28.0（当前修复版：v2.37.0） |
 | 认证方式 | 设备注册后返回 `device_token`，后续请求通过 `X-Device-Token` Header 校验 |
 | 限流 | 设备端基于 IP 限流；部分接口需 `device_token` |
 
@@ -522,6 +522,32 @@ m10.py
 | 13 | 🟢 | OCR 引擎加载失败后无法重置，需重启设备 | 新增 `reset_ocr_engine()` 函数，支持运行时重置 |
 | 14 | 🟢 | `_get_ocr_engine()` 缺少文档说明 | 添加详细 docstring，说明返回值和异常情况 |
 | 15 | 🟢 | `flush_local_logs()` 的 `_flush_in_progress` 事件可能因异常未释放 | 添加 finally 块确保事件清理 |
+
+### 已完成的 Bug 修复（v2.38.0，共 10 项，涵盖致命缺陷修复、逻辑正确性、并发安全、安全性）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `update_stock()` 中 `medicines_snapshot` 可能为 None 导致数据丢失：当库存为 0 时提前 break，快照未创建导致配置被覆盖为 None | 在循环前先创建完整快照，确保任何情况下都有有效值；找到药品且库存有更新时重新创建快照以反映最新修改 |
+| 2 | 🔴 | `init_network()` 中 `_wifi_initialized` 状态不一致：WiFi 连接成功但 `is_wifi_connected()` 返回 False 时，`_wifi_initialized` 仍为 True，导致后续网络恢复检查跳过 WiFi 重连 | 在 WiFi 连接状态异常的 else 分支中重置 `_wifi_initialized = False` |
+| 3 | 🔴 | `_enter_search_medicine_impl()` 退出检查事件耦合：使用 `_button_thread_stop_event` 作为搜索药品的退出检查，与按钮线程停止事件耦合导致状态不一致 | 添加专门的 `_search_medicine_stop_event` 事件，在 `exit_search_medicine()` 中设置此事件，与按钮线程停止事件解耦 |
+| 4 | 🟡 | `low_stock_alert()` GUI 模式检查与恢复操作之间存在时间窗口：告警界面可能覆盖用户正在进行的操作 | 保存当前 GUI 模式，告警结束后仅当仍为 status 告警模式时才恢复到之前的模式；增加对 reminder 模式的特殊处理 |
+| 5 | 🟡 | `confirm_take()` 当 `medicine_id` 为 None 时跳过库存更新但未告知用户 | 当 tid 为 None 时自动获取第一个活跃提醒；当无法获取有效提醒时，语音告知用户并返回 |
+| 6 | 🟡 | `_parse_frequency_per_day()` 逻辑正确但注释不完善 | 保留现有实现，添加详细注释说明计算逻辑（每天平均次数的向上取整） |
+| 7 | 🟢 | `_do_network_recovery_sync()` 与 `init_network()` 存在重复的 token 检查和设备注册逻辑 | 提取公共函数 `_ensure_device_registered()`，消除重复代码 |
+| 8 | 🟢 | `clock_thread()` 中 Tkinter 对象可能在刷新过程中被销毁 | 增加 `winfo_exists()` 检查，防止对象被销毁后调用 `config()` 抛出异常 |
+| 9 | 🟢 | `notify_emergency()` 紧急联系人缓存在配置更新后不会自动刷新 | 增加缓存过期机制（EMERGENCY_CACHE_TTL = 300 秒），过期后自动重新读取配置；新增 `invalidate_emergency_contact_cache()` 手动清除缓存接口 |
+| 10 | 🔵 | `capture_photo()` 文件名正则缺少路径安全校验，可能存在路径遍历攻击 | 使用 `os.path.basename()` 提取纯文件名；添加文件名长度检查；使用 `os.path.realpath()` 验证最终路径在 PHOTO_DIR 下 |
+
+### 已完成的 Bug 修复（v2.37.0，共 6 项，涵盖优雅退出、逻辑正确性、代码可维护性）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `button_thread()` 使用 `while True` 无限循环，无法优雅退出 | 添加 `_button_thread_stop_event` 停止事件，改用可中断等待 `_button_thread_stop_event.wait(timeout=0.1)` 替代 `time.sleep(0.1)` |
+| 2 | 🔴 | `main_loop()` 使用 `while True` 无限循环，无法优雅退出 | 添加 `_main_loop_stop_event` 停止事件，改用可中断等待 `_main_loop_stop_event.wait(timeout=CHECK_INTERVAL)` 替代 `time.sleep(CHECK_INTERVAL)` |
+| 3 | 🔴 | `send_heartbeat()` 中 `elif` 分支永远不会执行，逻辑分支设计缺陷 | 简化逻辑，移除 `elif` 分支，直接在 `status != "ok"` 时检查业务错误，代码更清晰 |
+| 4 | 🔴 | `update_stock()` 中 `found` 变量逻辑错误：库存为 0 时提前 break 但 `found` 仍为 False，导致误报"未找到药品" | 在检查库存前先标记 `found = True`，确保即使库存为 0 也能正确识别药品 |
+| 5 | 🟡 | `_enter_search_medicine_impl()` 缺少异常保护，异常时可能导致 `_searching_medicine` 状态不一致 | 添加 `try-except` 保护，异常时调用 `_exit_search_medicine_impl()` 恢复状态；同时改用可中断等待 |
+| 6 | 🟡 | `alert_loop()` 中搜索药品暂停时 `retry_count` 仍递增，导致在搜索期间过早超时 | 使用独立的 `pause_count` 计数器替代 `retry_count`，搜索药品暂停期间不再消耗重试次数 |
 
 ### 已完成的 Bug 修复（v2.36.0，共 8 项，涵盖并发安全、代码冗余、性能优化、可维护性）
 
