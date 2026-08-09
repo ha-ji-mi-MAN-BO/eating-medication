@@ -5,10 +5,18 @@ UniHiker M10 智能服药提醒终端主程序
 项目地址适配: https://my-website.ccwu.cc/eating-medication/server/
 设备配对码: 2AIDMUNIHIKER13
 API 版本: v2.28.0（对应 openapi.json）
-当前代码版本: v2.30.0
+当前代码版本: v2.30.2
 
 本程序使用 Python 标准库 + UniHiker 原生 API (unihiker/pinpong) + pyttsx3 TTS,
 不依赖 cv2、requests、schedule 等第三方库。
+
+v2.30.2 修复记录（共 1 项 bug 修复，涵盖异常处理）：
+- 【严重】http_request() 仅检测 404"设备未注册"，未检测 403"设备令牌无效或缺失"（本地 token 与服务端不匹配），补充 403 检测以触发重新注册
+
+v2.30.1 修复记录（共 3 项 bug 修复，涵盖导入错误、注册逻辑）：
+- 【致命】pyttsx3/unihiker/pinpong 导入缺少 try-except，_PYTTSX3_AVAILABLE/_GUI_AVAILABLE/_PINPONG_AVAILABLE 未定义导致 NameError，硬件初始化和 TTS 初始化全部失败
+- 【严重】register_device() 收到"成功但无 token"时误判为失败（服务端已注册设备心跳模式不返回 token 是正常行为），改为返回 True
+- 【严重】register_device()/send_heartbeat() 携带 X-Device-Token header（_auth_headers 自动添加），配合服务端 register_or_heartbeat 区分心跳和 token 丢失恢复
 
 v2.30.0 修复记录（共 3 项，新增心跳机制和 404 自动重注，涵盖网络通信、注册逻辑）：
 - 【致命】http_request() 检测到 404"设备未注册"时设置 _device_needs_re_register 标志，main_loop 检测后清除旧 token 并重新注册（解决设备 ID 变更后旧 token 失效导致所有接口 404 的问题）
@@ -177,13 +185,30 @@ from dfrobot_huskylensv2 import *
 
 
 # 可选依赖：pyttsx3（用于 TTS，缺失时自动回退到 espeak）
-import pyttsx3
+try:
+    import pyttsx3
+    _PYTTSX3_AVAILABLE = True
+except ImportError:
+    pyttsx3 = None
+    _PYTTSX3_AVAILABLE = False
+
 # 适配 UniHiker 平台
 # GUI 模块：可选依赖
-from unihiker import GUI
+try:
+    from unihiker import GUI
+    _GUI_AVAILABLE = True
+except ImportError:
+    GUI = None
+    _GUI_AVAILABLE = False
 
 # 硬件引脚模块：可选依赖
-from pinpong.board import Board, Pin
+try:
+    from pinpong.board import Board, Pin
+    _PINPONG_AVAILABLE = True
+except ImportError:
+    Board = None
+    Pin = None
+    _PINPONG_AVAILABLE = False
 
 # WiFi 模块：可选依赖，缺失时优雅降级
 _WIFI_AVAILABLE = False
@@ -825,9 +850,14 @@ def http_request(url, payload=None, timeout=None, headers=None):
             error_body = e.read().decode("utf-8", errors="ignore")
         except Exception:
             pass
-        # 检测 404"设备未注册"：device_id 在服务器不存在，token 已失效，需重新注册
+        # 检测需要重新注册的情况：
+        # - 404"设备未注册"：device_id 在服务器不存在
+        # - 403"设备令牌无效或缺失"：本地 token 与服务端不匹配（设备 ID 变更或 token 失效）
         if e.code == 404 and "设备未注册" in error_body:
             log("设备未注册（device_id 在服务器不存在），标记需要重新注册", "WARNING")
+            _device_needs_re_register.set()
+        elif e.code == 403 and "设备令牌" in error_body:
+            log("设备令牌无效或缺失（本地 token 与服务端不匹配），标记需要重新注册", "WARNING")
             _device_needs_re_register.set()
         # 日志脱敏：限制错误响应体长度，避免泄露敏感信息
         log(f"HTTP {e.code} 请求失败 {url}: {error_body[:100] if error_body else '无响应体'}", "ERROR")
@@ -842,7 +872,13 @@ def http_request(url, payload=None, timeout=None, headers=None):
 
 
 def register_device():
-    """设备注册（新版 API），成功后保存 device_token"""
+    """设备注册（新版 API），成功后保存 device_token
+
+    http_request 自动通过 _auth_headers() 携带 X-Device-Token（如果设备有 token），
+    服务端据此区分：
+    - 无 token / token 不匹配 → 重新生成并返回新 token（设备本地 token 丢失恢复）
+    - token 匹配 → 仅更新心跳，不返回 token（正常心跳）
+    """
     payload = {
         "device_id": DEVICE_ID,
         "device_name": None,
@@ -866,11 +902,13 @@ def register_device():
         if token:
             _set_device_token(token)
             save_device_token(token)
-            log("设备注册成功")
+            log("设备注册成功，已获取 device_token")
             return True
         else:
-            log("设备注册成功但未返回 device_token，后续请求可能失败", "ERROR")
-            return False
+            # 服务端未返回 token：设备已注册且携带的 token 匹配（心跳模式）
+            # 这是正常行为，不是失败
+            log("设备已注册（心跳模式），token 有效")
+            return True
     else:
         log(f"设备注册失败: {resp.get('message', resp)}", "ERROR")
         return False
@@ -879,11 +917,10 @@ def register_device():
 def send_heartbeat():
     """发送心跳到 register 接口
 
-    服务端 register_or_heartbeat 逻辑：
-    - 首次注册（设备不存在）：创建虚拟用户，返回 device_token
-    - 已注册设备：仅更新 last_heartbeat_at，不返回 token（防枚举攻击）
-
-    因此心跳时无 token 返回是正常行为，有 token 则保存（兼容设备 ID 变更场景）。
+    http_request 自动通过 _auth_headers() 携带 X-Device-Token（如果设备有 token），
+    服务端据此区分：
+    - token 匹配 → 仅更新心跳，不返回 token（正常心跳）
+    - 无 token / token 不匹配 → 重新生成并返回新 token（token 丢失恢复）
     """
     payload = {
         "device_id": DEVICE_ID,
@@ -899,12 +936,13 @@ def send_heartbeat():
         return False
 
     if isinstance(resp, dict) and resp.get("status") == "ok":
-        # 首次注册会返回 token，已注册设备不返回
+        # token 匹配时服务端不返回 token（心跳模式）
+        # 无 token 或 token 不匹配时服务端返回新 token（恢复模式）
         token = resp.get("device_token")
         if token:
             _set_device_token(token)
             save_device_token(token)
-            log("心跳发现新 token，已保存（设备 ID 可能已变更）")
+            log("心跳获取新 token，已保存")
         return True
 
     return False
