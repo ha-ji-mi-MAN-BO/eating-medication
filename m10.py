@@ -5,10 +5,15 @@ UniHiker M10 智能服药提醒终端主程序
 项目地址适配: https://my-website.ccwu.cc/eating-medication/server/
 设备配对码: 2AIDMUNIHIKER13
 API 版本: v2.28.0（对应 openapi.json）
-当前代码版本: v2.30.2
+当前代码版本: v2.31.0
 
 本程序使用 Python 标准库 + UniHiker 原生 API (unihiker/pinpong) + pyttsx3 TTS,
 不依赖 cv2、requests、schedule 等第三方库。
+
+v2.31.0 修复记录（共 3 项，新增 HuskyLens 初始化和模式切换）：
+- 【新增】init_hardware() 中添加 HuskyLens 二哈识图初始化：huskylens = HuskylensV2_I2C() + huskylens.knock()，开机自动初始化
+- 【新增】switch_huskylens_to_face() 函数：切换到 ALGORITHM_FACE_RECOGNITION 人脸识别模式（含 5 秒稳定等待）
+- 【新增】trigger_alert() 触发提醒时调用 switch_huskylens_to_face()，覆盖到时间提醒和按提醒按钮两种场景
 
 v2.30.2 修复记录（共 1 项 bug 修复，涵盖异常处理）：
 - 【严重】http_request() 仅检测 404"设备未注册"，未检测 403"设备令牌无效或缺失"（本地 token 与服务端不匹配），补充 403 检测以触发重新注册
@@ -180,7 +185,12 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 import uuid
-from dfrobot_huskylensv2 import *
+# HuskyLens 二哈识图：可选依赖，缺失时跳过人脸/条形码识别
+try:
+    from dfrobot_huskylensv2 import *
+    _HUSKYLENS_AVAILABLE = True
+except ImportError:
+    _HUSKYLENS_AVAILABLE = False
 
 
 
@@ -248,6 +258,12 @@ BUZZER_PIN_NUM = 25      # 蜂鸣器
 BUTTON_TAKE_PIN_NUM = 21  # 已吃药按钮（~A，按下高电平，松开低电平）
 BUTTON_REMIND_PIN_NUM = 27  # B键：直接启动吃药提醒（按下低电平）
 BUTTON_EMERGENCY_PIN_NUM = 28  # A键：紧急呼叫（联网通知家属）
+
+# HuskyLens 算法切换后的稳定等待时间（秒）
+HUSKYLENS_SWITCH_DELAY = 5
+
+# HuskyLens 全局实例（init_hardware 中初始化）
+huskylens = None
 
 # 提醒音量递增参数（每 10 分钟递增一次）
 VOLUME_INITIAL = 30
@@ -1733,6 +1749,8 @@ def trigger_alert(reminder):
     msg = f"{name}，该吃 {drug} 了，每次 {dose}"
     log(f"触发提醒: {msg}")
     update_gui_reminder(name, drug, dose)
+    # 切换 HuskyLens 到人脸识别模式（到时间了或按提醒按钮触发）
+    switch_huskylens_to_face()
     threading.Thread(target=alert_loop, args=(tid,), daemon=True).start()
 
 
@@ -2334,21 +2352,41 @@ def on_remind_button_pressed():
 
 # ============== 初始化与主循环 ==============
 
+def switch_huskylens_to_face():
+    """切换 HuskyLens 到人脸识别模式
+
+    在触发吃药提醒时调用（到时间了或按提醒按钮），
+    切换到 ALGORITHM_FACE_RECOGNITION 以识别人脸确认身份。
+    HuskyLens 未初始化时跳过。
+    """
+    global huskylens
+    if not _HUSKYLENS_AVAILABLE or huskylens is None:
+        log("HuskyLens 未初始化，跳过切换人脸识别模式", "WARNING")
+        return
+    try:
+        huskylens.switchAlgorithm(ALGORITHM_FACE_RECOGNITION)
+        time.sleep(HUSKYLENS_SWITCH_DELAY)
+        log("HuskyLens 已切换到人脸识别模式")
+    except Exception as e:
+        log(f"HuskyLens 切换人脸识别模式失败: {e}", "ERROR")
+
+
 def init_hardware():
-    """初始化硬件：蜂鸣器、按钮、GUI 和摄像头检测
-    
+    """初始化硬件：蜂鸣器、按钮、GUI、HuskyLens 和摄像头检测
+
     硬件模块不可用时优雅降级（如无 GUI 模式运行）。
-    
+    HuskyLens 初始化顺序：huskylens = HuskylensV2_I2C() → huskylens.knock()
+
     Args:
         无
-    
+
     Returns:
         None
-    
+
     Raises:
         无（所有异常已内部捕获）
     """
-    global buzzer, button_take, button_emergency, button_remind, gui
+    global buzzer, button_take, button_emergency, button_remind, gui, huskylens
     try:
         # 检查硬件模块是否可用
         if not _PINPONG_AVAILABLE or Board is None or Pin is None:
@@ -2376,6 +2414,17 @@ def init_hardware():
         except Exception as e:
             log(f"GUI 初始化失败，将以无界面模式运行: {e}", "WARNING")
             gui = None
+        # 初始化 HuskyLens 二哈识图（I2C 连接 + knock 握手）
+        try:
+            if _HUSKYLENS_AVAILABLE:
+                huskylens = HuskylensV2_I2C()
+                huskylens.knock()
+                log("HuskyLens 初始化成功")
+            else:
+                log("HuskyLens 模块不可用，跳过初始化", "WARNING")
+        except Exception as e:
+            log(f"HuskyLens 初始化失败: {e}", "WARNING")
+            huskylens = None
         # 检测摄像头是否可用（通过 fswebcam 能否执行）
         try:
             r = subprocess.run(["which", "fswebcam"], shell=False, capture_output=True, timeout=5)
