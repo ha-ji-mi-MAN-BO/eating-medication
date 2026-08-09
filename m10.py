@@ -5,10 +5,13 @@ UniHiker M10 智能服药提醒终端主程序
 项目地址适配: https://my-website.ccwu.cc/eating-medication/server/
 设备配对码: 2AIDMUNIHIKER13
 API 版本: v2.28.0（对应 openapi.json）
-当前代码版本: v2.33.1
+当前代码版本: v2.33.2
 
 本程序使用 Python 标准库 + UniHiker 原生 API (unihiker/pinpong) + pyttsx3 TTS,
 不依赖 cv2、requests、schedule 等第三方库。
+
+v2.33.2 修复记录（共 1 项 bug 修复，涵盖主页搜索药品卡死）：
+- 【致命】enter_search_medicine()/exit_search_medicine() 在 GUI 主线程（onclick 回调）中执行，switch_huskylens_to_barcode/face() 阻塞 GUI 主线程 5 秒，期间 clock_thread/face_id_thread 操作 tkinter 导致死锁（主页卡住需重启）。修复：将实际逻辑拆分到后台线程执行（_enter/_exit_search_medicine_impl），onclick 回调立即返回不阻塞 GUI 主线程；进入搜索前等待 1 秒确保 face_id_thread 暂停，避免 I2C 冲突
 
 v2.33.1 修复记录（共 1 项 bug 修复，涵盖搜索药品时二哈模式切换失效）：
 - 【严重】alert_loop() 提醒循环在搜索药品模式下仍调用 detect_face_id()，其内部的 huskylens.getResult(ALGORITHM_FACE_RECOGNITION) 会把二哈从条形码识别切回人脸识别，导致搜索药品时二哈模式切换失效。修复：在 alert_loop() 循环开头检查 _searching_medicine 事件，搜索药品时暂停提醒循环（不检测人脸、不播报、不增加重试次数）
@@ -261,7 +264,7 @@ SERVER_BASE_URL = "https://my-website.ccwu.cc/eating-medication/server"
 PAIR_CODE = "2AIDMUNIHIKER13"
 DEVICE_ID = "m10_" + PAIR_CODE
 
-# API 端点（v2.28.0，对应 openapi.json，m10.py 当前版本 v2.33.1）
+# API 端点（v2.28.0，对应 openapi.json，m10.py 当前版本 v2.33.2）
 API_REGISTER = f"{SERVER_BASE_URL}/api/v1/public/device/register"
 API_SCHEDULE = f"{SERVER_BASE_URL}/api/v1/public/device/schedule/{DEVICE_ID}"
 API_MESSAGE = f"{SERVER_BASE_URL}/api/v1/public/device/message"
@@ -2640,14 +2643,25 @@ def _barcode_detect_thread():
 
 
 def enter_search_medicine():
-    """进入搜索药品模式
+    """进入搜索药品模式（后台线程执行，避免阻塞 GUI 主线程）
 
+    onclick 回调在 GUI 主线程执行，若直接调用 switch_huskylens_to_barcode()
+    会阻塞 5 秒，期间 clock_thread/face_id_thread 操作 tkinter 导致死锁。
+    因此将实际逻辑放到后台线程，回调立即返回。
+
+    流程：
     1. 记录当前界面（home/reminder）
     2. 暂停人脸ID检测
-    3. 切换 HuskyLens 到条形码识别模式
-    4. 显示搜索药品界面
-    5. 启动条形码检测线程
+    3. 等待 face_id_thread 暂停（避免 I2C 冲突）
+    4. 切换 HuskyLens 到条形码识别模式
+    5. 显示搜索药品界面
+    6. 启动条形码检测线程
     """
+    threading.Thread(target=_enter_search_medicine_impl, daemon=True).start()
+
+
+def _enter_search_medicine_impl():
+    """进入搜索药品模式的实际实现（在后台线程执行）"""
     global _previous_gui_mode
     # 记录当前界面
     with _gui_lock:
@@ -2655,6 +2669,8 @@ def enter_search_medicine():
     log(f"进入搜索药品模式，前一界面: {_previous_gui_mode}")
     # 暂停人脸检测
     _searching_medicine.set()
+    # 等待 face_id_thread 检测到事件并暂停（检测周期 0.5 秒，等 1 秒确保暂停）
+    time.sleep(1)
     # 切换到条形码识别
     switch_huskylens_to_barcode()
     # 显示搜索界面
@@ -2665,13 +2681,22 @@ def enter_search_medicine():
 
 
 def exit_search_medicine():
-    """退出搜索药品模式，返回前一界面
+    """退出搜索药品模式（后台线程执行，避免阻塞 GUI 主线程）
 
+    onclick 回调在 GUI 主线程执行，若直接调用 switch_huskylens_to_face()
+    会阻塞 5 秒。因此将实际逻辑放到后台线程，回调立即返回。
+
+    流程：
     1. 停止条形码检测线程
     2. 切换 HuskyLens 回人脸识别模式（无论返回主页还是提醒界面）
     3. 恢复前一界面（home/reminder）
     4. 恢复人脸ID检测
     """
+    threading.Thread(target=_exit_search_medicine_impl, daemon=True).start()
+
+
+def _exit_search_medicine_impl():
+    """退出搜索药品模式的实际实现（在后台线程执行）"""
     log("退出搜索药品模式")
     # 停止条形码检测
     _barcode_thread_stop.set()
