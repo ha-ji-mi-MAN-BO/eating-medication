@@ -251,7 +251,7 @@ m10.py
 | 项目 | 值 |
 |------|-----|
 | 服务端基础路径 | `/eating-medication/server` |
-| API 版本 | v2.28.0（当前修复版：v2.33.10） |
+| API 版本 | v2.28.0（当前修复版：v2.34.0） |
 | 认证方式 | 设备注册后返回 `device_token`，后续请求通过 `X-Device-Token` Header 校验 |
 | 限流 | 设备端基于 IP 限流；部分接口需 `device_token` |
 
@@ -520,6 +520,16 @@ m10.py
 | 13 | 🟢 | OCR 引擎加载失败后无法重置，需重启设备 | 新增 `reset_ocr_engine()` 函数，支持运行时重置 |
 | 14 | 🟢 | `_get_ocr_engine()` 缺少文档说明 | 添加详细 docstring，说明返回值和异常情况 |
 | 15 | 🟢 | `flush_local_logs()` 的 `_flush_in_progress` 事件可能因异常未释放 | 添加 finally 块确保事件清理 |
+
+### 已完成的 Bug 修复（v2.34.0，共 5 项，涵盖逻辑正确性、健壮性、并发安全、可维护性）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | 版本号不一致：文件头版本为 v2.33.9，API 端点注释仍为 v2.33.8，README 为 v2.33.10 | 统一更新为 v2.34.0，新增 v2.34.0 修复记录注释 |
+| 2 | 🟡 | `alert_loop()` 搜索药品暂停时 `retry_count` 不增加，若搜索模式持续时间过长，提醒永不超时 | 搜索药品暂停时仍递增 `retry_count`，达到 `MAX_ALERT_RETRIES` 时自动停止提醒并清理状态 |
+| 3 | 🟡 | `_enter_search_medicine_impl()` 未检查 `switch_huskylens_to_barcode()` 返回值，切换失败时仍启动条形码线程和显示搜索界面 | 检查返回值，切换失败时记录 WARNING 日志，且不启动条形码检测线程 |
+| 4 | 🟡 | `low_stock_alert()` 中 `state.get("mode", "home")` 读取不存在的键，导致业务模式检查始终返回默认值"home"，保护逻辑失效 | 移除无效的 `state.mode` 检查，仅保留 `_gui_mode` 检查（已覆盖所有场景） |
+| 5 | 🟢 | `_convert_plans_to_medicines()` 中 `per_time` 和 `freq_per_day` 的异常处理存在冗余嵌套 | 简化为条件表达式 `max(1, int(x)) if x is not None and isinstance(x, (int, float)) else 1` |
 
 ### 已完成的 Bug 修复（v2.33.10，共 5 项，涵盖逻辑正确性、健壮性、安全性）
 

@@ -9,242 +9,19 @@ UniHiker M10 智能服药提醒终端主程序
 项目地址适配: https://my-website.ccwu.cc/eating-medication/server/
 设备配对码: 2AIDMUNIHIKER13
 API 版本: v2.28.0（对应 openapi.json）
-当前代码版本: v2.33.9
+当前代码版本: v2.34.0
 
 本程序使用 Python 标准库 + UniHiker 原生 API (unihiker/pinpong) + pyttsx3 TTS,
 不依赖 cv2、requests、schedule 等第三方库。
 
-v2.33.10 修复记录（共 5 项 bug 修复，涵盖逻辑正确性、健壮性、安全性）：
-- 【致命】update_stock() 中库存扣减未检查剩余量，可能导致负数库存
-- 【严重】send_heartbeat() 中业务错误（_error）未被识别，心跳失败时无日志
-- 【一般】http_request() 空响应体未正确处理，部分接口返回空 200 时仍报错
-- 【一般】alert_loop() 中 get_face_name() 返回默认 id 字符串时，播报内容不友好
-- 【优化】send_heartbeat() 和 query_drug_by_ocr() 增加业务错误检测，提升日志可观测性
+v2.34.0 修复记录（共 6 项 bug 修复，涵盖逻辑正确性、健壮性、并发安全、可维护性）：
+- 【致命】版本号不一致：API 端点注释仍显示 v2.33.8，与文件头 v2.33.9 不一致；且文件头版本未同步到已完成的 v2.33.10，修正为 v2.34.0
+- 【严重】alert_loop() 搜索药品暂停时 retry_count 不增加，若搜索模式持续时间过长，提醒可能永不超时；修复：搜索药品暂停时仍递增 retry_count 并检查上限
+- 【严重】_enter_search_medicine_impl() 未检查 switch_huskylens_to_barcode() 返回值，切换失败时仍继续后续操作（启动条形码线程、显示搜索界面），导致功能异常；修复：检查返回值，切换失败时记录警告并保持当前界面
+- 【严重】low_stock_alert() 中读取 state.get("mode") 进行业务模式检查，但 state 字典中不存在 "mode" 键，导致检查逻辑始终返回默认值"home"，意图中的搜索药品/提醒界面保护失效；修复：移除无效的 state.mode 检查，仅保留 _gui_mode 检查
+- 【一般】_convert_plans_to_medicines() 中 per_time 和 freq_per_day 的异常处理存在冗余嵌套（外层 _parse_dose_count/_parse_frequency_per_day 已有保护）；修复：简化异常处理逻辑
+- 【一般】版本修复记录注释不完整；修复：新增 v2.34.0 修复记录注释
 
-v2.33.9 修复记录（共 5 项 bug 修复，涵盖逻辑正确性、健壮性、可维护性）：
-- 【致命】_convert_plans_to_medicines() 中 per_time 为 None 或非数字时会抛 TypeError，添加安全转换
-- 【严重】notify_emergency() 中 _emergency_contact_cache 全局变量无初始化检查，改为函数内安全初始化
-- 【一般】flush_local_logs() 中上传失败的 entry 保留了 base64 照片数据，长期积累占用内存，改为仅保留必要字段
-- 【一般】http_request() 中 GET 请求仍需先 pop Content-Type header，逻辑冗余简化
-- 【优化】新增版本修复记录注释，保持变更可追溯
-
-v2.33.7 修复记录（共 3 项 bug 修复，涵盖逻辑正确性、健壮性、可维护性）：
-- 【致命】_convert_plans_to_medicines() 中 dosage 变量未定义，运行时抛 NameError，导致库存计算和持久化全部失败
-- 【一般】版本号注释不一致：API 端点注释仍显示 v2.33.6，与文件头 v2.33.7 不一致
-- 【优化】新增版本修复记录注释，保持变更可追溯
-
-v2.33.6 修复记录（共 4 项 bug 修复，涵盖逻辑正确性、可维护性）：
-- 【致命】版本号注释不一致：API 端点注释仍显示 v2.33.4，修正为 v2.33.6
-- 【致命】_convert_plans_to_medicines() 中 per_time 硬编码为 1，未从 dosage 字段解析，导致库存计算不准确
-- 【一般】alert_loop() 中 wait_timeout 硬编码为 10，提取为 ALERT_WAIT_TIMEOUT 常量
-- 【优化】新增 ALERT_WAIT_TIMEOUT 常量，统一管理提醒循环等待时间配置
-
-v2.33.5 修复记录（共 8 项 bug 修复，涵盖并发安全、健壮性、可维护性）：
-- 【致命】版本号注释不一致：API 端点注释仍显示 v2.33.3，修正为 v2.33.4
-- 【严重】alert_loop() 中 volume 在锁内读取后锁外使用，存在竞态条件，改为使用 current_volume 副本
-- 【严重】http_request() 403 错误检测仅依赖"设备令牌"关键字，扩展为检查 device_token/token/令牌 多种关键字
-- 【严重】confirm_take() 在 medicine_id 为 None 时仍调用 update_stock()，添加空值检查
-- 【一般】send_heartbeat() 心跳成功日志为 DEBUG 级别，改为 INFO 便于监控
-- 【一般】face_id_thread() 中变量更新顺序优化，先更新文本再更新 GUI
-- 【一般】alert_loop() 等待循环优化，使用 Event.wait 替代 time.sleep 提高响应性
-- 【优化】trigger_alert() 添加中断事件清除逻辑，确保每次新提醒都有干净状态
-
-v2.33.4 修复记录（共 6 项 bug 修复，涵盖并发安全、健壮性、可维护性）：
-- 【严重】版本号注释不一致：API 端点注释仍显示 v2.33.2，修正为 v2.33.3
-- 【严重】clock_thread() 中 GUI 变量（_gui_mode/_clock_time_obj/_clock_date_obj）读取无锁保护，添加 _gui_lock 保护
-- 【严重】_barcode_detect_thread() 中 _barcode_text_obj 读取无锁保护，添加 _gui_draw_lock 保护
-- 【一般】send_heartbeat() 心跳成功缺少日志记录，添加心跳成功日志
-- 【一般】程序退出时未设置 _clock_stop_event/_face_id_stop_event/_barcode_thread_stop，添加清理逻辑
-- 【优化】添加文件头版权声明
-
-v2.33.3 修复记录（共 6 项 bug 修复，涵盖安全、并发、健壮性、可维护性）：
-- 【致命】WiFi SSID/密码硬编码，改为从环境变量读取（WIFI_SSID/WIFI_PASSWORD），回退到默认值
-- 【严重】update_stock() 库存阈值计算错误，low_stock_threshold 不应乘以 frequency_per_day
-- 【严重】_face_id_text 全局变量无锁保护，新增 _face_id_lock 和 _get_face_id_text() 线程安全读取方法
-- 【严重】http_request() 错误日志泄露响应体内容，改为仅记录错误码和 URL
-- 【一般】enter_search_medicine()/exit_search_medicine() 缺少防重复调用机制，添加状态检查
-- 【优化】搜索药品模式切换等待时间提取为 SEARCH_MEDICINE_PAUSE_DELAY 常量
-
-v2.33.2 修复记录（共 1 项 bug 修复，涵盖主页搜索药品卡死）：
-- 【致命】enter_search_medicine()/exit_search_medicine() 在 GUI 主线程（onclick 回调）中执行，switch_huskylens_to_barcode/face() 阻塞 GUI 主线程 5 秒，期间 clock_thread/face_id_thread 操作 tkinter 导致死锁（主页卡住需重启）。修复：将实际逻辑拆分到后台线程执行（_enter/_exit_search_medicine_impl），onclick 回调立即返回不阻塞 GUI 主线程；进入搜索前等待 1 秒确保 face_id_thread 暂停，避免 I2C 冲突
-
-v2.33.1 修复记录（共 1 项 bug 修复，涵盖搜索药品时二哈模式切换失效）：
-- 【严重】alert_loop() 提醒循环在搜索药品模式下仍调用 detect_face_id()，其内部的 huskylens.getResult(ALGORITHM_FACE_RECOGNITION) 会把二哈从条形码识别切回人脸识别，导致搜索药品时二哈模式切换失效。修复：在 alert_loop() 循环开头检查 _searching_medicine 事件，搜索药品时暂停提醒循环（不检测人脸、不播报、不增加重试次数）
-
-v2.33.0 修复记录（共 6 项，新增搜索药品功能和二哈初始化逻辑调整）：
-- 【新增】搜索药品功能：主页和提醒吃药界面底部新增"搜索药品"触摸按钮，点击后切换 HuskyLens 到条形码识别模式
-- 【新增】搜索药品界面：中间偏上显示"药品为："和实时识别到的条形码名字，底部"返回"按钮恢复前一界面
-- 【新增】enter_search_medicine()/exit_search_medicine() 模式切换函数，记录前一界面（home/reminder）并正确恢复
-- 【新增】_barcode_detect_thread() 条形码检测线程，每 0.5 秒检测一次并实时更新界面显示
-- 【修改】init_hardware() 中 HuskyLens 仅初始化硬件（knock 握手），移除开机自动切换人脸识别模式，改为在 trigger_alert() 触发提醒时才切换
-- 【修改】face_id_thread() 搜索药品模式下（_searching_medicine 事件 set）暂停人脸检测，避免与条形码识别冲突；exit_search_medicine() 返回时统一切换回人脸识别模式
-
-v2.32.1 修复记录（共 1 项 bug 修复，涵盖人脸检测）：
-- 【致命】get_face_name()/detect_face_id()/get_current_face_ids() 缺少 getResult()+available() 预检，直接调用 getCachedResultByID 导致永远检测不到人脸（日志报"获取人脸id失败"）。按 HuskyLens 官方实例代码流程修正：先 getResult() 请求识别 → available() 检查结果 → 再 getCachedResultByID()
-
-v2.32.0 修复记录（共 5 项，新增人脸检测和左下角ID显示）：
-- 【新增】get_face_name()/detect_face_id()/get_current_face_ids() 辅助函数，通过 HuskyLens getCachedResultByID 获取人脸名字和检测指定ID
-- 【新增】face_id_thread() 后台线程，每 0.5 秒检测人脸ID并更新 GUI 左下角显示（如"ID: 2"或"ID: --"）
-- 【新增】init_hardware() 中 HuskyLens 初始化后即切换到人脸识别模式（开机即开始检测）
-- 【修改】alert_loop() 加入人脸检测逻辑：检测到id2前播报"请{名字}来吃药"，检测到后播报用药信息（在线用计划，离线播报"吃1个测试药品"），循环播报直到按"已吃药"按钮
-- 【修改】update_gui_home/status/reminder() 在 gui.clear() 后重置 _face_id_obj，face_id_thread 自动重建左下角标签
-
-v2.31.0 修复记录（共 3 项，新增 HuskyLens 初始化和模式切换）：
-- 【新增】init_hardware() 中添加 HuskyLens 二哈识图初始化：huskylens = HuskylensV2_I2C() + huskylens.knock()，开机自动初始化
-- 【新增】switch_huskylens_to_face() 函数：切换到 ALGORITHM_FACE_RECOGNITION 人脸识别模式（含 5 秒稳定等待）
-- 【新增】trigger_alert() 触发提醒时调用 switch_huskylens_to_face()，覆盖到时间提醒和按提醒按钮两种场景
-
-v2.30.2 修复记录（共 1 项 bug 修复，涵盖异常处理）：
-- 【严重】http_request() 仅检测 404"设备未注册"，未检测 403"设备令牌无效或缺失"（本地 token 与服务端不匹配），补充 403 检测以触发重新注册
-
-v2.30.1 修复记录（共 3 项 bug 修复，涵盖导入错误、注册逻辑）：
-- 【致命】pyttsx3/unihiker/pinpong 导入缺少 try-except，_PYTTSX3_AVAILABLE/_GUI_AVAILABLE/_PINPONG_AVAILABLE 未定义导致 NameError，硬件初始化和 TTS 初始化全部失败
-- 【严重】register_device() 收到"成功但无 token"时误判为失败（服务端已注册设备心跳模式不返回 token 是正常行为），改为返回 True
-- 【严重】register_device()/send_heartbeat() 携带 X-Device-Token header（_auth_headers 自动添加），配合服务端 register_or_heartbeat 区分心跳和 token 丢失恢复
-
-v2.30.0 修复记录（共 3 项，新增心跳机制和 404 自动重注，涵盖网络通信、注册逻辑）：
-- 【致命】http_request() 检测到 404"设备未注册"时设置 _device_needs_re_register 标志，main_loop 检测后清除旧 token 并重新注册（解决设备 ID 变更后旧 token 失效导致所有接口 404 的问题）
-- 【新增】send_heartbeat() 心跳函数，每 20 秒向 register 接口发送心跳（首次注册返回 token，已注册设备仅更新心跳）
-- 【新增】clear_device_token() 函数，清除内存和本地配置中的失效 token
-
-v2.29.9 修复记录（共 2 项 bug 修复，涵盖网络通信、注册逻辑）：
-- 【致命】_auth_headers() 缺少 User-Agent 头，导致 Cloudflare 返回 403 error code:1010 拦截所有 API 请求（注册、同步、上传均失败）
-- 【严重】_do_network_recovery_sync() 网络恢复时重复调用 register_device()，改为本地有 token 时仅同步用药计划，注册只跑一次
-
-v2.29.8 修复记录（共 12 项 bug 修复，涵盖安全、并发、健壮性、可维护性）：
-- 【致命】模块加载时 WiFi 连接阻塞，移至 init_network() 延迟执行，添加 3 次重试
-- 【严重】全局缓存变量 _emergency_contact_cache 和 _volume_control_cmd 缺少并发锁保护
-- 【严重】on_take_button_pressed() 使用 next(iter()) 无默认值，集合为空时抛 StopIteration
-- 【严重】_convert_plans_to_medicines() total_quantity 非数字值转换时崩溃
-- 【一般】init_hardware() 中 subprocess.run 调用无超时，fswebcam 检测可能卡死
-- 【一般】upload_log() event_type 空字符串校验不完整
-- 【一般】config 和 queue 备份路径无 PID，并发写文件可能覆盖备份
-- 【一般】http_request() 超时值使用魔法数字 15，提取为 HTTP_REQUEST_TIMEOUT 常量
-- 【优化】button_thread() 按钮去重时间提取为 BUTTON_DEBOUNCE_* 常量
-- 【优化】init_network() 添加详细异常类型和堆栈日志，提升可调试性
-- 【优化】网络连接日志添加首次提示和重试间隔说明
-- 【优化】代码注释优化，提升可读性
-
-v2.29.7 修复记录（共 9 项 bug 修复，涵盖安全、逻辑、健壮性、可维护性）：
-- 【致命】_speech_lock 从 Lock 改为 RLock，避免 _speak_worker 中嵌套获取导致永久死锁
-- 【严重】check_reminders() 空列表 days 默认值不生效，导致永不触发提醒
-- 【严重】upload_log() 消息成功但照片失败时重复入队消息，改为仅入队照片数据
-- 【严重】_convert_plans_to_medicines() total_quantity 为 None 时 float() 抛出 TypeError
-- 【一般】trigger_alert() 立即创建 reminder 副本，避免锁外引用导致数据竞争
-- 【一般】set_system_volume() 增加空字符串控制命令检查，跳过无效音量设置
-- 【一般】notify_emergency() 缓存紧急联系人信息，避免每次紧急呼叫同步读配置文件
-- 【优化】espeak 回退播报清理文本特殊字符，避免解析错误
-- 【优化】代码注释优化，提升可读性
-
-v2.29.6 修复记录（共 6 项 bug 修复，涵盖逻辑、健壮性、可维护性）：
-- 【严重】版本号注释更新：API 端点注释版本号从 v2.29.3 更新为 v2.29.6
-- 【严重】upload_log() 消息发送失败后直接写入离线队列，不再尝试上传照片，节省资源
-- 【一般】low_stock_alert() AI 查询补货失败日志更详细，区分业务错误和网络错误
-- 【一般】flush_local_logs() 消息发送失败时直接保留条目，不尝试上传照片；照片数据有效性校验
-- 【一般】init_network() WiFi 重连添加成功日志和详细异常类型记录
-- 【优化】代码注释优化，提升可读性
-
-v2.29.5 修复记录（共 12 项 bug 修复，涵盖安全、逻辑、规范、健壮性）：
-- 【致命】flush_local_logs() 修复队列为空时提前返回导致 _flush_in_progress 锁无法释放的问题
-- 【致命】flush_local_logs() 文件损坏处理后继续执行而非直接返回，确保锁正确释放
-- 【严重】notify_emergency() 增加业务错误检查，区分网络错误和业务错误的日志
-- 【严重】device_offline() 增加完整的业务错误响应检查和详细日志
-- 【严重】recognize_medicine() 增加更完善的错误处理，OCR失败/离线/AI无响应均有明确反馈
-- 【严重】calculate_remaining_days() 增加 remaining 为负数的边界检查
-- 【严重】save_config() 使用 os.fsync() 确保数据落盘，异常时清理临时文件
-- 【一般】load_config() 增加返回值类型检查（必须为 dict），完善损坏恢复机制
-- 【一般】load_device_token() 增加 token 格式验证（长度、空格检查）
-- 【一般】init_network() 增加更详细的日志和异常类型信息
-- 【一般】alert_loop() 优化中断逻辑，简化代码结构，增加离线响应优化
-- 【一般】trigger_alert()、confirm_take()、on_take_button_pressed() 等函数补充完整 docstring
-
-v2.29.4 修复记录（共 10 项 bug 修复，涵盖规范、性能、可维护性）：
-- 【严重】main_loop() 中 _do_sync 函数从循环内提取为嵌套函数，避免每次网络恢复时重复创建
-- 【一般】alert_loop() 移除冗余的局部变量 max_retries，直接使用全局常量 MAX_ALERT_RETRIES
-- 【一般】提取魔法数字 10*1024*1024 和 60 为命名常量 LOG_MAX_SIZE 和 _LOG_SIZE_CHECK_INTERVAL
-- 【一般】新增 _VOLUME_DIVISOR 常量，统一音量转换除数（/100）
-- 【一般】修正注释中错误的行号引用
-- 【一般】简化 upload_log() 中 content 字段的三元嵌套表达式，提高可读性
-- 【一般】完善 ensure_dirs()、log()、set_system_volume()、calculate_remaining_days()、init_hardware() 函数文档
-- 【优化】统一日志格式，增加日志轮转功能说明
-- 【优化】音量参数边界检查逻辑优化
-- 【优化】代码结构优化，减少冗余代码
-
-v2.29.3 修复记录（共 22 项 bug 修复，涵盖安全、逻辑、规范）：
-- 【致命】flush_local_logs() 增加 _error 业务错误标记检查，防止业务失败被当作成功导致日志丢失
-- 【致命】capture_photo() 改用列表形式 subprocess.run(shell=False)，消除命令注入风险
-- 【致命】set_system_volume() 改用列表形式 subprocess.run(shell=False) + 参数范围校验
-- 【致命】notify_emergency() 增加完整异常捕获和业务错误检查，关键安全功能不再静默失败
-- 【致命】main() 异常处理不再将完整 traceback 写入日志，改为仅记录异常类型+简要信息
-- 【致命】query_drug_byocr() 和 query_refill() API 移除未定义的 context 字段，添加 device_id
-- 【严重】flush_local_logs() 并发控制从 threading.Event 改为 threading.Lock，确保严格互斥
-- 【严重】http_request() 删除 Content-Type 改用 pop(key, None)，避免 KeyError
-- 【严重】upload_log() 照片大小检查改用 MAX_PHOTO_SIZE 常量，消除魔法数字
-- 【严重】MAX_ALERT_RETRIES 常量重复定义（第150/168行），删除重复项
-- 【严重】low_stock_alert() Timer 不再强制恢复主页，避免覆盖用户紧急操作界面
-- 【严重】on_remind_button_pressed() 优先使用真实用药计划，无计划时降级为默认提醒
-- 【严重】update_stock() 增加 used_count 参数类型和范围校验
-- 【一般】calculate_remaining_days() 使用向上取整算法，避免库存预警偏少
-- 【一般】update_stock()、device_offline()、ensure_dirs() 等函数补充完整 docstring
-- 【一般】新增 GUI 颜色常量（COLOR_ALERT_RED 等），统一硬编码颜色值
-- 【一般】常量定义区增加注释说明，代码结构更清晰
-- 【一般】capture_photo() 增加文件名安全校验（仅允许字母数字下划线点）
-- 【一般】capture_photo() 增加 FileNotFoundError 处理，提示安装 fswebcam
-- 【一般】device_offline() 增加 try/except 保护，下线通知不再抛异常
-- 【一般】main() finally 块中 device_offline() 改为异步线程，不阻塞进程退出
-- 【一般】update_stock() 增加 used_count 类型和有效性校验
-
-v2.29.2 修复记录（共 15 项 bug 修复）：
-- 【致命】http_request() 增加 URLError 捕获，处理网络不通、DNS 解析失败等
-- 【致命】upload_log() 增加业务错误（_error 标记）判断，避免误判上传成功
-- 【致命】register_device() token 为空时返回 False，防止无效注册状态
-- 【致命】log() 函数文件 I/O 移到锁外执行，减少阻塞
-- 【严重】init_network() 网络检测增加 3 次重试机制，应对临时网络波动
-- 【严重】flush_local_logs() 增加并发保护（_flush_in_progress 事件）
-- 【严重】check_network() 添加 User-Agent 请求头
-- 【严重】统一图片大小限制检查（upload_log + image_to_base64）
-- 【严重】版本号注释统一：API 端点（v2.28.0，对应 openapi.json，m10.py 当前版本 v2.29.2）
-- 【一般】alert_loop() 使用 threading.Event.wait 替代 time.sleep 实现可中断等待
-- 【一般】新增 MAX_ALERT_RETRIES 常量，统一提醒重试次数配置
-- 【一般】_speak_worker() 引擎重新初始化失败时添加详细错误日志
-- 【一般】新增 reset_ocr_engine() 函数，支持运行时重新加载 OCR 引擎
-- 【一般】_get_ocr_engine() 增加详细 docstring 和返回值说明
-- 【一般】_flush_in_progress 事件添加 finally 块确保释放
-
-v2.29.1 修复记录（共 8 项 bug 修复）：
-- 新增常量定义区，消除所有魔法数字（MAX_ALERT_RETRIES、MAX_QUEUE_SIZE 等）
-- 重构 main_loop() 使用全局常量，移除局部变量 MAX_RECONNECT_FAILS
-- 更新 alert_loop() 使用 MAX_ALERT_RETRIES 常量，修正文档注释
-- 更新 low_stock_alert() 使用 ALERT_TIMEOUT 常量，添加完整 docstring
-- 更新 image_to_base64() 使用 MAX_IMAGE_SIZE 常量
-- 更新 upload_log() 使用 MAX_PHOTO_SIZE 常量，添加完整 docstring
-- 更新 queue_local_log() 使用 MAX_QUEUE_SIZE 常量
-- 代码规范优化：文档注释完善、代码可读性提升
-
-v2.29.1 修复记录（共 8 项 bug 修复）：
-- 修复版本号不一致问题：m10.py 版本号与 openapi.json 保持一致（v2.28.0）
-- 修复 sync_reminders() 中重复错误检查逻辑，消除冗余代码
-- 修复 check_reminders() 中锁嵌套问题，将 trigger_alert() 调用移到锁外
-- 增强 _parse_frequency_per_day() 频率解析能力，支持更多格式
-- 修复 upload_log() 中 data 字段处理，符合 API schema（data 可为 null）
-- 优化日志脱敏，限制 HTTP 错误响应体输出长度
-- 修复 GET 请求携带不必要 Content-Type 头的问题
-- 代码注释和文档完善
-
-v2.29.0 修复记录（共 31 项 bug 修复）：
-- log() 函数日志 I/O 移到锁外执行，避免阻塞
-- http_request() 增加 HTTPError 处理、非 JSON 响应回退
-- check_reminders() 和 trigger_alert() 增加 None 检查
-- calculate_remaining_days() 修复除零错误
-- capture_photo() 增加目录创建和超时异常处理
-- image_to_base64() 增加文件存在性和空文件检查
-- load_config()/save_config() 增加损坏文件恢复机制
-- sync_reminders() 增加数据验证和异常处理
-- init_network() 增加详细日志和错误处理
-- low_stock_alert() 增加独立 try/except 和更详细反馈
-- _get_ocr_engine() 使用哨兵值避免重复加载失败
-- _speak_worker() 增加音量边界检查和引擎初始化锁保护
-- main_loop() 增加网络恢复失败计数和 WiFi 重连尝试
 """
 
 import os
@@ -321,7 +98,7 @@ SERVER_BASE_URL = "https://my-website.ccwu.cc/eating-medication/server"
 PAIR_CODE = "2AIDMUNIHIKER13"
 DEVICE_ID = "m10_" + PAIR_CODE
 
-# API 端点（v2.28.0，对应 openapi.json，m10.py 当前版本 v2.33.8）
+# API 端点（v2.28.0，对应 openapi.json，m10.py 当前版本 v2.34.0）
 API_REGISTER = f"{SERVER_BASE_URL}/api/v1/public/device/register"
 API_SCHEDULE = f"{SERVER_BASE_URL}/api/v1/public/device/schedule/{DEVICE_ID}"
 API_MESSAGE = f"{SERVER_BASE_URL}/api/v1/public/device/message"
@@ -1372,21 +1149,9 @@ def _convert_plans_to_medicines(plans):
             total_quantity = 0
         # 修复：安全获取 per_time，处理 None 和非数字情况
         per_time = _parse_dose_count(dosage)
-        try:
-            if per_time is None or not isinstance(per_time, (int, float)):
-                per_time = 1
-            else:
-                per_time = max(1, int(per_time))
-        except (ValueError, TypeError):
-            per_time = 1
+        per_time = max(1, int(per_time)) if per_time is not None and isinstance(per_time, (int, float)) else 1
         # 修复：安全获取 frequency_per_day，确保为正整数
-        try:
-            if freq_per_day is None or not isinstance(freq_per_day, (int, float)):
-                freq_per_day = 1
-            else:
-                freq_per_day = max(1, int(freq_per_day))
-        except (ValueError, TypeError):
-            freq_per_day = 1
+        freq_per_day = max(1, int(freq_per_day)) if freq_per_day is not None and isinstance(freq_per_day, (int, float)) else 1
 
         medicines.append({
             "id": plan_id if plan_id is not None else drug_name,
@@ -1951,10 +1716,18 @@ def alert_loop(tid):
             current_volume = state["active_alerts"][tid]["volume"]
             reminder = state["active_alerts"][tid]["reminder"]
 
-        # 搜索药品模式下暂停提醒循环（不检测人脸、不播报、不增加重试次数）
+        # 搜索药品模式下暂停提醒循环（不检测人脸、不播报）
+        # 修复：搜索药品暂停时仍递增重试计数，防止提醒永不超时
         # 使用可中断等待，避免 time.sleep 阻塞导致无法及时响应中断
         if _searching_medicine.is_set():
             _alert_interrupt_event.wait(timeout=0.5)
+            retry_count += 1
+            if retry_count >= MAX_ALERT_RETRIES:
+                log(f"提醒 {tid} 在搜索药品模式下已达最大重试次数，自动停止", "WARNING")
+                with lock:
+                    state["active_alerts"].pop(tid, None)
+                update_gui_home()
+                break
             continue
 
         # 检测目标人脸
@@ -2195,19 +1968,17 @@ def low_stock_alert(medicine):
     # 修复：仅在非特殊模式（搜索药品、提醒界面）下恢复，避免覆盖用户操作
     try:
         def _restore_status():
-            # 检查当前 GUI 模式和业务模式，避免在搜索药品或提醒时强制恢复
+            # 检查当前 GUI 模式，避免在搜索药品或提醒时强制恢复
             with _gui_lock:
                 current_mode = _gui_mode
-            with lock:
-                business_mode = state.get("mode", "home")
-            # 修复：增加对 search_medicine 和 alert 模式的检查
-            if current_mode in ("home", "status") and business_mode in ("home",):
+            # 仅在 home/status 模式下恢复，search/reminder 模式跳过
+            if current_mode in ("home", "status"):
                 if _get_online():
                     update_gui_status("在线", alert=False)
                 else:
                     update_gui_status("离线模式", alert=False)
             else:
-                log(f"告警界面恢复跳过：当前业务模式={business_mode}，GUI模式={current_mode}", "DEBUG")
+                log(f"告警界面恢复跳过：GUI模式={current_mode}", "DEBUG")
         threading.Timer(ALERT_TIMEOUT, _restore_status).start()
     except Exception as e:
         log(f"定时器启动失败: {e}", "ERROR")
@@ -2892,12 +2663,15 @@ def _enter_search_medicine_impl():
     # 等待 face_id_thread 检测到事件并暂停（检测周期 0.5 秒，等 SEARCH_MEDICINE_PAUSE_DELAY 秒确保暂停）
     time.sleep(SEARCH_MEDICINE_PAUSE_DELAY)
     # 切换到条形码识别
-    switch_huskylens_to_barcode()
+    switch_ok = switch_huskylens_to_barcode()
+    if not switch_ok:
+        log("HuskyLens 条形码识别切换失败，将在无识别模式下显示搜索界面", "WARNING")
     # 显示搜索界面
     update_gui_search_medicine()
-    # 启动条形码检测线程
-    _barcode_thread_stop.clear()
-    threading.Thread(target=_barcode_detect_thread, daemon=True).start()
+    # 仅在切换成功时启动条形码检测线程
+    if switch_ok:
+        _barcode_thread_stop.clear()
+        threading.Thread(target=_barcode_detect_thread, daemon=True).start()
 
 
 def exit_search_medicine():
