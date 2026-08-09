@@ -5,10 +5,13 @@ UniHiker M10 智能服药提醒终端主程序
 项目地址适配: https://my-website.ccwu.cc/eating-medication/server/
 设备配对码: 2AIDMUNIHIKER13
 API 版本: v2.28.0（对应 openapi.json）
-当前代码版本: v2.32.0
+当前代码版本: v2.32.1
 
 本程序使用 Python 标准库 + UniHiker 原生 API (unihiker/pinpong) + pyttsx3 TTS,
 不依赖 cv2、requests、schedule 等第三方库。
+
+v2.32.1 修复记录（共 1 项 bug 修复，涵盖人脸检测）：
+- 【致命】get_face_name()/detect_face_id()/get_current_face_ids() 缺少 getResult()+available() 预检，直接调用 getCachedResultByID 导致永远检测不到人脸（日志报"获取人脸id失败"）。按 HuskyLens 官方实例代码流程修正：先 getResult() 请求识别 → available() 检查结果 → 再 getCachedResultByID()
 
 v2.32.0 修复记录（共 5 项，新增人脸检测和左下角ID显示）：
 - 【新增】get_face_name()/detect_face_id()/get_current_face_ids() 辅助函数，通过 HuskyLens getCachedResultByID 获取人脸名字和检测指定ID
@@ -2389,7 +2392,7 @@ def get_face_name(face_id):
     """从 HuskyLens 获取指定人脸 ID 的名字
 
     使用 getCachedResultByID 获取已学习的人脸信息。
-    先 request() 刷新缓存，再读取 name 字段。
+    必须先 getResult() + available() 确保有识别结果，再读取 name 字段。
 
     Args:
         face_id: 人脸 ID（如 2）
@@ -2400,7 +2403,9 @@ def get_face_name(face_id):
     if not _HUSKYLENS_AVAILABLE or huskylens is None:
         return f"id{face_id}"
     try:
-        huskylens.request()
+        huskylens.getResult(ALGORITHM_FACE_RECOGNITION)
+        if not huskylens.available(ALGORITHM_FACE_RECOGNITION):
+            return f"id{face_id}"
         result = huskylens.getCachedResultByID(ALGORITHM_FACE_RECOGNITION, face_id)
         if result and result.name:
             return result.name
@@ -2413,8 +2418,10 @@ def get_face_name(face_id):
 def detect_face_id(face_id):
     """检测当前帧中是否存在指定 ID 的人脸
 
-    通过 request() 请求一次识别，再用 getCachedResultByID 检查目标 ID。
-    注意：getCachedResultByID 返回的是当前帧缓存，若该 ID 未出现在画面中则返回 None。
+    按 HuskyLens 实例代码流程：
+    1. getResult() 请求一次识别
+    2. available() 检查是否有结果
+    3. getCachedResultByID() 检查目标 ID 是否在当前帧
 
     Args:
         face_id: 目标人脸 ID
@@ -2425,7 +2432,9 @@ def detect_face_id(face_id):
     if not _HUSKYLENS_AVAILABLE or huskylens is None:
         return False
     try:
-        huskylens.request()
+        huskylens.getResult(ALGORITHM_FACE_RECOGNITION)
+        if not huskylens.available(ALGORITHM_FACE_RECOGNITION):
+            return False
         result = huskylens.getCachedResultByID(ALGORITHM_FACE_RECOGNITION, face_id)
         return result is not None
     except Exception as e:
@@ -2436,7 +2445,10 @@ def detect_face_id(face_id):
 def get_current_face_ids():
     """获取当前帧中检测到的所有人脸 ID 列表
 
-    遍历 ID 1-7，用 getCachedResultByID 检查哪些在当前帧中。
+    按 HuskyLens 实例代码流程：
+    1. getResult() 请求识别
+    2. available() 检查是否有结果
+    3. 遍历 ID 1-7，用 getCachedResultByID 检查哪些在当前帧中
 
     Returns:
         list: 检测到的人脸 ID 列表（如 [1, 2]），无检测或异常时返回空列表
@@ -2444,7 +2456,9 @@ def get_current_face_ids():
     if not _HUSKYLENS_AVAILABLE or huskylens is None:
         return []
     try:
-        huskylens.request()
+        huskylens.getResult(ALGORITHM_FACE_RECOGNITION)
+        if not huskylens.available(ALGORITHM_FACE_RECOGNITION):
+            return []
         ids = []
         for fid in range(1, 8):
             result = huskylens.getCachedResultByID(ALGORITHM_FACE_RECOGNITION, fid)

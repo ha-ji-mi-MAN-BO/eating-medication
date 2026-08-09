@@ -226,7 +226,7 @@ m10.py
 | 项目 | 值 |
 |------|-----|
 | 服务端基础路径 | `/eating-medication/server` |
-| API 版本 | v2.28.0（当前修复版：v2.32.0） |
+| API 版本 | v2.28.0（当前修复版：v2.32.1） |
 | 认证方式 | 设备注册后返回 `device_token`，后续请求通过 `X-Device-Token` Header 校验 |
 | 限流 | 设备端基于 IP 限流；部分接口需 `device_token` |
 
@@ -495,6 +495,12 @@ m10.py
 | 13 | 🟢 | OCR 引擎加载失败后无法重置，需重启设备 | 新增 `reset_ocr_engine()` 函数，支持运行时重置 |
 | 14 | 🟢 | `_get_ocr_engine()` 缺少文档说明 | 添加详细 docstring，说明返回值和异常情况 |
 | 15 | 🟢 | `flush_local_logs()` 的 `_flush_in_progress` 事件可能因异常未释放 | 添加 finally 块确保事件清理 |
+
+### 已完成的 Bug 修复（v2.32.1，共 1 项）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `get_face_name()`/`detect_face_id()`/`get_current_face_ids()` 缺少 `getResult()`+`available()` 预检，直接调用 `getCachedResultByID` 导致永远检测不到人脸 | 按官方实例代码流程修正：先 `getResult()` → `available()` 检查 → 再 `getCachedResultByID()` |
 
 ### 已完成的 Bug 修复（v2.32.0，共 5 项）
 
