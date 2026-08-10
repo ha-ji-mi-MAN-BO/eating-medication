@@ -253,7 +253,7 @@ m10.py
 | 项目 | 值 |
 |------|-----|
 | 服务端基础路径 | `/eating-medication/server` |
-| API 版本 | v2.28.0（当前修复版：v2.38.1） |
+| API 版本 | v2.28.0（当前修复版：v2.48.0） |
 | 认证方式 | 设备注册后返回 `device_token`，后续请求通过 `X-Device-Token` Header 校验 |
 | 限流 | 设备端基于 IP 限流；部分接口需 `device_token` |
 
@@ -522,6 +522,160 @@ m10.py
 | 13 | 🟢 | OCR 引擎加载失败后无法重置，需重启设备 | 新增 `reset_ocr_engine()` 函数，支持运行时重置 |
 | 14 | 🟢 | `_get_ocr_engine()` 缺少文档说明 | 添加详细 docstring，说明返回值和异常情况 |
 | 15 | 🟢 | `flush_local_logs()` 的 `_flush_in_progress` 事件可能因异常未释放 | 添加 finally 块确保事件清理 |
+
+### 已完成的 Bug 修复（v2.48.0，共 6 项，涵盖版本一致性、数据持久化、代码复用、并发安全、性能优化、日志健壮性）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | 版本号不一致：文件头声明 v2.47.0，但 API 端点注释仍为 v2.45.0，造成版本追踪混乱 | 统一所有版本号为 v2.48.0，在文件头集中维护版本变更记录 |
+| 2 | 🟡 | `update_stock()` 库存为 0 时跳过持久化但已修改内存状态，若程序崩溃将导致数据丢失 | 库存为 0 时仍进行持久化，确保内存与配置文件状态一致 |
+| 3 | 🟡 | `save_device_token()` 重复实现 `load_config` 逻辑，代码复用性差且增加维护成本 | 将 `_config_lock` 改为 `RLock`，在 `save_device_token()` 中复用 `load_config()` 函数 |
+| 4 | 🟡 | `notify_emergency()` 配置加载失败时缺少明确的日志提示，不利于问题排查 | 记录配置加载错误信息，在配置加载失败时添加详细 WARNING 日志 |
+| 5 | 🟢 | `log()` 日志轮转在锁内执行文件大小检查，高频日志写入时增加锁竞争 | 将日志大小检查移到锁外执行，锁内仅执行必要的轮转和写入操作 |
+| 6 | 🟢 | 版本变更记录分散，开发者难以快速了解版本历史 | 在文件头集中维护版本修复记录，便于追溯和交付 |
+
+### 已完成的 Bug 修复（v2.47.0，共 5 项，涵盖缺失常量、数据完整性、并发安全、输入校验）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `DEFAULT_CONFIG` 常量未定义，`save_device_token()` 在空配置场景下会抛出 `NameError` | 在配置区顶部显式定义 `DEFAULT_CONFIG` 默认配置模板，包含 `medicines`/`device_token`/`emergency_contact`/`wifi_ssid`/`wifi_password` 等字段 |
+| 2 | 🔴 | `ALGORITHM_FACE_RECOGNITION` / `ALGORITHM_BARCODE_RECOGNITION` 常量未定义（v2.41.0 改为显式导入后丢失原通配符导入中的常量），人脸识别/条形码识别所有调用点均会抛出 `NameError` | 在 `dfrobot_huskylensv2` 导入 `try/except` 块中显式定义两个算法常量（值 `1` 和 `2`），导入成功和失败场景下均保证常量可用 |
+| 3 | 🟡 | `flush_local_logs()` 写回合并逻辑中，`existing_entries` 直接拼接到 `remain` 之后，网络请求期间新增条目与已失败条目重复时会造成同一条目被重复存储，影响刷新效率 | 使用设备ID+内容特征（照片用 `image_base64` 前缀、消息用 `message_type+content`）作为去重键，先过滤 `existing_entries` 中已在 `remain` 的条目，再合并 |
+| 4 | 🟡 | `capture_photo()` 文件名安全校验正则 `r'^[\w\u4e00-\u9fff\.\-]+$'` 未启用 `re.UNICODE` 标志，中文字符文件名可能被误判为非法 | 在 `re.match` 调用中添加 `re.UNICODE` 标志，确保 `\w` 正确匹配 Unicode 字母数字 |
+| 5 | 🟢 | 修复记录在代码中以注释形式维护，README 需同步以保持文档一致性 | 同步本章节修复记录，便于交付和回溯 |
+
+### 已完成的 Bug 修复（v2.46.0，共 10 项，涵盖致命逻辑缺陷、并发安全、数据完整性、异常容错、内存安全、日志健壮性）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `main_loop()` 中先 `clear()` `_device_needs_re_register` 标志位再调用 `register_device()`，若注册失败标志位已清除，设备永远无法触发重新注册 | 将 `clear()` 移到 `register_device()` 成功返回之后；注册失败时保留标志位供后续重试；离线时记录日志并等待网络恢复 |
+| 2 | 🔴 | `_ensure_device_registered()` 心跳全部失败时仍返回 `True`，导致设备在服务端已失效的情况下仍被标记为"已注册" | 心跳连续失败超过阈值时返回 `False` 并触发 `_device_needs_re_register` 事件 |
+| 3 | 🔴 | `_enter_search_medicine_impl()` `finally` 块依赖 `_searching_set` 标志判断是否清除状态，异常发生在 `set()` 与标志设置之间时，`_searching_medicine` 状态残留导致人脸检测永久暂停 | `finally` 块直接检查 `_searching_medicine.is_set()`，不依赖中间变量；移除对 `_searching_set` 的依赖 |
+| 4 | 🔴 | `flush_local_logs()` 写回时覆盖网络请求期间的新队列条目，导致数据丢失 | 写回前先读取当前 `QUEUE_FILE` 内容，合并 `remain` 与新条目后再写回；增加队列大小限制 |
+| 5 | 🔴 | `notify_emergency()` 中存在 `_config_lock` → `_emergency_lock` 的锁排序风险，若其他位置存在反向获取将产生死锁 | 将 `load_config()` 完全移到 `_emergency_lock` 锁外，避免跨锁嵌套；锁内仅做 TTL 检查和缓存更新 |
+| 6 | 🔴 | `notify_emergency()` 网络请求失败时无重试机制且不入离线队列，紧急通知可能永久丢失 | 失败时重试 1 次（间隔 1 秒），全部失败后写入离线队列确保后续补发 |
+| 7 | 🔴 | `queue_local_log()` 将 base64 照片直接存入 JSON 队列文件，存在 OOM 风险 | 对单张照片数据限制 50KB，队列文件总大小限制 50MB，超限截断并标记 `_photo_truncated` |
+| 8 | 🟡 | `save_device_token()` 读取-修改-写入非原子操作，`load_config()` → `save_config()` 之间存在竞态条件 | 将读取-修改-写入操作合并到单次 `_config_lock` 临界区内，确保原子性 |
+| 9 | 🟡 | `save_device_token()` 空配置时创建仅含 token 的新配置，可能覆盖已有配置 | 空配置时使用 `DEFAULT_CONFIG.copy()` 默认配置模板 |
+| 10 | 🟡 | `log()` 函数异常被完全吞噬，日志丢失无任何告警 | 日志写入异常时输出到 `stderr`，便于开发者发现日志系统故障 |
+
+### 已完成的 Bug 修复（v2.45.0，共 4 项，涵盖库存告警准确性、并发健壮性、日志准确性）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `update_stock()` 中库存为 0 时提前 `break` 未设置 `found=True`，日志误报"未找到药品"、跳过库存为 0 场景的持久化路径 | 在 `break` 前设置 `found=True`，使库存为 0 与正常扣减走同一 `found` 分支；同时显式设置 `remaining=0` 保证快照数据正确 |
+| 2 | 🔴 | `update_stock()` 中 `alert_medicine = dict(m)` 在扣减前取值，传递给 `low_stock_alert` 的 `remaining` 为扣减前旧值（如 6→5 时仍显示 6） | 将 `alert_medicine` 快照移到扣减/阈值判断之后，确保告警使用最新值 |
+| 3 | 🟡 | `update_stock()` 循环前已创建完整快照，循环后又重建快照为冗余操作，且循环前快照不会反映修改 | 移除循环前快照，改为循环结束后基于最新状态在锁内重建快照，保证持久化数据与内存一致 |
+| 4 | 🟡 | `notify_emergency()` 中双重检查锁定读取 TTL 与写缓存之间存在 TOCTOU，高并发下可能多次触发文件重新加载 | 将 TTL 判断与缓存更新合并到同一锁内执行，消除 TOCTOU 窗口 |
+
+### 已完成的 Bug 修复（v2.44.0，共 5 项，涵盖致命逻辑缺陷、并发安全、数据校验、路由修复）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `init_hardware()` 中 `buzzer`/`button_take` 等模块级变量初始化为 `None`，导致 `Board` 初始化成功后引脚初始化代码永远不会执行（`None` 检查始终通过） | 引入 `board_init_ok` 标志跟踪 `Board` 初始化状态，替代不可靠的 `None` 检查；合并重复的 `Board().begin()` 调用 |
+| 2 | 🟡 | `_convert_plans_to_medicines()` 中 `remaining_quantity` 可为负数，异常数据导致药品库存显示为负值 | 使用 `max(0, ...)` 限制 `remaining` 为非负数 |
+| 3 | 🟡 | `flush_local_logs()` 中照片类型队列条目（含 `image_base64` 但无 `message_type`）被错误路由到 `API_MESSAGE` 接口，导致上传失败 | 检测照片专用条目并路由到 `API_UPLOAD` 接口 |
+| 4 | 🟡 | `notify_emergency()` 中 `load_config()` 在 `_emergency_lock` 锁内执行，嵌套 `_config_lock` 存在死锁风险且 I/O 阻塞其他线程 | 采用双重检查锁定模式（DCLP），将文件 I/O 移到锁外执行 |
+| 5 | 🔵 | `init_hardware()` 中存在重复的 `Board().begin()` 调用 | 合并为单一初始化逻辑 |
+
+### 已完成的 Bug 修复（v2.43.0，共 6 项，涵盖竞态条件、异常恢复、安全脱敏、代码健壮性）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `_enter_search_medicine_impl()` 中 `_searching_medicine.set()` 和 `_searching_set=True` 之间存在竞态条件，异常时状态残留导致人脸检测永久暂停 | 调整赋值顺序，先标记 `_searching_set` 再 `set` 事件，确保原子性 |
+| 2 | 🟡 | `_exit_search_medicine_impl()` 中异常时 `_searching_medicine.clear()` 不会执行，导致人脸检测无法恢复 | 使用 `try-finally` 确保异常时也能清除状态 |
+| 3 | 🟡 | 版本号注释不一致（API 端点注释仍为 v2.41.0） | 更新注释为 v2.43.0 |
+| 4 | 🟡 | `notify_emergency()` 中日志记录紧急联系人信息（可能包含手机号），存在敏感信息泄露风险 | 日志脱敏，仅记录联系人信息长度 |
+| 5 | 🟡 | `init_hardware()` 中 Board 初始化失败后，引脚对象仍会被创建，可能导致后续代码崩溃 | 增加 `None` 检查，Board 未初始化时跳过引脚初始化 |
+| 6 | 🟢 | `http_request()` 中 403 错误关键词列表为局部变量，可维护性差 | 提取为模块级常量 `_403_AUTH_KEYWORDS` |
+
+### 已完成的 Bug 修复（v2.42.0，共 6 项，涵盖致命逻辑缺陷、异常恢复、安全检测、代码清理）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `update_stock()` 中库存为 0 时跳过了 `low_stock_alert` 告警触发，用户库存耗尽时得不到告警 | 库存为 0 时仍触发低库存告警，确保用户及时收到通知 |
+| 2 | 🟡 | `_enter_search_medicine_impl()` 异常时 `_searching_medicine` 状态可能残留，导致人脸检测永久暂停 | 使用 `finally` 块确保异常时也能清除 `_searching_medicine` 状态 |
+| 3 | 🟡 | `http_request()` 中 403 错误检测关键词范围过宽（含 "unauthorized"、"authentication"），可能误触发重新注册流程 | 收窄关键词范围，仅检测 "device_token"、"token missing"、"设备令牌" 等直接相关关键词 |
+| 4 | 🟡 | `notify_emergency()` 中紧急联系人验证不够严格，空字符串可能被当作有效联系人 | 增加对 `None` 和空字符串（含纯空白字符）的检查 |
+| 5 | 🟢 | 冗余 docstring 和多余注释，影响代码可读性 | 删除冗余 docstring 和 `MAX_ALERT_RETRIES` 多余注释 |
+| 6 | 🟢 | 版本号未同步更新 | 更新版本号为 v2.42.0，添加修复记录 |
+
+### 已完成的 Bug 修复（v2.41.0，共 7 项，涵盖并发安全、降级容错、日志脱敏、API解析、依赖管理）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `_alert_interrupt_event` 从未被 `set()`，用户确认服药后提醒循环仍需等待最长10秒才能响应 | 在 `confirm_take()` 两个分支中均添加 `_alert_interrupt_event.set()`，实现即时中断 |
+| 2 | 🟡 | `update_stock()` 中库存已为0时仍执行文件持久化 I/O | 增加 `current_remaining <= 0` 判断，跳过不必要的持久化操作 |
+| 3 | 🟡 | `init_hardware()` 中 Board 初始化失败后 `raise` 阻断 GUI/HuskyLens 等其他硬件初始化 | 移除 `raise`，改为降级处理，仅跳过引脚初始化 |
+| 4 | 🟡 | `http_request()` 中 403/HTTP 错误日志记录完整 URL，可能泄露 `device_id` 等敏感信息 | 日志脱敏，403 和通用 HTTP 错误均不再记录 URL |
+| 5 | 🟡 | `_convert_plans_to_reminders()` 不处理字符串格式的 days（如 "1,2,3"） | 新增 `str` 类型解析分支，支持逗号分隔的星期字符串 |
+| 6 | 🟡 | `confirm_take()` 未设置搜索药品退出事件，搜索模式下服药确认无法立即停止提醒循环 | 在删除活跃提醒后立即调用 `_alert_interrupt_event.set()` |
+| 7 | 🟢 | 通配符导入 `from dfrobot_huskylensv2 import *` 可能导致命名冲突 | 改为显式导入 `HuskylensV2_I2C` |
+
+### 已完成的 Bug 修复（v2.40.0，共 4 项，涵盖致命缩进错误、心跳重试、设备兼容性、API端点）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `main_loop()` 中 `try` 块缩进错误，核心逻辑在 `try` 块外导致异常无法捕获 | 将所有循环逻辑正确缩进到 `try` 块内，确保异常保护覆盖完整 |
+| 2 | 🟡 | `_ensure_device_registered()` 心跳失败时直接返回 True，无重试机制，单次网络抖动可能误判设备状态 | 增加 2 次心跳重试（间隔1秒），避免单次网络抖动误判设备状态 |
+| 3 | 🟡 | `_build_device_payload()` 中 `device_name` 为 None，部分服务器实现可能需要此字段 | 提供默认设备名称 `"M10-Device-{id}"`，提升服务器兼容性 |
+| 4 | 🟢 | API 端点常量注释中的版本号与实际代码版本不一致 | 更新注释中的版本号为 v2.40.0 |
+
+### 已完成的 Bug 修复（v2.39.0，共 5 项，涵盖网络检测、安全日志、数据持久化、异常处理）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `check_network()` 检查 `SERVER_BASE_URL` 根路径而非 API 端点，服务器正常但 API 故障时误判网络正常 | 改用 `/health` 健康检查端点（`openapi.json` 定义），精确检测 API 可用性 |
+| 2 | 🟡 | `send_heartbeat()` 中 token 检查仅验证非空，未过滤空白字符串，可能保存无效 token | 增加 `isinstance(token, str)` 和 `token.strip()` 检查，确保 token 有效 |
+| 3 | 🟡 | `update_stock()` 未找到药品时仍执行不必要的持久化操作，浪费 I/O 资源 | 仅在找到药品时才持久化，避免无意义的文件读写 |
+| 4 | 🟡 | `http_request()` 异常日志记录完整 URL 和异常信息，可能泄露敏感数据（堆栈、路径等） | 日志脱敏，`URLError` 仅记录错误类型，通用异常仅记录异常类名 |
+| 5 | 🟡 | `sync_reminders()` 返回错误状态时未检查 `_device_needs_re_register` 标记，无法主动触发重新注册 | 增加对 `_device_needs_re_register` 事件的检查，主动触发重新注册流程 |
+
+### 已完成的 Bug 修复（v2.38.5，共 17 项，涵盖异常处理、线程安全、代码健壮性、性能优化、安全性）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `_control_exists()` 中 `subprocess.run()` 无异常保护，缺少 amixer 命令时抛 `FileNotFoundError` | 添加 try-except 捕获 `FileNotFoundError`/`SubprocessError`/`OSError`，异常时返回 False |
+| 2 | 🔴 | `_convert_plans_to_reminders()` 中 `plans` 列表元素可能非 dict，导致 `AttributeError` | 在循环内添加 `isinstance(p, dict)` 类型检查，非字典元素跳过并记录警告 |
+| 3 | 🔴 | `_convert_plans_to_medicines()` 中 `plans` 列表元素可能非 dict，导致 `AttributeError` | 同上，添加类型检查 |
+| 4 | 🔴 | `check_reminders()` 中 `times` 可能为字符串/整数等非可迭代类型，导致遍历逻辑错误 | 添加类型检查，字符串自动包装为列表，非列表/字符串类型转为字符串后包装 |
+| 5 | 🔴 | `alert_loop()` 中 `reminder` 可能非 dict，调用 `.get()` 时崩溃 | 改用 `isinstance(reminder, dict)` 进行类型检查 |
+| 6 | 🔴 | `update_stock()` 中 `state["medicines"]` 元素可能非 dict，导致 `AttributeError` | 在循环内添加类型检查，快照创建时过滤非字典元素 |
+| 7 | 🔴 | `upload_log()` 中 `os.path.getsize()` 无异常保护，文件并发删除时抛 `OSError` | 添加 try-except 保护文件访问操作 |
+| 8 | 🔴 | `main_loop()` 无顶层 try-except，未预期异常将导致主循环退出 | 在循环体内添加顶层 try-except，异常时记录 CRITICAL 日志并等待 1 秒 |
+| 9 | 🔴 | `confirm_take()` 中 `next(iter(...))` 无默认值，字典为空时抛 `StopIteration` | 使用 `next(iter(...), None)` 提供默认值，检查 None 后再访问 |
+| 10 | 🔴 | `capture_photo()` 中 `os.path.exists()` + `os.path.getsize()` 存在 TOCTOU 竞态条件 | 改用 try-except 处理文件检查，合并 exists 和 getsize 调用 |
+| 11 | 🔴 | `log()` 日志文件写入无锁保护，多线程并发可能导致日志交错 | 将文件写入和大小检查都放入 `_log_lock` 保护范围 |
+| 12 | 🔴 | `send_heartbeat()` 中存在死代码分支（`status != "ok"` 永远不会执行） | 移除死代码分支，简化逻辑 |
+| 13 | 🟡 | `_speak_worker()` 每条播报都调用 `set_system_volume()`，造成大量 amixer 系统调用 | 缓存上次设置的音量值，仅在音量变化时才调用 set_system_volume |
+| 14 | 🟡 | `sync_reminders()` 未检查 `_device_needs_re_register` 事件，同步失败时无法触发重新注册 | 在同步异常和无响应时检查事件状态并记录警告 |
+| 15 | 🟡 | `notify_emergency()` 中 `content` 字段包含敏感联系信息 | 改用通用描述，联系信息仅在 `data` 字段中传递 |
+| 16 | 🟡 | `save_device_token()` 未检查配置是否为空，可能覆盖已有配置 | 添加配置为空检查，记录警告日志 |
+| 17 | 🟡 | `init_hardware()` 中 `Board().begin()` 异常可能导致引脚对象状态不一致 | 添加异常保护，初始化失败时清理已赋值的引脚对象 |
+
+**魔法数字提取（v2.38.5）**：
+- 新增常量 `DEFAULT_LOW_STOCK_THRESHOLD = 5`（默认低库存阈值）
+- 新增常量 `LOW_STOCK_DAYS_THRESHOLD = 5`（剩余天数告警阈值）
+- 新增常量 `ALL_WEEKDAYS = [1, 2, 3, 4, 5, 6, 7]`（全周默认值）
+- 替换代码中所有硬编码的魔法数字为对应常量
+
+### 已完成的 Bug 修复（v2.38.3，共 6 项，涵盖空响应处理、返回值检查、可维护性、性能优化）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `sync_reminders()` 未处理 `_empty_response` 标识，API 返回空响应体时可能丢失数据 | 增加 `_empty_response` 检查，空响应体视为成功但无数据，保留现有数据 |
+| 2 | 🔴 | `_ensure_device_registered()` 中 `send_heartbeat()` 返回值未检查，心跳失败时仍返回 True | 检查 `send_heartbeat()` 返回值，心跳失败时记录警告但仍视为已注册（网络抖动容错） |
+| 3 | 🟡 | 9 个辅助函数 docstring 不完整，缺少 Args/Returns 标准格式 | 补充 `_get_online`/`_set_online`/`_get_camera_available`/`_set_camera_available`/`_get_device_token`/`_set_device_token`/`_speak_worker`/`tts_speak`/`_build_device_payload`/`invalidate_emergency_contact_cache` 的完整 docstring |
+| 4 | 🟡 | `_parse_dose_count()` 未处理含范围的剂量字符串（如"1-2片"、"1~2粒"），只匹配第一个数字 | 增加范围格式检测正则 `(\d+)\s*[-~至到]\s*(\d+)`，取最大值作为推荐剂量 |
+| 5 | 🔵 | `_speak_worker()` 语音播报日志级别为 INFO，高频播报时日志过多 | 将语音播报日志降级为 DEBUG，减少不必要的日志输出 |
+| 6 | 🔵 | `alert_loop()` 搜索药品暂停超时使用魔法数字 900，维护困难 | 提取为常量 `_MAX_SEARCH_MEDICINE_PAUSE_COUNT = 900`，便于统一管理 |
+
+### 已完成的 Bug 修复（v2.38.2，共 2 项，涵盖代码健壮性、逻辑清晰度）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `update_stock()` 中 `current_remaining` 变量在库存为 0 或未找到药品时可能未定义，导致 `NameError` 崩溃 | 在函数开头初始化 `current_remaining = 0`，确保所有分支都有定义 |
+| 2 | 🟡 | `http_request()` 业务错误检测逻辑不清晰，`status` 检查条件冗余且可能误判正常响应 | 简化为三种情况清晰处理：`status` 明确存在且不为 "ok" → 直接标记错误；`status` 为 "ok" → 不标记错误；`status` 不存在 → 检查 `message`/`error` 字段 |
 
 ### 已完成的 Bug 修复（v2.38.1，共 7 项，涵盖逻辑正确性、代码可维护性、健壮性）
 

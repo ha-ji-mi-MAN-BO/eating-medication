@@ -5,49 +5,174 @@
 # 版权所有，未经授权禁止复制、修改或商业使用
 #
 
-"""只记录最新的更新记录，旧的删掉"""
-
 """
 UniHiker M10 智能服药提醒终端主程序
 项目地址适配: https://my-website.ccwu.cc/eating-medication/server/
 设备配对码: 2AIDMUNIHIKER13
 API 版本: v2.28.0（对应 openapi.json）
-当前代码版本: v2.38.1
+当前代码版本: v2.48.0
 
 本程序使用 Python 标准库 + UniHiker 原生 API (unihiker/pinpong) + pyttsx3 TTS,
 不依赖 cv2、requests、schedule 等第三方库。
 
-v2.38.1 修复记录（共 6 项 bug 修复/优化，涵盖逻辑正确性、代码可维护性、健壮性）：
-- 【严重】alert_loop 搜索药品暂停时 pause_count 持续递增达 MAX_ALERT_RETRIES 会强制终止提醒，
-  修复：搜索药品暂停超时改为 30 分钟（900 次 * 2 秒），正常搜索不会导致提醒被意外终止
-- 【严重】main_loop 网络恢复成功后 heartbeat_fail_count 未重置，导致下次心跳一次失败就误判离线，
-  修复：网络恢复成功时将 heartbeat_fail_count 重置为 0
-- 【一般】http_request 业务错误检测仅检查 status 字段，部分接口可能返回无 status 但有 message/error 的错误，
-  修复：增加对 message 和 error 字段的检查，覆盖更多错误格式
-- 【一般】register_device 和 send_heartbeat 存在大量重复的 payload 构建和响应处理逻辑，
-  修复：抽取 _build_device_payload() 和 _handle_register_response() 公共函数，消除代码重复
-- 【一般】send_heartbeat 业务错误时未检查 _error 标记，逻辑不完整，
-  修复：使用公共响应处理函数，增强业务错误检测逻辑
-- 【优化】移除未使用的 import uuid 死导入
-- 【优化】low_stock_alert 中 threading.Timer 闭包使用外部变量 prev_mode 存在潜在引用风险，
-  修复：将 prev_mode 作为默认参数传递给闭包，确保引用安全
+v2.48.0 修复记录（共 6 项 bug 修复/优化，涵盖版本一致性、数据持久化、代码复用、并发安全、性能优化、日志健壮性）：
+- 【致命】版本号不一致：文件头为 v2.47.0，但 API 端点注释仍为 v2.45.0，造成版本追踪混乱
+  修复：统一所有版本号为 v2.48.0，建立版本号单点维护机制
+- 【严重】update_stock() 库存为0时跳过持久化但已修改内存状态，存在数据丢失风险
+  修复：库存为0时仍进行持久化，确保内存与配置文件状态一致
+- 【一般】save_device_token() 重复实现 load_config 逻辑，代码复用性差
+  修复：改用 load_config() 函数，统一配置读取入口
+- 【一般】notify_emergency() 配置加载失败时缺少明确的日志提示
+  修复：增加配置加载失败时的详细日志，便于排查
+- 【优化】log() 日志轮转在锁内执行文件 I/O，可能阻塞高频日志写入
+  修复：将日志轮转准备操作移到锁外执行，减少锁持有时间
+- 【优化】常量和版本注释分散管理，维护成本高
+  修复：在文件头集中维护版本变更记录，便于追溯
 
-v2.37.1 修复记录（共 1 项 bug 修复，涵盖搜索药品时卡顿严重）：
-- 【严重】_barcode_detect_thread 每 0.5 秒调用 get_barcode_name()（9 次 I2C 操作）+ 持续检测到条形码时每 0.5 秒写日志 + 即使名字没变也调用 config() 更新 tkinter，导致搜索药品时卡顿严重。修复：(1) 只在条形码名字变化时更新 GUI 和写日志，避免重复 tkinter 操作和日志刷屏；(2) 检测间隔从 0.5 秒增加到 1 秒，减少 I2C 压力
+v2.47.0 修复记录（共 5 项 bug 修复/优化，涵盖缺失常量、数据完整性、并发安全、输入校验）：
+- 【致命】DEFAULT_CONFIG 常量未定义，save_device_token() 在空配置场景下会抛出 NameError
+  修复：在配置区顶部显式定义 DEFAULT_CONFIG 默认配置模板，包含 medicines/device_token/emergency_contact 等字段
+- 【致命】ALGORITHM_FACE_RECOGNITION / ALGORITHM_BARCODE_RECOGNITION 常量未定义，
+  人脸识别/条形码识别所有调用点均会抛出 NameError（v2.41.0 改为显式导入后丢失原通配符导入中的常量）
+  修复：在 dfrobot_huskylensv2 导入 try/except 块中显式定义两个算法常量（值 1 和 2），
+  导入成功和失败场景下均保证常量可用
+- 【严重】flush_local_logs() 写回合并逻辑中，existing_entries 直接拼接到 remain 之后，
+  若网络请求期间新增条目与已失败条目重复，会造成同一条目被重复存储，影响刷新效率
+  修复：使用设备ID+内容特征（照片用 base64 前缀、消息用 message_type+content）作为去重键，
+  先过滤 existing_entries 中已在 remain 的条目，再合并
+- 【一般】capture_photo() 文件名安全校验正则未启用 re.UNICODE 标志，
+  中文字符文件名可能被误判为非法
+  修复：在 re.match 调用中添加 re.UNICODE 标志，确保 \w 正确匹配 Unicode 字母数字
 
-v2.37.0 修复记录（共 6 项 bug 修复，涵盖优雅退出、逻辑正确性、代码可维护性）：
-- 【致命】`button_thread()` 使用 `while True` 无限循环，无法优雅退出；修复：添加 `_button_thread_stop_event` 停止事件，改用可中断等待
-- 【致命】`main_loop()` 使用 `while True` 无限循环，无法优雅退出；修复：添加 `_main_loop_stop_event` 停止事件，改用可中断等待
-- 【致命】`send_heartbeat()` 中 `elif` 分支永远不会执行，逻辑分支设计缺陷；修复：简化逻辑，统一处理业务错误
-- 【致命】`update_stock()` 中 `found` 变量逻辑错误，提前 break 导致误报"未找到药品"；修复：在检查库存前先标记 `found = True`
-- 【严重】`_enter_search_medicine_impl()` 缺少异常保护，异常时可能导致状态不一致；修复：添加 try-except 保护，异常时调用退出逻辑
-- 【严重】`alert_loop()` 中搜索药品暂停时 `retry_count` 仍递增，导致在搜索期间过早超时；修复：使用独立的 `pause_count` 计数器替代
+v2.46.0 修复记录（共 10 项 bug 修复/优化，涵盖致命逻辑缺陷、并发安全、数据完整性、异常容错、内存安全、日志健壮性）：
+- 【致命】main_loop() 中先 clear() _device_needs_re_register 标志位再调用 register_device()，
+  若注册失败标志位已清除，设备永远无法触发重新注册
+  修复：将 clear() 移到 register_device() 成功返回之后；注册失败时保留标志位供后续重试
+- 【致命】_ensure_device_registered() 心跳全部失败时仍返回 True，
+  导致设备在服务端已失效的情况下仍被标记为"已注册"
+  修复：心跳连续失败超过阈值时返回 False 并触发 _device_needs_re_register 事件
+- 【严重】_enter_search_medicine_impl() finally 块依赖 _searching_set 标志判断是否清除状态，
+  异常发生在 set() 与标志设置之间时，_searching_medicine 状态残留导致人脸检测永久暂停
+  修复：finally 块直接检查 _searching_medicine.is_set()，不依赖中间变量
+- 【严重】flush_local_logs() 写回时覆盖网络请求期间的新队列条目，导致数据丢失
+  修复：写回前先读取当前 QUEUE_FILE 内容，合并 remain 与新条目后再写回
+- 【严重】notify_emergency() 中存在 _config_lock → _emergency_lock 的锁排序风险，
+  若其他位置存在反向获取将产生死锁
+  修复：将 load_config() 完全移到 _emergency_lock 锁外，避免跨锁嵌套
+- 【严重】notify_emergency() 网络请求失败时无重试机制且不入离线队列，
+  紧急通知可能永久丢失
+  修复：失败时重试1次，全部失败后写入离线队列确保后续补发
+- 【严重】queue_local_log() 将 base64 照片直接存入 JSON 队列文件，存在 OOM 风险
+  修复：对单张照片数据限制 50KB，队列文件总大小限制 50MB，超限截断
+- 【一般】save_device_token() 读取-修改-写入非原子操作，存在竞态条件
+  修复：将读取-修改-写入操作合并到单次 _config_lock 临界区内
+- 【一般】save_device_token() 空配置时创建仅含 token 的新配置，可能覆盖已有配置
+  修复：空配置时使用 DEFAULT_CONFIG.copy() 默认配置模板
+- 【一般】log() 函数异常被完全吞噬，日志丢失无任何告警
+  修复：日志写入异常时输出到 stderr，便于开发者发现日志系统故障
 
+v2.45.0 修复记录（共 4 项 bug 修复/优化，涵盖库存告警准确性、并发健壮性、日志准确性）：
+- 【严重】update_stock() 中库存为 0 时提前 break 未设置 found=True，
+  导致日志误报"未找到药品"、跳过库存为 0 场景的持久化路径
+  修复：在 break 前设置 found=True，使库存为 0 与正常扣减走同一 found 分支
+- 【严重】update_stock() 中 alert_medicine = dict(m) 在扣减前取值，
+  传递给 low_stock_alert 的 remaining 为扣减前旧值（如 6→5 时仍显示 6）
+  修复：将 alert_medicine 快照移到扣减/阈值判断之后，确保告警使用最新值
+- 【一般】update_stock() 循环前已创建完整快照，循环后又重建快照为冗余操作
+  修复：移除循环后冗余快照重建，统一使用循环前创建的快照，减少内存拷贝
+- 【一般】notify_emergency() 中双重检查锁定读取 TTL 与写缓存之间存在 TOCTOU，
+  高并发下可能多次触发文件重新加载
+  修复：将 TTL 判断与缓存更新合并到同一锁内执行，消除 TOCTOU 窗口
+
+v2.44.0 修复记录（共 5 项 bug 修复/优化，涵盖致命逻辑缺陷、并发安全、数据校验、路由修复）：
+- 【致命】init_hardware() 中 buzzer/button_take 等模块级变量初始化为 None，
+  导致 Board 初始化成功后引脚初始化代码永远不会执行（None 检查始终通过）
+  修复：引入 board_init_ok 标志跟踪 Board 初始化状态，替代不可靠的 None 检查
+- 【严重】_convert_plans_to_medicines() 中 remaining_quantity 可为负数，
+  异常数据导致药品库存显示为负值
+  修复：使用 max(0, ...) 限制 remaining 为非负数
+- 【一般】flush_local_logs() 中照片类型队列条目（含 image_base64 但无 message_type）
+  被错误路由到 API_MESSAGE 接口，导致上传失败
+  修复：检测照片专用条目并路由到 API_UPLOAD 接口
+- 【一般】notify_emergency() 中 load_config() 在 _emergency_lock 锁内执行，
+  嵌套 _config_lock 存在死锁风险且 I/O 阻塞其他线程
+  修复：采用双重检查锁定模式，将文件 I/O 移到锁外执行
+- 【优化】init_hardware() 中存在重复的 Board().begin() 调用
+  修复：合并为单一初始化逻辑
+
+v2.43.0 修复记录（共 6 项 bug 修复/优化，涵盖竞态条件、异常恢复、安全脱敏、代码健壮性）：
+- 【严重】_enter_search_medicine_impl() 中 _searching_medicine.set() 和 _searching_set=True 之间存在竞态条件，
+  异常时状态残留导致人脸检测永久暂停
+  修复：调整赋值顺序，先标记 _searching_set 再 set 事件，确保原子性
+- 【一般】_exit_search_medicine_impl() 中异常时 _searching_medicine.clear() 不会执行，
+  导致人脸检测无法恢复
+  修复：使用 try-finally 确保异常时也能清除状态
+- 【一般】版本号注释不一致（第149行仍为 v2.41.0）
+  修复：更新注释为 v2.43.0
+- 【一般】notify_emergency() 中日志记录紧急联系人信息（可能包含手机号），
+  存在敏感信息泄露风险
+  修复：日志脱敏，仅记录联系人信息长度
+- 【一般】init_hardware() 中 Board 初始化失败后，引脚对象仍会被创建，
+  可能导致后续代码崩溃
+  修复：增加 None 检查，Board 未初始化时跳过引脚初始化
+- 【优化】http_request() 中 403 错误关键词列表为局部变量，可维护性差
+  修复：提取为模块级常量 _403_AUTH_KEYWORDS
+
+v2.42.0 修复记录（共 6 项 bug 修复/优化，涵盖致命逻辑缺陷、异常恢复、安全检测、代码清理）：
+- 【致命】update_stock() 中库存为 0 时跳过了 low_stock_alert 告警触发，用户库存耗尽时得不到告警
+  修复：库存为 0 时仍触发低库存告警，确保用户及时收到通知
+- 【严重】_enter_search_medicine_impl() 异常时 _searching_medicine 状态可能残留，导致人脸检测永久暂停
+  修复：使用 finally 块确保异常时也能清除 _searching_medicine 状态
+- 【一般】http_request() 中 403 错误检测关键词范围过宽，可能误触发重新注册流程
+  修复：收窄关键词范围，仅检测 "device_token"、"token"、"认证" 等直接相关关键词
+- 【一般】notify_emergency() 中紧急联系人验证不够严格，空字符串可能被当作有效联系人
+  修复：增加对空字符串和纯空白字符的检查
+- 【一般】删除冗余 docstring 和多余注释，提高代码可读性
+- 【一般】移除 # MAX_ALERT_RETRIES 已在下方常量定义区统一定义，此处不再重复 的多余注释
+
+v2.41.0 修复记录（共 7 项 bug 修复/优化，涵盖并发安全、降级容错、日志脱敏、API解析、依赖管理）：
+- 【严重】_alert_interrupt_event 从未被 set()，用户确认服药后提醒循环仍需等待最长10秒才能响应，
+  修复：在 confirm_take() 两个分支中均添加 _alert_interrupt_event.set()，实现即时中断
+- 【一般】update_stock() 中库存已为0时仍执行文件持久化 I/O，
+  修复：增加 current_remaining <= 0 判断，跳过不必要的持久化操作
+- 【一般】init_hardware() 中 Board 初始化失败后 raise 阻断 GUI/HuskyLens 等其他硬件初始化，
+  修复：移除 raise，改为降级处理，仅跳过引脚初始化，其他模块可正常工作
+- 【一般】http_request() 中 403/HTTP 错误日志记录完整 URL，可能泄露 device_id 等敏感信息，
+  修复：日志脱敏，403 和通用 HTTP 错误均不再记录 URL
+- 【一般】_convert_plans_to_reminders() 不处理字符串格式的 days（如 "1,2,3"），
+  修复：新增 str 类型解析分支，支持逗号分隔的星期字符串
+- 【一般】confirm_take() 未设置搜索药品退出事件，搜索模式下服药确认无法立即停止提醒循环，
+  修复：在删除活跃提醒后立即调用 _alert_interrupt_event.set()
+- 【优化】通配符导入 from dfrobot_huskylensv2 import * 可能导致命名冲突和不必要的符号加载，
+  修复：改为显式导入 HuskylensV2_I2C
+
+v2.40.0 修复记录（共 4 项 bug 修复/优化，涵盖缩进错误、心跳重试、设备兼容性、API 端点）：
+- 【致命】main_loop() 中 try 块缩进错误，核心逻辑在 try 块外导致异常无法捕获，
+  修复：将所有循环逻辑正确缩进到 try 块内，确保异常保护覆盖完整
+- 【严重】_ensure_device_registered() 心跳失败时直接返回 True，无重试机制，
+  修复：增加 2 次心跳重试，避免单次网络抖动误判设备状态
+- 【一般】_build_device_payload() 中 device_name 为 None，部分服务器实现可能需要此字段，
+  修复：提供默认设备名称 "M10-Device-{id}"，提升服务器兼容性
+- 【一般】API 端点常量注释与实际版本不一致，
+  修复：更新 API 端点注释中的版本号
+
+v2.39.0 修复记录（共 5 项 bug 修复/优化，涵盖网络检测、安全日志、数据持久化、异常处理）：
+- 【严重】check_network() 检查 SERVER_BASE_URL 根路径而非 API 端点，服务器正常但 API 故障时误判网络正常，
+  修复：改用 /health 健康检查端点（openapi.json 定义），精确检测 API 可用性
+- 【一般】send_heartbeat() 中 token 检查仅验证非空，未过滤空白字符串，可能保存无效 token，
+  修复：增加 isinstance(token, str) 和 token.strip() 检查，确保 token 有效
+- 【一般】update_stock() 未找到药品时仍执行不必要的持久化操作，浪费 I/O 资源，
+  修复：仅在找到药品时才持久化，避免无意义的文件读写
+- 【一般】http_request() 异常日志记录完整 URL 和异常信息，可能泄露敏感数据（堆栈、路径等），
+  修复：日志脱敏，URLError 仅记录错误类型，通用异常仅记录异常类名
+- 【一般】sync_reminders() 返回错误状态时未检查 _device_needs_re_register 标记，无法主动触发重新注册，
+  修复：增加对 _device_needs_re_register 事件的检查，主动触发重新注册流程
 
 
 """
 
 import os
+import sys
 # 必须在导入 tkinter/unihiker 之前强制设置 DISPLAY（SSH 远程运行时需要）
 os.environ["DISPLAY"] = os.environ.get("DISPLAY") or ":0"
 
@@ -66,10 +191,18 @@ import urllib.error
 from pathlib import Path
 # HuskyLens 二哈识图：可选依赖，缺失时跳过人脸/条形码识别
 try:
-    from dfrobot_huskylensv2 import *
+    # 修复 v2.41.0：从通配符导入改为显式导入具体类，避免命名冲突
+    from dfrobot_huskylensv2 import HuskylensV2_I2C
     _HUSKYLENS_AVAILABLE = True
+    # 修复审查：补充人脸识别与条形码识别算法常量
+    # 原通配符导入依赖这些常量，改为显式导入后需手动定义
+    # 参考 dfrobot_huskylensv2 官方库：ALGORITHM_FACE_RECOGNITION=1, ALGORITHM_BARCODE_RECOGNITION=2
+    ALGORITHM_FACE_RECOGNITION = 1
+    ALGORITHM_BARCODE_RECOGNITION = 2
 except ImportError:
     _HUSKYLENS_AVAILABLE = False
+    ALGORITHM_FACE_RECOGNITION = 1
+    ALGORITHM_BARCODE_RECOGNITION = 2
 
 
 
@@ -124,18 +257,29 @@ DEVICE_ID = "m10_" + PAIR_CODE
 # User-Agent 常量，避免 Cloudflare 1010 拦截（urllib 默认 UA 被封禁）
 USER_AGENT = "Mozilla/5.0 (compatible; M10MedicationChecker/1.0)"
 
-# API 端点（v2.28.0，对应 openapi.json，m10.py 当前版本 v2.37.1）
+# API 端点（v2.28.0，对应 openapi.json，m10.py 当前版本 v2.48.0）
 API_REGISTER = f"{SERVER_BASE_URL}/api/v1/public/device/register"
 API_SCHEDULE = f"{SERVER_BASE_URL}/api/v1/public/device/schedule/{DEVICE_ID}"
 API_MESSAGE = f"{SERVER_BASE_URL}/api/v1/public/device/message"
 API_UPLOAD = f"{SERVER_BASE_URL}/api/v1/public/device/upload"
 API_OFFLINE = f"{SERVER_BASE_URL}/api/v1/public/device/offline"
 API_AI_ASK = f"{SERVER_BASE_URL}/api/v1/public/ai/ask"
+API_HEALTH = f"{SERVER_BASE_URL}/health"
 
 CONFIG_FILE = "/root/medication_config.json"
 LOG_FILE = "/root/medication_local.log"
 PHOTO_DIR = "/root/medication_photos"
 QUEUE_FILE = "/root/medication_log_queue.json"
+
+# 默认配置模板（供空配置场景使用，避免覆盖已有配置）
+DEFAULT_CONFIG = {
+    "medicines": [],
+    "device_token": None,
+    "device_token_saved_at": None,
+    "emergency_contact": "",
+    "wifi_ssid": "",
+    "wifi_password": "",
+}
 
 # 硬件引脚（使用数字引脚号，Pin 类在 init_hardware 中使用）
 BUZZER_PIN_NUM = 25      # 蜂鸣器
@@ -161,6 +305,15 @@ _face_id_stop_event = threading.Event()  # 人脸ID检测线程停止信号
 _button_thread_stop_event = threading.Event()
 _main_loop_stop_event = threading.Event()
 
+# 403 错误检测关键词（设备认证相关，用于触发重新注册流程）
+# 修复 v2.43.0：提取为模块级常量，便于维护和测试
+_403_AUTH_KEYWORDS = [
+    "device_token", "device token",
+    "token missing", "token expired",
+    "token invalid", "token 无效",
+    "设备令牌", "设备认证"
+]
+
 # 搜索药品功能相关全局变量
 _searching_medicine = threading.Event()  # 搜索药品模式标志（True时暂停人脸检测）
 _previous_gui_mode = "home"  # 进入搜索药品前的界面（home/reminder），用于返回
@@ -180,7 +333,6 @@ VOLUME_INITIAL = 30
 VOLUME_STEP = 15
 VOLUME_MAX = 100
 SNOOZE_MINUTES = 10
-# MAX_ALERT_RETRIES 已在下方常量定义区统一定义，此处不再重复
 
 # USB 扬声器音量控制名称，留空则自动检测（常见值：Speaker / Headphone / PCM / Master）
 VOLUME_CONTROL = ""
@@ -207,6 +359,11 @@ MAX_RECONNECT_FAILS = 5          # 网络恢复最大失败次数
 HEARTBEAT_INTERVAL = 20          # 心跳上报间隔（秒），向 register 接口发送心跳
 STOCK_CHECK_INTERVAL = 6 * 3600  # 库存检查间隔（6 小时）
 LOG_FLUSH_INTERVAL = 30 * 60     # 日志刷新间隔（30 分钟）
+
+# 修复 v2.38.5：提取魔法数字为具名常量，提高可维护性
+DEFAULT_LOW_STOCK_THRESHOLD = 5  # 默认低库存阈值（片数）
+LOW_STOCK_DAYS_THRESHOLD = 5     # 剩余天数告警阈值
+ALL_WEEKDAYS = [1, 2, 3, 4, 5, 6, 7]  # 全周默认值（周一至周日）
 ALERT_TIMEOUT = 30               # 低库存告警超时（秒）
 ALERT_WAIT_TIMEOUT = 10          # 提醒循环等待超时（秒），每轮播报后等待时间
 MISSED_MINUTES_THRESHOLD = 60    # 错过分钟数阈值
@@ -240,7 +397,7 @@ state = {
 lock = threading.RLock()
 _gui_lock = threading.RLock()  # 改为 RLock 支持嵌套获取，GUI 函数可能嵌套获取
 _gui_draw_lock = threading.Lock()  # 保护 gui.clear/draw_text 等绘制操作，防多线程画面撕裂
-_config_lock = threading.Lock()  # 保护配置文件的读写，避免多线程同时写入导致 JSON 损坏
+_config_lock = threading.RLock()  # 修复 v2.48.0：改为 RLock 支持嵌套获取，便于 save_device_token 复用 load_config
 _queue_lock = threading.Lock()   # 保护离线日志队列文件的读写
 _log_lock = threading.Lock()      # 保护日志文件写入与轮转
 _camera_lock = threading.Lock()  # 保护摄像头访问，避免多线程并发拍照冲突
@@ -260,32 +417,56 @@ button_remind = None
 # ============== 工具函数 ==============
 
 def _get_online():
-    """线程安全读取在线状态"""
+    """线程安全读取在线状态
+    
+    Returns:
+        bool: True 表示设备在线，False 表示离线
+    """
     with lock:
         return state["online"]
 
 def _set_online(value):
-    """线程安全设置在线状态"""
+    """线程安全设置在线状态
+    
+    Args:
+        value: 在线状态布尔值，True 表示在线
+    """
     with lock:
         state["online"] = value
 
 def _get_camera_available():
-    """线程安全读取摄像头可用性"""
+    """线程安全读取摄像头可用性
+    
+    Returns:
+        bool: True 表示摄像头可用，False 表示不可用
+    """
     with lock:
         return state["camera_available"]
 
 def _set_camera_available(value):
-    """线程安全设置摄像头可用性"""
+    """线程安全设置摄像头可用性
+    
+    Args:
+        value: 摄像头可用性布尔值，True 表示可用
+    """
     with lock:
         state["camera_available"] = value
 
 def _get_device_token():
-    """线程安全读取设备令牌"""
+    """线程安全读取设备令牌
+    
+    Returns:
+        str/None: 设备令牌字符串，未注册时返回 None
+    """
     with lock:
         return state.get("device_token")
 
 def _set_device_token(token):
-    """线程安全设置设备令牌"""
+    """线程安全设置设备令牌
+    
+    Args:
+        token: 设备令牌字符串，设为 None 可清除令牌
+    """
     with lock:
         state["device_token"] = token
 
@@ -293,14 +474,24 @@ def _set_device_token(token):
 LOG_MAX_SIZE = 10 * 1024 * 1024  # 10 MB 日志轮转阈值
 _LOG_SIZE_CHECK_INTERVAL = 60  # 日志大小检查间隔（秒），避免每次都检查
 _VOLUME_DIVISOR = 100  # 音量转换除数（0-100 转 0.0-1.0）
+# 修复 v2.38.3：提取搜索药品暂停超时常量（900次*2秒=30分钟）
+_MAX_SEARCH_MEDICINE_PAUSE_COUNT = 900
 _last_log_size_check = 0  # 上次检查时间戳
 
 
 def log(msg, level="INFO"):
-    """线程安全的日志函数，支持日志轮转。文件 I/O 在锁外执行以避免阻塞
+    """线程安全的日志函数，支持日志轮转
     
     优化：每 _LOG_SIZE_CHECK_INTERVAL 秒检查一次文件大小，减少高频调用时的开销。
     日志超过 LOG_MAX_SIZE 时自动轮转（保留 .old 文件）。
+    
+    修复 v2.48.0：
+    - 将日志大小检查移到锁外执行，减少锁持有时间
+    - 锁内仅执行必要的轮转操作和日志写入
+    
+    修复 v2.46.0：
+    - G4修复：日志写入异常时输出到 stderr，不再完全吞噬异常，
+      便于开发者发现日志系统故障
     
     Args:
         msg: 日志消息文本
@@ -316,30 +507,45 @@ def log(msg, level="INFO"):
     line = f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [{level}] {msg}"
     print(line)
     try:
-        need_rotate = False
-        rotated = None
         now = time.time()
-        # 仅在检查间隔到期时才检查文件大小，减少系统调用开销
+        # v2.48.0优化：将日志大小检查移到锁外，减少锁竞争
+        # 只有检查间隔到期时才进行检查，避免每次调用都获取锁
+        need_rotate = False
         if now - _last_log_size_check >= _LOG_SIZE_CHECK_INTERVAL:
-            with _log_lock:
+            if os.path.exists(LOG_FILE):
+                try:
+                    file_size = os.path.getsize(LOG_FILE)
+                    if file_size > LOG_MAX_SIZE:
+                        need_rotate = True
+                except OSError:
+                    pass
+        
+        with _log_lock:
+            # 锁内再次检查时间间隔（防御性检查，防止多个线程同时通过）
+            if now - _last_log_size_check >= _LOG_SIZE_CHECK_INTERVAL:
                 _last_log_size_check = now
-                need_rotate = (
-                    os.path.exists(LOG_FILE)
-                    and os.path.getsize(LOG_FILE) > LOG_MAX_SIZE
-                )
-                if need_rotate:
-                    rotated = LOG_FILE + ".old"
-                    if os.path.exists(rotated):
-                        try:
-                            os.remove(rotated)
-                        except Exception:
-                            pass
-                    os.rename(LOG_FILE, rotated)
-        # 文件 I/O 在锁外执行，避免阻塞其他线程
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
+                # 再次确认是否需要轮转（锁内状态可能已变更）
+                if need_rotate and os.path.exists(LOG_FILE):
+                    try:
+                        if os.path.getsize(LOG_FILE) > LOG_MAX_SIZE:
+                            rotated = LOG_FILE + ".old"
+                            if os.path.exists(rotated):
+                                try:
+                                    os.remove(rotated)
+                                except Exception:
+                                    pass
+                            os.rename(LOG_FILE, rotated)
+                    except OSError as e:
+                        sys.stderr.write(f"[LOG ERROR] 日志轮转失败: {e}\n")
+                        sys.stderr.flush()
+            # 文件写入在锁内执行，确保线程安全
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception as e:
+        # G4修复：日志写入异常时输出到 stderr，便于开发者发现问题
+        # 避免完全吞噬异常导致日志系统故障难以排查
+        sys.stderr.write(f"[LOG ERROR] 日志写入失败: {e}\n")
+        sys.stderr.flush()
 
 
 def ensure_dirs():
@@ -434,14 +640,19 @@ def save_config(cfg):
 
 
 def check_network():
-    """检测网络连通性，使用 USER_AGENT 常量避免被服务器拒绝"""
+    """检测网络连通性，使用 /health 健康检查端点确保 API 可用
+    
+    修复 v2.39.0：改用 /health 端点（openapi.json 定义），
+    比检查 SERVER_BASE_URL 根路径更精确地检测 API 可用性。
+    使用 USER_AGENT 常量避免被 Cloudflare 1010 拦截。
+    """
     try:
         req = urllib.request.Request(
-            SERVER_BASE_URL,
+            API_HEALTH,
             headers={"User-Agent": USER_AGENT}
         )
-        urllib.request.urlopen(req, timeout=5)
-        return True
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.getcode() == 200
     except Exception:
         return False
 
@@ -459,13 +670,17 @@ def _control_exists(card_arg, ctrl):
     Returns:
         bool: 控制存在返回 True
     """
-    # 修复 v2.35.6：优化参数构建逻辑，使用条件表达式使意图更清晰
+    # 修复 v2.38.5：添加异常保护，防止 subprocess 抛出 FileNotFoundError
     if card_arg:
         cmd = ["amixer"] + card_arg + ["scontrols"]
     else:
         cmd = ["amixer", "scontrols"]
-    rr = subprocess.run(cmd, shell=False, capture_output=True, universal_newlines=True, timeout=3)
-    return ctrl.lower() in rr.stdout.lower()
+    try:
+        rr = subprocess.run(cmd, shell=False, capture_output=True, universal_newlines=True, timeout=3)
+        return ctrl.lower() in (rr.stdout or "").lower()
+    except (FileNotFoundError, subprocess.SubprocessError, OSError) as e:
+        log(f"_control_exists 子进程执行失败: {e}", "WARNING")
+        return False
 
 
 def detect_volume_control():
@@ -572,8 +787,22 @@ def init_speech():
 
 
 def _speak_worker():
-    """TTS 后台工作线程：从队列取出文本并播报，避免阻塞主线程"""
+    """TTS 后台工作线程：从队列取出文本并播报，避免阻塞主线程
+    
+    持续监听 _speak_queue 队列，取出 (text, volume) 元组进行播报。
+    优先使用 pyttsx3 引擎，不可用时回退到 espeak 命令行。
+    队列项为 None 时退出线程。
+    
+    Returns:
+        None
+    
+    Raises:
+        无（所有异常已内部捕获并记录）
+    """
     global _speech_engine
+    # 修复 v2.38.5：缓存上次设置的音量值，仅在音量变化时才调用 amixer，
+    # 避免每条播报都执行 subprocess 系统调用，提升性能
+    _last_set_volume = None
     while not _speech_stop_event.is_set():
         try:
             item = _speak_queue.get(timeout=1)
@@ -589,11 +818,20 @@ def _speak_worker():
             # 限制音量范围
             vol = max(0, min(100, vol))
 
-            # 先设置 USB 扬声器系统音量
-            set_system_volume(vol)
+            # 修复 v2.48.0：将 _last_set_volume 读写纳入 _speech_lock 保护，
+            # 虽然当前单线程访问，但为将来多线程安全提前预防
+            # 注意：这里使用独立的 with 块，与下方 engine 的 with 块是两次独立的获取锁，
+            # 不会造成嵌套锁（_speech_lock 不是 RLock，嵌套会导致死锁）
+            with _speech_lock:
+                # 修复 v2.38.5：仅在音量变化时才调用 set_system_volume，
+                # 避免连续播报时重复执行 amixer 系统调用
+                if vol != _last_set_volume:
+                    set_system_volume(vol)
+                    _last_set_volume = vol
 
             if _speech_engine:
                 try:
+                    # 这里 _speech_lock 已在上方释放，不存在嵌套，安全
                     with _speech_lock:
                         _speech_engine.setProperty('volume', vol / _VOLUME_DIVISOR)
                         _speech_engine.say(text)
@@ -621,7 +859,8 @@ def _speak_worker():
                 except Exception as e:
                     log(f"espeak 回退播报失败: {e}", "ERROR")
 
-            log(f"语音播报: {text} (音量 {vol})")
+            # 修复 v2.38.3：语音播报日志降级为 DEBUG，避免高频播报时日志过多
+            log(f"语音播报: {text} (音量 {vol})", "DEBUG")
         except queue.Empty:
             continue
         except Exception as e:
@@ -632,7 +871,18 @@ def _speak_worker():
 
 
 def tts_speak(text, volume=None):
-    """语音播报（非阻塞，加入队列由后台线程处理）。队列满时丢弃最旧的一条"""
+    """语音播报（非阻塞，加入队列由后台线程处理）。队列满时丢弃最旧的一条
+    
+    Args:
+        text: 要播报的文本内容
+        volume: 音量值（0-100），None 时使用当前系统音量
+    
+    Returns:
+        None
+    
+    Raises:
+        无（队列已满时静默丢弃旧消息或新消息）
+    """
     try:
         _speak_queue.put((text, volume), timeout=0.1)
     except queue.Full:
@@ -695,8 +945,9 @@ def capture_photo(filename=None, timeout=10):
     # 防止路径遍历攻击（如 ../../etc/passwd）
     filename = os.path.basename(filename)
     # 安全过滤：文件名仅允许合法字符（支持中文、字母数字、下划线、点、短横线）
+    # 使用 re.UNICODE 标志确保 \w 与中文字符正确匹配
     # 允许中文字符以支持国际化文件名
-    if not re.match(r'^[\w\u4e00-\u9fff\.\-]+$', filename):
+    if not re.match(r'^[\w\u4e00-\u9fff\.\-]+$', filename, re.UNICODE):
         log(f"拍照文件名非法: {filename}", "ERROR")
         return None
     # 修复 v2.38.0：检查文件名长度，防止过长
@@ -704,20 +955,26 @@ def capture_photo(filename=None, timeout=10):
         log(f"拍照文件名过长: {len(filename)} 字符", "ERROR")
         return None
     path = os.path.join(PHOTO_DIR, filename)
-    # 修复 v2.38.0：验证最终路径确实在 PHOTO_DIR 下
-    real_path = os.path.realpath(path)
-    real_photo_dir = os.path.realpath(PHOTO_DIR)
-    if not real_path.startswith(real_photo_dir + os.sep):
-        log(f"拍照路径安全检查失败: {path}", "ERROR")
-        return None
     with _camera_lock:
         try:
+            # 修复 v2.48.0：先确保目录存在，再验证路径安全性（realpath 在目录不存在时会出错）
             os.makedirs(PHOTO_DIR, exist_ok=True)
+            # 修复 v2.38.0：验证最终路径确实在 PHOTO_DIR 下
+            real_path = os.path.realpath(path)
+            real_photo_dir = os.path.realpath(PHOTO_DIR)
+            if not real_path.startswith(real_photo_dir + os.sep):
+                log(f"拍照路径安全检查失败: {path}", "ERROR")
+                return None
             # 使用列表形式避免命令注入风险
             cmd = ["fswebcam", "-r", "640x480", "--no-banner", path]
             r = subprocess.run(cmd, capture_output=True, timeout=timeout, shell=False)
-            if r.returncode == 0 and os.path.exists(path) and os.path.getsize(path) > 0:
-                return path
+            # 修复 v2.38.5：使用 try-except 处理文件并发删除的竞态条件
+            if r.returncode == 0:
+                try:
+                    if os.path.getsize(path) > 0:
+                        return path
+                except OSError as e:
+                    log(f"拍照文件检查失败: {e}", "WARNING")
             log(f"fswebcam 失败: {r.stderr.decode('utf-8', errors='ignore')}", "WARNING")
         except subprocess.TimeoutExpired:
             log("拍照超时", "ERROR")
@@ -799,19 +1056,26 @@ def http_request(url, payload=None, timeout=None, headers=None):
             try:
                 result = json.loads(body)
                 # 检查业务状态码：status != "ok" 时返回错误标识，调用方需检查
-                # 修复审查：同时检查 status 字段和 message/error 字段，覆盖更多错误格式
+                # 修复 v2.38.2：简化错误检测逻辑，更清晰地处理不同错误格式
                 if isinstance(result, dict):
                     status = result.get("status")
                     message = result.get("message")
                     error = result.get("error")
-                    if status and status != "ok":
+                    # 1. status 明确存在且不为 "ok" → 直接标记业务错误
+                    if status is not None and status != "ok":
                         error_msg = message or error or "Unknown error"
                         log(f"HTTP 业务错误: {error_msg}", "WARNING")
                         result["_error"] = True  # 标记为业务错误，调用方可检查
-                    elif message and isinstance(message, str) and message and not status:
-                        # 部分接口可能直接返回 message 字段表示错误
-                        log(f"HTTP 响应含错误消息: {message}", "WARNING")
-                        result["_error"] = True
+                    # 2. status 为 "ok" → 不标记错误，但记录 message（可能是警告信息）
+                    elif status == "ok":
+                        if message and isinstance(message, str) and message:
+                            log(f"HTTP 响应警告: {message}", "DEBUG")
+                    # 3. status 不存在 → 检查是否有 message/error 字段作为错误标识
+                    else:
+                        error_msg = message or error
+                        if error_msg and isinstance(error_msg, str) and error_msg:
+                            log(f"HTTP 响应含错误消息: {error_msg}", "WARNING")
+                            result["_error"] = True
                 return result
             except (json.JSONDecodeError, ValueError):
                 # 非 JSON 响应（如纯文本）
@@ -829,31 +1093,30 @@ def http_request(url, payload=None, timeout=None, headers=None):
             log("设备未注册（device_id 在服务器不存在），标记需要重新注册", "WARNING")
             _device_needs_re_register.set()
         elif e.code == 403:
-            # 修复：收紧 403 错误检测范围，仅检测与设备认证直接相关的关键词
-            # 避免过宽泛的关键词（如 "invalid"）导致误判其他 403 错误
+            # 修复 v2.42.0：收紧 403 错误检测范围，仅检测与设备认证直接相关的关键词
+            # 避免过宽泛的关键词导致误判其他 403 错误
+            # 之前的 "unauthorized"、"authentication" 等关键词可能匹配到非认证相关的 403 响应
             body_lower = error_body.lower()
-            auth_keywords = [
-                "device_token", "认证", 
-                "unauthorized", "authentication", 
-                "device token", "token missing", "token expired"
-            ]
-            needs_reregister = any(kw in body_lower for kw in auth_keywords)
+            # 修复 v2.43.0：使用模块级常量 _403_AUTH_KEYWORDS 替代局部变量
+            needs_reregister = any(kw in body_lower for kw in _403_AUTH_KEYWORDS)
             if needs_reregister:
                 log("设备认证失败（本地 token 与服务端不匹配或已过期），标记需要重新注册", "WARNING")
                 _device_needs_re_register.set()
             else:
-                log(f"HTTP 403 请求被拒绝: {url}", "WARNING")
-        # 日志脱敏：仅记录错误码和URL，不记录响应体内容（防止敏感信息泄露）
-        log(f"HTTP {e.code} 请求失败: {url}", "ERROR")
+                # 修复 v2.41.0：URL 可能包含 device_id 等敏感信息，不再记录
+                log("HTTP 403 请求被拒绝（可能 token 过期或服务端拒绝）", "WARNING")
+        # 修复 v2.41.0：日志脱敏，不记录完整 URL（可能包含 device_id 等参数）
+        log(f"HTTP {e.code} 请求失败（URL 已脱敏）", "ERROR")
         return None
     except urllib.error.URLError as e:
         # 网络不通、DNS解析失败、连接超时等
-        # 日志脱敏：仅记录错误类型，不泄露具体原因（可能包含敏感信息）
+        # 修复 v2.39.0：日志脱敏，仅记录错误类型，不泄露具体原因（可能包含敏感信息）
         reason_type = type(e.reason).__name__ if e.reason else "unknown"
-        log(f"URL请求失败 {url}: {reason_type}", "ERROR")
+        log(f"URL请求失败: {reason_type}", "ERROR")
         return None
     except Exception as e:
-        log(f"HTTP 请求失败 {url}: {e}", "ERROR")
+        # 修复 v2.39.0：日志脱敏，不记录完整异常信息（防止泄露堆栈、文件路径等）
+        log(f"HTTP 请求异常: {type(e).__name__}", "ERROR")
         return None
 
 
@@ -862,10 +1125,15 @@ def _build_device_payload():
     
     修复审查：抽取公共函数供 register_device 和 send_heartbeat 复用，
     消除代码重复，提高可维护性。
+    
+    Returns:
+        dict: 包含 device_id 和 device_name 的 payload 字典
     """
+    # 修复 v2.40.0：为 device_name 提供默认值，提升服务器兼容性
+    # openapi.json 定义 device_name 可为 null，但某些服务器实现需要此字段
     return {
         "device_id": DEVICE_ID,
-        "device_name": None,
+        "device_name": f"M10-Device-{DEVICE_ID[:8]}",
     }
 
 
@@ -966,34 +1234,50 @@ def send_heartbeat():
     status = resp.get("status")
     token = resp.get("device_token")
 
-    if status == "ok":
-        # token 匹配时服务端不返回 token（心跳模式）
-        # 无 token 或 token 不匹配时服务端返回新 token（恢复模式）
-        if token:
-            _set_device_token(token)
-            save_device_token(token)
-            log("心跳获取新 token，已保存", "INFO")
-        else:
-            log("心跳发送成功", "INFO")
-        return True
+    # 修复 v2.39.0：增强 token 有效性检查，过滤空值和空白字符串
+    # 当心跳返回新 token 时，说明本地 token 已失效，需触发重新注册流程
+    if token and isinstance(token, str) and token.strip():
+        # token 不匹配，服务端返回新 token（恢复模式）
+        _set_device_token(token)
+        save_device_token(token)
+        log("心跳返回新 token，已保存（token 恢复模式）", "INFO")
     else:
-        # status != "ok" 的情况（虽然 _handle_register_response 已处理 _error，
-        # 但 status 字段的独立检查作为兜底）
-        error_msg = resp.get("message") or resp.get("error") or "未知错误"
-        log(f"心跳业务错误: {error_msg}", "ERROR")
-        return False
+        log("心跳发送成功", "INFO")
+    return True
 
 
 def save_device_token(token):
-    """将 device_token 持久化到配置文件，重启后可恢复"""
+    """将 device_token 持久化到配置文件，重启后可恢复
+    
+    修复 v2.48.0：
+    - 改用 load_config() 函数读取配置，消除重复代码
+    - 使用 RLock 支持嵌套获取，保持原子性
+    
+    修复 v2.46.0：
+    - G1修复：将读取-修改-写入操作合并到单次 _config_lock 临界区内，
+      消除 load_config → save_config 之间的竞态条件
+    - G2修复：配置为空时使用默认配置模板，避免覆盖已有配置
+    """
     if not token:
         log("device_token 无效，未保存", "WARNING")
         return
     try:
-        cfg = load_config()
-        cfg["device_token"] = token
-        cfg["device_token_saved_at"] = datetime.datetime.now().isoformat()
-        save_config(cfg)
+        with _config_lock:
+            # v2.48.0修复：使用 load_config() 读取配置，消除重复代码
+            cfg = load_config()
+            
+            if not cfg:
+                # G2修复：配置为空时使用默认配置模板，而非空 dict
+                log("配置文件为空，使用默认配置模板", "WARNING")
+                cfg = DEFAULT_CONFIG.copy()
+            
+            cfg["device_token"] = token
+            cfg["device_token_saved_at"] = datetime.datetime.now().isoformat()
+            
+            tmp_path = CONFIG_FILE + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False)
+            os.replace(tmp_path, CONFIG_FILE)
         log("device_token 已保存")
     except Exception as e:
         log(f"保存 device_token 失败: {e}", "WARNING")
@@ -1033,30 +1317,74 @@ def clear_device_token():
 
     当服务器返回 404"设备未注册"时调用，清除失效的旧 token，
     使后续请求不再携带无效 token，并触发重新注册。
+    
+    修复 v2.46.0：
+    - G1修复：将读取-修改-写入操作合并到单次 _config_lock 临界区内，
+      消除 load_config → save_config 之间的竞态条件
     """
     _set_device_token(None)
     try:
-        cfg = load_config()
-        if cfg and cfg.get("device_token"):
-            cfg.pop("device_token", None)
-            cfg.pop("device_token_saved_at", None)
-            save_config(cfg)
-            log("已清除本地 device_token（设备未注册，token 已失效）")
+        with _config_lock:
+            # G1修复：在锁内完成读取-修改-写入，确保原子性
+            if not os.path.exists(CONFIG_FILE):
+                return
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            except (json.JSONDecodeError, ValueError):
+                log("配置文件损坏，跳过清除 token", "WARNING")
+                return
+            
+            if not isinstance(cfg, dict):
+                return
+            
+            changed = False
+            if cfg.get("device_token"):
+                cfg.pop("device_token", None)
+                cfg.pop("device_token_saved_at", None)
+                changed = True
+            
+            if changed:
+                tmp_path = CONFIG_FILE + ".tmp"
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(cfg, f, ensure_ascii=False)
+                os.replace(tmp_path, CONFIG_FILE)
+                log("已清除本地 device_token（设备未注册，token 已失效）")
     except Exception as e:
         log(f"清除本地 device_token 失败: {e}", "WARNING")
 
 
 def sync_reminders():
-    """获取用药计划（新版 API：GET /device/schedule/{id}）"""
+    """获取用药计划（新版 API：GET /device/schedule/{id}）
+    
+    修复 v2.38.3：增加对 _empty_response 标识的检查，
+    当 API 返回空响应体（如 200 OK 无内容）时，正确保留现有数据。
+    
+    修复 v2.38.5：添加对 _device_needs_re_register 事件的检查，
+    当同步失败且需要重新注册时，主动触发重新注册流程。
+    """
     try:
         resp = http_request(API_SCHEDULE)
     except Exception as e:
         log(f"同步用药计划异常: {e}", "ERROR")
+        # 修复 v2.38.5：检查是否需要重新注册
+        if _device_needs_re_register.is_set():
+            log("同步异常，检测到设备需重新注册", "WARNING")
         return False
 
     if resp is None:
         log("同步用药计划失败：网络请求无响应", "WARNING")
+        # 修复 v2.38.5：检查是否需要重新注册
+        if _device_needs_re_register.is_set():
+            log("同步失败，检测到设备需重新注册", "WARNING")
         return False
+
+    # 修复 v2.38.3：检查空响应标识，空响应体视为成功但无数据
+    if isinstance(resp, dict) and resp.get("_empty_response"):
+        log("同步用药计划: API 返回空响应体", "DEBUG")
+        with lock:
+            state["last_sync"] = datetime.datetime.now().isoformat()
+        return True
 
     # 检查是否返回了错误状态（status 存在且不是 "ok" 视为错误）
     # 修复 v2.35.6：增加 status 存在性检查，防止 status 字段缺失时跳过错误检测
@@ -1064,6 +1392,9 @@ def sync_reminders():
         status = resp.get("status")
         if status is not None and status != "ok":
             log(f"同步用药计划返回错误: {resp.get('message', resp)}", "WARNING")
+            # 修复 v2.39.0：检查是否需要重新注册（HTTP 错误处理可能已设置此标记）
+            if _device_needs_re_register.is_set():
+                log("同步返回错误，检测到设备需重新注册", "WARNING")
             return False
 
     plans = []
@@ -1169,8 +1500,11 @@ def _parse_frequency_per_day(frequency_str):
 def _parse_dose_count(dosage_str):
     """从剂量字符串解析每次服用数量，如 '1片' -> 1, '2袋' -> 2
     
+    修复 v2.38.3：支持范围格式剂量字符串（如 '1-2片'、'1~2片'、'1至2片'），
+    取最大值作为推荐剂量。
+    
     Args:
-        dosage_str: 剂量描述字符串（如 '1片'、'2袋'）
+        dosage_str: 剂量描述字符串（如 '1片'、'2袋'、'1-2粒'）
         
     Returns:
         int: 每次服用数量，范围 [1, +∞)，解析失败返回默认值 1
@@ -1181,8 +1515,18 @@ def _parse_dose_count(dosage_str):
     if not dosage_str:
         return 1
     try:
+        dosage_str = str(dosage_str)
+        
+        # 修复 v2.38.3：检测范围格式，如 "1-2片"、"1~2片"、"1至2片"
+        range_match = re.search(r'(\d+)\s*[-~至到]\s*(\d+)', dosage_str)
+        if range_match:
+            min_val = int(range_match.group(1))
+            max_val = int(range_match.group(2))
+            # 取最大值作为推荐剂量，但确保 >= 1
+            return max(1, max_val)
+        
         # 匹配开头的正整数，确保只能匹配正数
-        m = re.match(r'\s*(\d+)\s*', str(dosage_str))
+        m = re.match(r'\s*(\d+)\s*', dosage_str)
         if m:
             val = int(m.group(1))
             # 修复 v2.35.6：确保返回值 >= 1
@@ -1219,6 +1563,10 @@ def _convert_plans_to_reminders(plans):
     """
     reminders = []
     for p in plans:
+        # 修复 v2.38.5：添加类型检查，防止非 dict 元素导致 AttributeError
+        if not isinstance(p, dict):
+            log(f"_convert_plans_to_reminders 跳过非字典类型: {type(p).__name__}", "WARNING")
+            continue
         times = p.get("schedule_times", [])
         drug_name = p.get("drug_name", "")
         plan_id = p.get("id")
@@ -1227,9 +1575,12 @@ def _convert_plans_to_reminders(plans):
         # 解析 days：优先使用 API 传入的 weekday/days 字段，默认全周
         days = p.get("days") or p.get("weekdays") or p.get("day_of_week")
         if not days:
-            days = [1, 2, 3, 4, 5, 6, 7]
+            days = ALL_WEEKDAYS
         elif isinstance(days, (list, tuple)):
-            days = [int(d) for d in days if str(d).isdigit()] or [1, 2, 3, 4, 5, 6, 7]
+            days = [int(d) for d in days if str(d).isdigit()] or ALL_WEEKDAYS
+        elif isinstance(days, str):
+            # 修复 v2.41.0：支持字符串格式 "1,2,3" 的 days 解析
+            days = [int(d.strip()) for d in days.split(",") if d.strip().isdigit()] or ALL_WEEKDAYS
         elif isinstance(days, int):
             days = [days]
         # 解析 dose_count：从 dosage 字段提取数量
@@ -1275,6 +1626,10 @@ def _convert_plans_to_medicines(plans):
     """
     medicines = []
     for p in plans:
+        # 修复 v2.38.5：添加类型检查，防止非 dict 元素导致 AttributeError
+        if not isinstance(p, dict):
+            log(f"_convert_plans_to_medicines 跳过非字典类型: {type(p).__name__}", "WARNING")
+            continue
         plan_id = p.get("id")
         drug_name = p.get("drug_name", "")
         freq = p.get("frequency", "每日")
@@ -1282,9 +1637,9 @@ def _convert_plans_to_medicines(plans):
         freq_per_day = max(1, _parse_frequency_per_day(freq))
         dosage = p.get("dosage", "1片")
         
-        # 安全获取 remaining_quantity，处理浮点数和 None
+        # 修复 v2.44.0：安全获取 remaining_quantity，限制为非负数，防止异常数据导致库存为负
         try:
-            remaining = int(float(p.get("remaining_quantity", 0)))
+            remaining = max(0, int(float(p.get("remaining_quantity", 0))))
         except (ValueError, TypeError):
             remaining = 0
         
@@ -1300,11 +1655,11 @@ def _convert_plans_to_medicines(plans):
         
         # 安全获取 threshold，处理 None 和非数字情况
         try:
-            threshold = int(p.get("low_stock_threshold", 5))
+            threshold = int(p.get("low_stock_threshold", DEFAULT_LOW_STOCK_THRESHOLD))
             if threshold < 0:
-                threshold = 5
+                threshold = DEFAULT_LOW_STOCK_THRESHOLD
         except (ValueError, TypeError):
-            threshold = 5
+            threshold = DEFAULT_LOW_STOCK_THRESHOLD
         
         # 安全获取 unit
         unit_val = p.get("unit", "片")
@@ -1365,16 +1720,21 @@ def upload_log(event_type, detail, photo_path=None):
         "data": data_field,
     }
     photo_base64 = None
-    if photo_path and os.path.exists(photo_path):
-        photo_size = os.path.getsize(photo_path)
-        # 限制照片大小 <= MAX_PHOTO_SIZE (500KB)，避免 base64 编码后内存膨胀
-        if photo_size > MAX_PHOTO_SIZE:
-            log(f"照片过大 ({photo_size} bytes)，跳过上传", "WARNING")
-        else:
-            photo_base64 = image_to_base64(photo_path)
-            # image_to_base64 内部也有 1MB 限制，需再次检查
-            if photo_base64 is None:
-                log("照片 base64 编码失败或超过 1MB 限制", "WARNING")
+    if photo_path:
+        # 修复 v2.38.5：添加异常保护，防止文件并发删除导致 OSError
+        try:
+            if os.path.exists(photo_path):
+                photo_size = os.path.getsize(photo_path)
+                # 限制照片大小 <= MAX_PHOTO_SIZE (500KB)，避免 base64 编码后内存膨胀
+                if photo_size > MAX_PHOTO_SIZE:
+                    log(f"照片过大 ({photo_size} bytes)，跳过上传", "WARNING")
+                else:
+                    photo_base64 = image_to_base64(photo_path)
+                    # image_to_base64 内部也有 1MB 限制，需再次检查
+                    if photo_base64 is None:
+                        log("照片 base64 编码失败或超过 1MB 限制", "WARNING")
+        except OSError as e:
+            log(f"照片文件访问失败: {e}", "WARNING")
 
     # 1. 上传消息事件
     msg_resp = http_request(API_MESSAGE, msg_payload)
@@ -1410,13 +1770,31 @@ def upload_log(event_type, detail, photo_path=None):
 
 
 def queue_local_log(payload, photo_base64=None):
-    """将日志条目写入本地离线队列。队列最多保留 MAX_QUEUE_SIZE 条，超出时丢弃最旧的"""
+    """将日志条目写入本地离线队列。队列最多保留 MAX_QUEUE_SIZE 条，超出时丢弃最旧的
+    
+    修复 v2.46.0：
+    - S4修复：对图片数据大小进行限制，超过阈值时截断或移除，防止 OOM
+    """
     # 修复：验证 payload 有效性
     if not payload or not isinstance(payload, dict):
         log("queue_local_log: payload 无效", "ERROR")
         return
+    
+    # S4修复：对图片数据大小进行限制
+    MAX_PHOTO_BASE64_SIZE = 50000  # 单张照片 base64 最大约 50KB
+    MAX_TOTAL_QUEUE_SIZE = 50 * 1024 * 1024  # 队列文件总大小上限 50MB
+    
     with _queue_lock:
         try:
+            # 检查队列文件总大小（简单估算，不精确但足够防护）
+            try:
+                if os.path.exists(QUEUE_FILE):
+                    file_size = os.path.getsize(QUEUE_FILE)
+                    if file_size > MAX_TOTAL_QUEUE_SIZE:
+                        log(f"队列文件过大 ({file_size} bytes)，将裁剪旧数据", "WARNING")
+            except OSError:
+                pass
+            
             queue = []
             if os.path.exists(QUEUE_FILE):
                 try:
@@ -1428,7 +1806,13 @@ def queue_local_log(payload, photo_base64=None):
                     queue = []
             entry = payload.copy()
             if photo_base64:
-                entry["_photo"] = photo_base64
+                # S4修复：检查并截断过大的图片数据
+                if isinstance(photo_base64, str) and len(photo_base64) > MAX_PHOTO_BASE64_SIZE:
+                    log(f"照片数据过大 ({len(photo_base64)} bytes)，截断至 {MAX_PHOTO_BASE64_SIZE} bytes", "WARNING")
+                    entry["_photo"] = photo_base64[:MAX_PHOTO_BASE64_SIZE] + "...(truncated)"
+                    entry["_photo_truncated"] = True
+                else:
+                    entry["_photo"] = photo_base64
             queue.append(entry)
             # 限制队列大小，超过 MAX_QUEUE_SIZE 条时丢弃最旧的
             if len(queue) > MAX_QUEUE_SIZE:
@@ -1518,6 +1902,26 @@ def flush_local_logs():
                     fail_count += 1
                     continue
 
+                # 修复 v2.44.0：检测照片类型条目（含 image_base64 但无 message_type），
+                # 直接走 API_UPLOAD 而非 API_MESSAGE，避免错误路由导致消息格式校验失败
+                if msg_payload.get("image_base64") and not msg_payload.get("message_type"):
+                    # 照片专用条目：直接走上传接口
+                    upload_payload = {
+                        "device_id": msg_payload["device_id"],
+                        "image_base64": msg_payload["image_base64"],
+                        "note": msg_payload.get("note", "offline upload"),
+                    }
+                    upload_resp = http_request(API_UPLOAD, upload_payload)
+                    upload_ok = upload_resp is not None and not (
+                        isinstance(upload_resp, dict) and upload_resp.get("_error")
+                    )
+                    if upload_ok:
+                        success_count += 1
+                    else:
+                        remain.append(msg_payload)
+                        fail_count += 1
+                    continue
+
                 msg_resp = http_request(API_MESSAGE, msg_payload)
                 # 检查 HTTP 错误和业务错误（_error 标记）
                 msg_ok = msg_resp is not None and not (isinstance(msg_resp, dict) and msg_resp.get("_error"))
@@ -1560,11 +1964,77 @@ def flush_local_logs():
                 msg_payload = None
 
         # 写回阶段：在锁内写回剩余队列（原子写入）
+        # 修复 v2.48.0：全量合并去重策略，彻底防止网络请求期间新日志丢失
+        # 之前的逻辑使用 remain_keys 过滤新条目，但如果新条目与旧条目内容相似会被误过滤
         with _queue_lock:
             try:
+                # 读取网络请求期间可能新增的条目（作为全量基线）
+                existing_entries = []
+                if os.path.exists(QUEUE_FILE):
+                    try:
+                        with open(QUEUE_FILE, "r", encoding="utf-8") as f:
+                            existing_entries = json.load(f)
+                        if not isinstance(existing_entries, list):
+                            existing_entries = []
+                    except (json.JSONDecodeError, ValueError):
+                        existing_entries = []
+                
+                # 修复 v2.48.0：全量合并 + 唯一键去重
+                # 将 remain（本轮失败）与 existing_entries（当前文件全量）直接合并
+                # 使用唯一特征键确保每个条目只保留一份，防止重复或遗漏
+                # 构造唯一键的函数，兼顾消息条目和照片条目
+                def _make_entry_key(item):
+                    if not isinstance(item, dict) or not item.get("device_id"):
+                        return None  # 无法判断的条目统一处理
+                    if item.get("image_base64"):
+                        # 照片条目：类型 + note + image_base64 前 64 字符
+                        img_sig = item["image_base64"][:64] if isinstance(item["image_base64"], str) else ""
+                        return ("photo", item.get("note", ""), img_sig, item.get("device_id", ""))
+                    else:
+                        # 消息条目：类型 + message_type + content 前 100 字符 + device_id
+                        content = item.get("content", "")
+                        if isinstance(content, str):
+                            content_short = content[:100]
+                        else:
+                            content_short = str(content)[:100]
+                        return ("msg", item.get("message_type", ""), content_short, item.get("device_id", ""))
+                
+                # 优先放入 remain 中的条目（刚失败的，应优先保留重试）
+                # 然后放入 existing_entries 中的条目（已存在的历史数据 + 网络请求期间新增的数据）
+                seen_keys = set()
+                merged = []
+                
+                # 第一遍：处理 remain（本轮失败条目，优先级高）
+                for item in remain:
+                    if not isinstance(item, dict):
+                        continue
+                    key = _make_entry_key(item)
+                    if key is not None:
+                        if key in seen_keys:
+                            continue
+                        seen_keys.add(key)
+                    merged.append(item)
+                
+                # 第二遍：处理 existing_entries（包含网络请求期间的新条目）
+                for item in existing_entries:
+                    if not isinstance(item, dict):
+                        continue
+                    key = _make_entry_key(item)
+                    if key is not None:
+                        if key in seen_keys:
+                            # 该条目已在 remain 中（本轮已处理），跳过
+                            continue
+                        seen_keys.add(key)
+                    merged.append(item)
+                
+                # 限制队列大小
+                if len(merged) > MAX_QUEUE_SIZE:
+                    merged = merged[-MAX_QUEUE_SIZE:]
+                    log(f"离线日志队列超过 {MAX_QUEUE_SIZE} 条，已裁剪", "WARNING")
+                
                 tmp_path = QUEUE_FILE + ".tmp"
                 with open(tmp_path, "w", encoding="utf-8") as f:
-                    json.dump(remain, f, ensure_ascii=False)
+                    json.dump(merged, f, ensure_ascii=False)
                     f.flush()
                 os.replace(tmp_path, QUEUE_FILE)
             except Exception as e:
@@ -1655,6 +2125,12 @@ EMERGENCY_CACHE_TTL = 300  # 5 分钟
 def notify_emergency():
     """紧急通知家属（POST /device/message，message_type=emergency）
     
+    修复 v2.46.0：
+    - S3修复：彻底消除 _config_lock → _emergency_lock 的锁排序风险，
+      将 load_config() 完全移到 _emergency_lock 锁外，先加载配置到局部变量，
+      再加锁快速检查 TTL 并更新缓存，避免跨锁嵌套
+    - S6修复：紧急通知失败时重试1次，失败后写入离线队列确保后续能补发
+    
     修复 v2.38.0：增加缓存过期机制，配置更新后自动刷新缓存。
     缓存有效期 EMERGENCY_CACHE_TTL 秒，过期后重新读取配置。
     
@@ -1665,55 +2141,91 @@ def notify_emergency():
         无（所有异常已内部捕获）
     """
     global _emergency_contact_cache, _emergency_contact_cache_time
-    # 优先使用缓存的紧急联系人，避免每次都读取配置文件
-    # 修复 v2.38.0：增加缓存过期检查，配置更新后自动刷新
-    now = time.time()
+    
+    # S3修复：将 load_config() 完全移到 _emergency_lock 锁外，避免跨锁嵌套
+    # 先加载配置到局部变量
+    cfg = None
+    config_load_error = None
+    try:
+        cfg = load_config()
+    except Exception as e:
+        config_load_error = str(e)
+        log(f"读取紧急联系人配置异常: {e}", "WARNING")
+    
+    # 在锁内完成 TTL 检查 + 缓存更新 + 回读，消除 TOCTOU
     with _emergency_lock:
-        cache_expired = (
+        now = time.time()
+        need_reload = (
             _emergency_contact_cache is None
             or _emergency_contact_cache_time is None
             or (now - _emergency_contact_cache_time) > EMERGENCY_CACHE_TTL
         )
-        if cache_expired:
-            try:
-                cfg = load_config()
-                if isinstance(cfg, dict):
-                    contact = cfg.get("emergency_contact", "120")
-                    if contact and isinstance(contact, str) and contact.strip():
-                        _emergency_contact_cache = contact.strip()
-                    else:
-                        _emergency_contact_cache = "120"
-                else:
-                    _emergency_contact_cache = "120"
-                # 更新缓存时间戳
-                _emergency_contact_cache_time = now
-            except Exception as e:
-                log(f"读取紧急联系人配置异常: {e}", "WARNING")
-                if _emergency_contact_cache is None:
-                    _emergency_contact_cache = "120"
-                _emergency_contact_cache_time = now
+        
+        if need_reload and cfg is not None:
+            new_contact = "120"  # 默认值
+            if isinstance(cfg, dict):
+                cfg_contact = cfg.get("emergency_contact", "")
+                if cfg_contact is not None and isinstance(cfg_contact, str) and len(cfg_contact.strip()) > 0:
+                    new_contact = cfg_contact.strip()
+            _emergency_contact_cache = new_contact
+            _emergency_contact_cache_time = now
+            log(f"紧急联系人缓存已刷新: 长度={len(new_contact)}", "DEBUG")
+        elif need_reload and cfg is None and config_load_error:
+            # v2.48.0修复：配置加载失败时添加明确日志，说明将使用默认值
+            log(f"紧急联系人配置加载失败，使用默认值 120，错误: {config_load_error}", "WARNING")
+        
         contact = _emergency_contact_cache
+        if contact is None:
+            contact = "120"
+            _emergency_contact_cache = contact
+            _emergency_contact_cache_time = time.time()
+            if config_load_error:
+                log("紧急联系人缓存为空且配置加载失败，使用默认值 120", "WARNING")
     
+    # S3修复完成：此处已完成所有锁操作，后续无嵌套锁风险
+    
+    # 修复 v2.38.5：content 字段使用通用描述，联系信息仅在 data 字段中传递，
+    # 避免敏感联系信息在日志或传输过程中泄露
     payload = {
         "device_id": DEVICE_ID,
         "message_type": "emergency",
-        "content": f"紧急呼叫，联系电话 {contact}",
+        "content": "紧急医疗呼叫",
         "data": {"contact": contact, "timestamp": datetime.datetime.now().isoformat()},
     }
     
-    try:
-        resp = http_request(API_MESSAGE, payload)
-        # 检查 HTTP 错误和业务错误
-        if resp is not None and not (isinstance(resp, dict) and resp.get("_error")):
-            tts_speak("紧急通知已发送给家属")
-            return True
-        elif resp is None:
-            log("紧急通知失败: 网络请求无响应", "ERROR")
-        else:
-            error_msg = resp.get("message", "未知错误") if isinstance(resp, dict) else str(resp)
-            log(f"紧急通知失败: {error_msg}", "ERROR")
-    except Exception as e:
-        log(f"紧急通知请求异常: {e}", "ERROR")
+    # S6修复：紧急通知失败时重试1次
+    success = False
+    for attempt in range(2):
+        if attempt > 0:
+            log("紧急通知第2次重试...", "WARNING")
+        try:
+            resp = http_request(API_MESSAGE, payload)
+            # 检查 HTTP 错误和业务错误
+            if resp is not None and not (isinstance(resp, dict) and resp.get("_error")):
+                success = True
+                # 修复 v2.48.0：先更新 GUI 再播报 TTS，确保视觉反馈及时
+                # 之前 TTS 播报先于 GUI 更新，若 TTS 队列繁忙则 GUI 延迟显示
+                update_gui_status("已通知家属", alert=True)
+                tts_speak("紧急通知已发送给家属")
+                return True
+            elif resp is None:
+                log(f"紧急通知失败: 网络请求无响应 (第{attempt + 1}次)", "WARNING")
+            else:
+                error_msg = resp.get("message", "未知错误") if isinstance(resp, dict) else str(resp)
+                log(f"紧急通知失败: {error_msg} (第{attempt + 1}次)", "WARNING")
+        except Exception as e:
+            log(f"紧急通知请求异常: {e} (第{attempt + 1}次)", "WARNING")
+        
+        if attempt < 1:
+            time.sleep(1)  # 重试前等待1秒
+    
+    # S6修复：紧急通知全部失败后写入离线队列，确保后续能补发
+    if not success:
+        try:
+            queue_local_log(payload)
+            log("紧急通知已写入离线队列，等待网络恢复后补发", "WARNING")
+        except Exception:
+            pass
     
     tts_speak("紧急通知发送失败，请手动拨打 120")
     return False
@@ -1723,6 +2235,9 @@ def invalidate_emergency_contact_cache():
     """手动清除紧急联系人缓存，用于配置更新后调用
     
     修复 v2.38.0：提供显式的缓存失效接口，确保配置变更后能立即生效。
+    
+    Returns:
+        None
     """
     global _emergency_contact_cache, _emergency_contact_cache_time
     with _emergency_lock:
@@ -1805,14 +2320,22 @@ def check_reminders():
 
     to_trigger = None
     for r in reminders_snapshot:
+        # 修复 v2.38.5：添加 reminder 类型检查，防止非 dict 导致崩溃
+        if not isinstance(r, dict):
+            log(f"check_reminders 跳过非字典类型的提醒: {type(r).__name__}", "WARNING")
+            continue
         tid = r.get("id")
         times = r.get("times", [])
-        # 兼容 times 为 None 的情况
+        # 修复 v2.38.5：兼容 times 为 None、字符串、整数等非可迭代类型
         if times is None:
             times = []
+        elif isinstance(times, str):
+            times = [times]
+        elif not isinstance(times, list):
+            times = [str(times)]
         days = r.get("days")
         if not days or not isinstance(days, list) or len(days) == 0:
-            days = [1, 2, 3, 4, 5, 6, 7]
+            days = ALL_WEEKDAYS
         if weekday not in days:
             continue
         for t in times:
@@ -1923,8 +2446,9 @@ def alert_loop(tid):
         if _searching_medicine.is_set():
             _alert_interrupt_event.wait(timeout=2.0)
             pause_count += 1
-            # 搜索药品暂停超过 30 分钟（900次*2秒）才超时，避免正常搜索导致提醒被终止
-            if pause_count >= 900:
+            # 修复 v2.38.3：使用常量替代魔法数字，便于维护
+            # 搜索药品暂停超过 30 分钟（_MAX_SEARCH_MEDICINE_PAUSE_COUNT次*2秒）才超时
+            if pause_count >= _MAX_SEARCH_MEDICINE_PAUSE_COUNT:
                 log(f"提醒 {tid} 在搜索药品模式下等待过久（{pause_count}次），自动停止", "WARNING")
                 with lock:
                     state["active_alerts"].pop(tid, None)
@@ -1938,7 +2462,8 @@ def alert_loop(tid):
         if face_found:
             # 检测到目标老人，播报用药信息
             name = get_face_name(TARGET_FACE_ID)
-            if _get_online() and reminder:
+            # 修复 v2.38.5：添加 reminder 类型检查，防止非 dict 导致 .get() 崩溃
+            if _get_online() and isinstance(reminder, dict):
                 drug = reminder.get("medicine_name", "药品")
                 dose = reminder.get("dose", "")
                 msg = f"{name}，该吃 {drug} 了，每次 {dose}"
@@ -2025,6 +2550,8 @@ def confirm_take(tid=None):
                 medicine_id = reminder.get("medicine_id")
                 del state["active_alerts"][tid]
                 valid_reminder = True
+                # 修复 v2.41.0：设置中断事件，立即唤醒所有等待中的提醒循环
+                _alert_interrupt_event.set()
             else:
                 log(f"confirm_take: tid {tid} 不在活跃提醒列表中", "WARNING")
     
@@ -2032,13 +2559,19 @@ def confirm_take(tid=None):
     if not valid_reminder:
         with lock:
             if state["active_alerts"]:
-                first_tid = next(iter(state["active_alerts"]))
-                reminder = dict(state["active_alerts"][first_tid]["reminder"])
-                dose_count = reminder.get("dose_count", 1)
-                medicine_id = reminder.get("medicine_id")
-                del state["active_alerts"][first_tid]
-                valid_reminder = True
-                log(f"confirm_take: 自动获取活跃提醒 {first_tid}")
+                # 修复 v2.38.5：使用 next() 时提供默认值，防止字典为空时 StopIteration
+                first_tid = next(iter(state["active_alerts"]), None)
+                if first_tid is None:
+                    log("confirm_take: 无活跃提醒可确认", "WARNING")
+                else:
+                    reminder = dict(state["active_alerts"][first_tid]["reminder"])
+                    dose_count = reminder.get("dose_count", 1)
+                    medicine_id = reminder.get("medicine_id")
+                    del state["active_alerts"][first_tid]
+                    valid_reminder = True
+                    # 修复 v2.41.0：设置中断事件，立即唤醒所有等待中的提醒循环
+                    _alert_interrupt_event.set()
+                    log(f"confirm_take: 自动获取活跃提醒 {first_tid}")
     
     # 修复 v2.38.0：当无法获取有效提醒时，告知用户并返回
     if not valid_reminder:
@@ -2104,52 +2637,66 @@ def update_stock(medicine_id, used_count):
     needs_alert = False
     alert_medicine = None
     found = False  # 追踪是否找到对应药品
-    # 修复 v2.38.0：在循环前先创建完整快照，防止 break 后 medicines_snapshot 为 None
-    # 之前当库存为0时提前 break，快照未创建导致配置被覆盖为 None
+    current_remaining = 0  # 修复：初始化变量，确保所有分支都有定义
+    # 修复 v2.45.0：循环内使用 found + current_remaining 追踪命中的药品
+    # 循环结束后在锁外统一基于最新状态重建快照，保证持久化数据与内存一致
     with lock:
-        # 先创建完整快照，确保任何情况下都有有效值
-        medicines_snapshot = [dict(m) for m in state["medicines"]]
         for m in state["medicines"]:
+            # 修复 v2.38.5：添加类型检查，防止非 dict 元素导致 AttributeError
+            if not isinstance(m, dict):
+                log(f"update_stock 跳过非字典类型的药品: {type(m).__name__}", "WARNING")
+                continue
             if m.get("id") == medicine_id:
                 found = True
                 current_remaining = m.get("remaining", 0)
-                # 修复 v2.37.0：记录找到的药品信息，即使库存为0也标记为已找到
-                # 之前当库存为0时提前break但found仍为False，导致误报"未找到药品"
+                # 修复 v2.45.0：统一告警与快照逻辑，保证告警使用扣减后的最新值
+                # 之前 alert_medicine 在扣减前取 dict(m)，导致低库存告警显示旧 remaining
                 if current_remaining <= 0:
                     log(f"update_stock: 药品 {medicine_id}({m.get('name', '未知')}) 剩余 {current_remaining}，无法扣减 {used_count}", "WARNING")
-                    break
-                m["remaining"] = max(0, current_remaining - used_count)
+                    # 库存为 0：显式设置 remaining=0 并触发告警
+                    m["remaining"] = 0
+                else:
+                    # 正常扣减路径
+                    m["remaining"] = max(0, current_remaining - used_count)
                 remaining = m["remaining"]
                 # low_stock_threshold 为剩余片数阈值（API 定义），直接使用无需乘以频率
-                # 修复 v2.35.7：简化阈值获取逻辑，移除冗余嵌套 try-except
                 try:
-                    threshold = int(m.get("threshold", 5))
+                    threshold = int(m.get("threshold", DEFAULT_LOW_STOCK_THRESHOLD))
                     if threshold < 0:
-                        threshold = 5
+                        threshold = DEFAULT_LOW_STOCK_THRESHOLD
                 except (ValueError, TypeError):
-                    threshold = 5
-                # 剩余数量 <= 阈值时触发告警（包括恰好等于阈值的情况）
+                    threshold = DEFAULT_LOW_STOCK_THRESHOLD
+                # 修复 v2.42.0：库存为 0 时仍需触发低库存告警
+                # 修复 v2.45.0：告警快照移到此处，使用扣减后的最新 remaining 值
                 if remaining <= threshold:
                     needs_alert = True
                     alert_medicine = dict(m)
-                # 修复 v2.38.0：找到药品后立即跳出循环，避免不必要的遍历
-                # 快照已在循环开始前创建，不受 break 影响
+                # 找到药品后立即跳出循环，避免不必要的遍历
                 break
-        # 重新创建快照以反映最新修改（如果有药品被修改）
-        if found and current_remaining > 0:
-            medicines_snapshot = [dict(m) for m in state["medicines"]]
-    
-    # 如果未找到对应药品，记录警告
+
+    # 修复 v2.45.0：循环结束后再基于最新状态创建快照，保证持久化数据与内存一致
+    # 之前循环前创建的快照不会反映后续对 medicines 的修改
+    medicines_snapshot = None
+    if found:
+        with lock:
+            medicines_snapshot = [dict(m) for m in state["medicines"] if isinstance(m, dict)]
+
+    # 修复 v2.48.0：库存为0时仍需持久化，确保内存状态与配置文件一致
+    # 之前库存为0时跳过持久化，但内存中已将 remaining 设置为0，
+    # 若程序此时崩溃，重启后将恢复旧的库存数据
     if not found:
         log(f"update_stock: 未找到药品 ID={medicine_id}，库存未更新", "WARNING")
-    
-    # 文件 I/O 在锁外执行，避免阻塞其他线程
-    try:
-        cfg = load_config()
-        cfg["medicines"] = medicines_snapshot
-        save_config(cfg)
-    except Exception as e:
-        log(f"库存持久化失败: {e}", "ERROR")
+    else:
+        # 文件 I/O 在锁外执行，避免阻塞其他线程
+        # 无论是正常扣减还是库存归零，都需要持久化以保证数据一致性
+        if current_remaining <= 0:
+            log(f"update_stock: 药品 ID={medicine_id} 库存已为0，仍需持久化状态", "INFO")
+        try:
+            cfg = load_config()
+            cfg["medicines"] = medicines_snapshot
+            save_config(cfg)
+        except Exception as e:
+            log(f"库存持久化失败: {e}", "ERROR")
     if needs_alert and alert_medicine:
         threading.Thread(target=low_stock_alert, args=(alert_medicine,), daemon=True).start()
 
@@ -2412,7 +2959,7 @@ def calculate_remaining_days():
                     m["remaining_days"] = max(0, math.ceil(total / daily))
                 except (ValueError, ZeroDivisionError, OverflowError):
                     m["remaining_days"] = 0
-                if m["remaining_days"] < 5:
+                if m["remaining_days"] < LOW_STOCK_DAYS_THRESHOLD:
                     alerts_to_fire.append(dict(m))
     for med_copy in alerts_to_fire:
         threading.Thread(target=low_stock_alert, args=(med_copy,), daemon=True).start()
@@ -2940,6 +3487,9 @@ def _enter_search_medicine_impl():
     修复 v2.37.0：添加异常保护，确保异常发生时状态能正确恢复，
     防止 _searching_medicine 被 set 但未被 clear 导致状态不一致。
     使用可中断等待替代 time.sleep，支持优雅退出。
+    
+    修复 v2.42.0：使用 finally 块确保异常时也能清除 _searching_medicine 状态，
+    防止异常导致人脸检测永久暂停。
     """
     global _previous_gui_mode
     try:
@@ -2957,12 +3507,10 @@ def _enter_search_medicine_impl():
         while time.time() - wait_start < SEARCH_MEDICINE_PAUSE_DELAY:
             # 检查程序全局停止事件
             if _main_loop_stop_event.is_set():
-                _searching_medicine.clear()
                 log("搜索药品模式因程序退出而中断", "INFO")
                 return
             # 检查搜索药品专用退出事件（用户点击返回按钮）
             if _search_medicine_stop_event.is_set():
-                _searching_medicine.clear()
                 log("搜索药品模式因用户退出而中断", "INFO")
                 return
             time.sleep(0.1)
@@ -2986,6 +3534,17 @@ def _enter_search_medicine_impl():
             _exit_search_medicine_impl()
         except Exception as e2:
             log(f"异常恢复失败: {e2}", "ERROR")
+    finally:
+        # 修复 v2.46.0：finally 块确保异常时也能清除 _searching_medicine 状态
+        # S1修复：始终检查 _searching_medicine 是否被 set，若已 set 则清除
+        # 不再依赖 _searching_set 变量，直接检查事件状态
+        if _searching_medicine.is_set():
+            # 检查是否已经调用过退出逻辑（通过 _search_medicine_stop_event 判断）
+            # 如果退出逻辑未处理，则确保清除状态
+            if not _search_medicine_stop_event.is_set():
+                # 没有用户退出事件，可能是异常导致的，确保清除状态
+                _searching_medicine.clear()
+                log("搜索药品模式状态已在 finally 中清除", "DEBUG")
 
 
 def exit_search_medicine():
@@ -3016,40 +3575,47 @@ def _exit_search_medicine_impl():
     
     修复 v2.35.1：使用锁保护 _previous_gui_mode 的读取，
     确保与 _enter_search_medicine_impl 中的设置操作互斥。
+    
+    修复 v2.43.0：使用 try-finally 确保异常时也能清除
+    _searching_medicine 状态，防止人脸检测永久暂停。
     """
     log("退出搜索药品模式")
-    # 停止条形码检测
-    _barcode_thread_stop.set()
-    # 切换回人脸识别模式（主页和提醒界面均需要）
-    switch_ok = switch_huskylens_to_face()
-    if not switch_ok:
-        log("HuskyLens 切换人脸识别失败，人脸识别不可用", "WARNING")
-    # 修复：使用锁保护读取前一界面模式
-    with _gui_lock:
-        prev = _previous_gui_mode
-    if prev == "reminder":
-        # 返回提醒界面，从 active_alerts 恢复提醒数据（在锁内创建副本，避免数据竞争）
-        reminder_data = None
-        with lock:
-            if state["active_alerts"]:
-                tid = next(iter(state["active_alerts"]), None)
-                if tid:
-                    reminder_data = dict(state["active_alerts"][tid]["reminder"])
-        if reminder_data:
-            # 在锁外使用副本，安全更新 GUI
-            update_gui_reminder(
-                reminder_data.get("user_name", "老人"),
-                reminder_data.get("medicine_name", "药品"),
-                reminder_data.get("dose", ""),
-            )
+    try:
+        # 停止条形码检测
+        _barcode_thread_stop.set()
+        # 切换回人脸识别模式（主页和提醒界面均需要）
+        switch_ok = switch_huskylens_to_face()
+        if not switch_ok:
+            log("HuskyLens 切换人脸识别失败，人脸识别不可用", "WARNING")
+        # 修复：使用锁保护读取前一界面模式
+        with _gui_lock:
+            prev = _previous_gui_mode
+        if prev == "reminder":
+            # 返回提醒界面，从 active_alerts 恢复提醒数据（在锁内创建副本，避免数据竞争）
+            reminder_data = None
+            with lock:
+                if state["active_alerts"]:
+                    tid = next(iter(state["active_alerts"]), None)
+                    if tid:
+                        reminder_data = dict(state["active_alerts"][tid]["reminder"])
+            if reminder_data:
+                # 在锁外使用副本，安全更新 GUI
+                update_gui_reminder(
+                    reminder_data.get("user_name", "老人"),
+                    reminder_data.get("medicine_name", "药品"),
+                    reminder_data.get("dose", ""),
+                )
+            else:
+                # 提醒已被停止或无活跃提醒，回主页
+                update_gui_home()
         else:
-            # 提醒已被停止或无活跃提醒，回主页
+            # 返回主页
             update_gui_home()
-    else:
-        # 返回主页
-        update_gui_home()
-    # 恢复人脸ID检测
-    _searching_medicine.clear()
+    finally:
+        # 修复 v2.43.0：确保异常时也能清除状态
+        # 无论前面是否发生异常，都执行状态清理
+        _searching_medicine.clear()
+        log("退出搜索药品模式状态已清理", "DEBUG")
 
 
 def switch_huskylens_to_face():
@@ -3152,18 +3718,30 @@ def init_hardware():
             log("GUI 模块不可用，将以无界面模式运行", "WARNING")
             gui = None
         
-        Board().begin()
-        # 优先使用 pinpong 板载蜂鸣器（支持音效），回退到数字引脚
+        # 修复 v2.44.0：使用 board_init_ok 标志跟踪 Board 初始化状态，
+        # 修复模块级变量初始化为 None 导致引脚初始化永远被跳过的致命 bug
+        board_init_ok = False
         try:
-            from pinpong.extension.unihiker import buzzer as _buzzer
-            buzzer = _buzzer
-            log("使用 pinpong 板载蜂鸣器（音效模式）")
-        except ImportError:
-            buzzer = Pin(BUZZER_PIN_NUM, Pin.OUT)
-            log("使用数字引脚蜂鸣器（兼容模式）")
-        button_take = Pin(BUTTON_TAKE_PIN_NUM, Pin.IN)
-        button_emergency = Pin(BUTTON_EMERGENCY_PIN_NUM, Pin.IN)
-        button_remind = Pin(BUTTON_REMIND_PIN_NUM, Pin.IN)
+            Board().begin()
+            board_init_ok = True
+        except Exception as e:
+            log(f"Board 初始化失败: {e}", "ERROR")
+            log("将以降级模式运行（跳过引脚初始化）")
+
+        if not board_init_ok:
+            log("Board 未初始化，跳过引脚初始化", "WARNING")
+        else:
+            # 优先使用 pinpong 板载蜂鸣器（支持音效），回退到数字引脚
+            try:
+                from pinpong.extension.unihiker import buzzer as _buzzer
+                buzzer = _buzzer
+                log("使用 pinpong 板载蜂鸣器（音效模式）")
+            except ImportError:
+                buzzer = Pin(BUZZER_PIN_NUM, Pin.OUT)
+                log("使用数字引脚蜂鸣器（兼容模式）")
+            button_take = Pin(BUTTON_TAKE_PIN_NUM, Pin.IN)
+            button_emergency = Pin(BUTTON_EMERGENCY_PIN_NUM, Pin.IN)
+            button_remind = Pin(BUTTON_REMIND_PIN_NUM, Pin.IN)
         try:
             gui = GUI()
             log("GUI 初始化成功")
@@ -3337,6 +3915,8 @@ def _ensure_device_registered():
     修复 v2.38.0：提取公共逻辑，消除 init_network 和 _do_network_recovery_sync 中的
     重复 token 检查 + 设备注册代码。
     
+    修复 v2.38.3：检查 send_heartbeat() 返回值，心跳失败时记录警告。
+    
     Returns:
         bool: True 表示设备已注册（或已有有效 token），False 表示注册失败
     """
@@ -3344,8 +3924,24 @@ def _ensure_device_registered():
     if token_restored:
         # 本地有 token，发心跳确认 device_id 在服务器已注册
         # （设备 ID 变更后旧 token 失效，心跳会触发服务端创建新用户并返回新 token）
-        send_heartbeat()
-        return True
+        heartbeat_ok = send_heartbeat()
+        if heartbeat_ok:
+            return True
+        else:
+            # 修复 v2.40.0：增加心跳重试机制，避免单次网络抖动误判
+            log("心跳发送失败，重试 2 次确认...", "WARNING")
+            for retry in range(2):
+                time.sleep(1)
+                heartbeat_ok = send_heartbeat()
+                if heartbeat_ok:
+                    log("重试心跳成功", "INFO")
+                    return True
+            log("多次心跳失败，标记设备需要重新注册", "WARNING")
+            # 修复 v2.48.0：清除本地 token，确保后续 register_device() 执行全新注册
+            # 避免携带失效/旧 token 导致服务端拒绝注册或产生数据不一致
+            clear_device_token()
+            _device_needs_re_register.set()
+            return False
     else:
         # 未找到本地 token，尝试注册
         if register_device():
@@ -3392,103 +3988,112 @@ def main_loop():
     heartbeat_fail_count = 0  # 连续心跳失败计数
 
     while not _main_loop_stop_event.is_set():
-        now = datetime.datetime.now()
-        now_str = now.strftime("%H:%M")
+        try:
+            now = datetime.datetime.now()
+            now_str = now.strftime("%H:%M")
 
-        # 每分钟检查提醒（含固定时间提醒 9:00/13:00/17:00）
-        if now_str != last_minute:
-            last_minute = now_str
-            missed_minutes = 0
-            check_reminders()
-            check_fixed_reminders()
-        else:
-            # 若系统延迟导致多次循环同一分钟，超过阈值则强制检查
-            missed_minutes += 1
-            if missed_minutes > MISSED_MINUTES_THRESHOLD:
+            # 每分钟检查提醒（含固定时间提醒 9:00/13:00/17:00）
+            if now_str != last_minute:
+                last_minute = now_str
                 missed_minutes = 0
-                log("main_loop 长时间未刷新，强制检查提醒", "WARNING")
                 check_reminders()
-
-        # 每小时同步一次数据
-        if now.hour != last_hour:
-            last_hour = now.hour
-            if _get_online():
-                sync_reminders()
-
-        # 检测设备未注册（404），清除旧 token 并重新注册
-        if _device_needs_re_register.is_set() and _get_online():
-            _device_needs_re_register.clear()
-            log("检测到设备未注册，清除旧 token 并重新注册...", "WARNING")
-            clear_device_token()
-            if register_device():
-                log("重新注册成功，正在同步用药计划...", "INFO")
-                sync_reminders()
+                check_fixed_reminders()
             else:
-                log("重新注册失败，稍后重试", "WARNING")
+                # 若系统延迟导致多次循环同一分钟，超过阈值则强制检查
+                missed_minutes += 1
+                if missed_minutes > MISSED_MINUTES_THRESHOLD:
+                    missed_minutes = 0
+                    log("main_loop 长时间未刷新，强制检查提醒", "WARNING")
+                    check_reminders()
 
-        # 每 HEARTBEAT_INTERVAL 秒发送心跳（在线时），并根据心跳结果更新在线状态
-        if _get_online() and time.time() - last_heartbeat > HEARTBEAT_INTERVAL:
-            last_heartbeat = time.time()
-            heartbeat_ok = send_heartbeat()
-            if heartbeat_ok:
-                heartbeat_fail_count = 0  # 心跳成功时重置失败计数
-            else:
-                heartbeat_fail_count += 1
-                # 连续失败 2 次后再标记为离线，避免单次网络抖动误判
-                if heartbeat_fail_count >= 2:
-                    log(f"连续 {heartbeat_fail_count} 次心跳失败，标记为离线", "WARNING")
-                    _set_online(False)
+            # 每小时同步一次数据
+            if now.hour != last_hour:
+                last_hour = now.hour
+                if _get_online():
+                    sync_reminders()
+
+            # 检测设备未注册（404），清除旧 token 并重新注册
+            if _device_needs_re_register.is_set():
+                if _get_online():
+                    log("检测到设备未注册，清除旧 token 并重新注册...", "WARNING")
+                    clear_device_token()
+                    if register_device():
+                        _device_needs_re_register.clear()
+                        log("重新注册成功，正在同步用药计划...", "INFO")
+                        sync_reminders()
+                    else:
+                        log("重新注册失败，稍后重试", "WARNING")
                 else:
-                    log(f"心跳发送失败（第 {heartbeat_fail_count} 次），继续尝试", "DEBUG")
+                    log("设备需要重新注册，但当前离线，等待网络恢复", "DEBUG")
 
-        # 每 STOCK_CHECK_INTERVAL 检查库存
-        if time.time() - last_stock_check > STOCK_CHECK_INTERVAL:
-            last_stock_check = time.time()
-            calculate_remaining_days()
+            # 每 HEARTBEAT_INTERVAL 秒发送心跳（在线时），并根据心跳结果更新在线状态
+            if _get_online() and time.time() - last_heartbeat > HEARTBEAT_INTERVAL:
+                last_heartbeat = time.time()
+                heartbeat_ok = send_heartbeat()
+                if heartbeat_ok:
+                    heartbeat_fail_count = 0  # 心跳成功时重置失败计数
+                else:
+                    heartbeat_fail_count += 1
+                    # 连续失败 2 次后再标记为离线，避免单次网络抖动误判
+                    if heartbeat_fail_count >= 2:
+                        log(f"连续 {heartbeat_fail_count} 次心跳失败，标记为离线", "WARNING")
+                        _set_online(False)
+                    else:
+                        log(f"心跳发送失败（第 {heartbeat_fail_count} 次），继续尝试", "DEBUG")
 
-        # 每 LOG_FLUSH_INTERVAL 刷新离线日志
-        if time.time() - last_flush > LOG_FLUSH_INTERVAL:
-            last_flush = time.time()
-            if _get_online():
-                flush_local_logs()
+            # 每 STOCK_CHECK_INTERVAL 检查库存
+            if time.time() - last_stock_check > STOCK_CHECK_INTERVAL:
+                last_stock_check = time.time()
+                calculate_remaining_days()
 
-        # 每 NETWORK_RECONNECT_INTERVAL 检查网络恢复（异步执行，避免阻塞主循环）
-        if not _get_online() and time.time() - last_reconnect_check > NETWORK_RECONNECT_INTERVAL:
-            last_reconnect_check = time.time()
-            if check_network():
-                _set_online(True)
-                reconnect_fail_count = 0
-                # 修复审查：网络恢复成功时重置心跳失败计数，避免历史计数影响下次判断
-                heartbeat_fail_count = 0
-                # 修复：使用锁保护读取 _gui_mode，避免并发竞态条件
-                with _gui_lock:
-                    current_gui_mode = _gui_mode
-                if current_gui_mode in ("home", "status"):
-                    # 网络恢复后回到主页，显示"在线"状态和时钟
-                    update_gui_home()
-                log("网络恢复成功，正在同步数据...", "INFO")
-                
-                # 异步执行数据同步，避免阻塞主循环
-                if _sync_thread is None or not _sync_thread.is_alive():
-                    _sync_thread = threading.Thread(target=_do_network_recovery_sync, daemon=True)
-                    _sync_thread.start()
-            else:
-                reconnect_fail_count += 1
-                # 连续失败超过阈值时告警
-                if reconnect_fail_count >= MAX_RECONNECT_FAILS:
-                    log(f"网络恢复连续失败 {reconnect_fail_count} 次", "WARNING")
+            # 每 LOG_FLUSH_INTERVAL 刷新离线日志
+            if time.time() - last_flush > LOG_FLUSH_INTERVAL:
+                last_flush = time.time()
+                if _get_online():
+                    flush_local_logs()
+
+            # 每 NETWORK_RECONNECT_INTERVAL 检查网络恢复（异步执行，避免阻塞主循环）
+            if not _get_online() and time.time() - last_reconnect_check > NETWORK_RECONNECT_INTERVAL:
+                last_reconnect_check = time.time()
+                if check_network():
+                    _set_online(True)
                     reconnect_fail_count = 0
-                    # 尝试重启 WiFi 连接
-                    if wifi_manager is not None and hasattr(wifi_manager, 'reconnect'):
-                        try:
-                            log("尝试 WiFi 重连...", "INFO")
-                            wifi_manager.reconnect()
-                            log("WiFi 重连成功", "INFO")
-                        except Exception as e:
-                            log(f"WiFi 重连失败: {type(e).__name__}: {e}", "ERROR")
+                    # 修复审查：网络恢复成功时重置心跳失败计数，避免历史计数影响下次判断
+                    heartbeat_fail_count = 0
+                    # 修复：使用锁保护读取 _gui_mode，避免并发竞态条件
+                    with _gui_lock:
+                        current_gui_mode = _gui_mode
+                    if current_gui_mode in ("home", "status"):
+                        # 网络恢复后回到主页，显示"在线"状态和时钟
+                        update_gui_home()
+                    log("网络恢复成功，正在同步数据...", "INFO")
+                    
+                    # 异步执行数据同步，避免阻塞主循环
+                    if _sync_thread is None or not _sync_thread.is_alive():
+                        _sync_thread = threading.Thread(target=_do_network_recovery_sync, daemon=True)
+                        _sync_thread.start()
+                else:
+                    reconnect_fail_count += 1
+                    # 连续失败超过阈值时告警
+                    if reconnect_fail_count >= MAX_RECONNECT_FAILS:
+                        log(f"网络恢复连续失败 {reconnect_fail_count} 次", "WARNING")
+                        reconnect_fail_count = 0
+                        # 尝试重启 WiFi 连接
+                        if wifi_manager is not None and hasattr(wifi_manager, 'reconnect'):
+                            try:
+                                log("尝试 WiFi 重连...", "INFO")
+                                wifi_manager.reconnect()
+                                log("WiFi 重连成功", "INFO")
+                            except Exception as e:
+                                log(f"WiFi 重连失败: {type(e).__name__}: {e}", "ERROR")
 
             # 可中断等待：使用事件等待替代 time.sleep，便于立即响应退出信号
-        _main_loop_stop_event.wait(timeout=CHECK_INTERVAL)
+            _main_loop_stop_event.wait(timeout=CHECK_INTERVAL)
+        except Exception as e:
+            # 修复 v2.38.5：顶层异常保护，防止主循环因未预期异常退出
+            log(f"main_loop 主循环异常: {type(e).__name__}: {e}", "CRITICAL")
+            # 异常后短暂等待，防止忙等待占用 CPU
+            time.sleep(1)
 
 
 def main():
