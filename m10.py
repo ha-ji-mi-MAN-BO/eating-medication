@@ -12,10 +12,25 @@ UniHiker M10 智能服药提醒终端主程序
 项目地址适配: https://my-website.ccwu.cc/eating-medication/server/
 设备配对码: 2AIDMUNIHIKER13
 API 版本: v2.28.0（对应 openapi.json）
-当前代码版本: v2.37.1
+当前代码版本: v2.38.1
 
 本程序使用 Python 标准库 + UniHiker 原生 API (unihiker/pinpong) + pyttsx3 TTS,
 不依赖 cv2、requests、schedule 等第三方库。
+
+v2.38.1 修复记录（共 6 项 bug 修复/优化，涵盖逻辑正确性、代码可维护性、健壮性）：
+- 【严重】alert_loop 搜索药品暂停时 pause_count 持续递增达 MAX_ALERT_RETRIES 会强制终止提醒，
+  修复：搜索药品暂停超时改为 30 分钟（900 次 * 2 秒），正常搜索不会导致提醒被意外终止
+- 【严重】main_loop 网络恢复成功后 heartbeat_fail_count 未重置，导致下次心跳一次失败就误判离线，
+  修复：网络恢复成功时将 heartbeat_fail_count 重置为 0
+- 【一般】http_request 业务错误检测仅检查 status 字段，部分接口可能返回无 status 但有 message/error 的错误，
+  修复：增加对 message 和 error 字段的检查，覆盖更多错误格式
+- 【一般】register_device 和 send_heartbeat 存在大量重复的 payload 构建和响应处理逻辑，
+  修复：抽取 _build_device_payload() 和 _handle_register_response() 公共函数，消除代码重复
+- 【一般】send_heartbeat 业务错误时未检查 _error 标记，逻辑不完整，
+  修复：使用公共响应处理函数，增强业务错误检测逻辑
+- 【优化】移除未使用的 import uuid 死导入
+- 【优化】low_stock_alert 中 threading.Timer 闭包使用外部变量 prev_mode 存在潜在引用风险，
+  修复：将 prev_mode 作为默认参数传递给闭包，确保引用安全
 
 v2.37.1 修复记录（共 1 项 bug 修复，涵盖搜索药品时卡顿严重）：
 - 【严重】_barcode_detect_thread 每 0.5 秒调用 get_barcode_name()（9 次 I2C 操作）+ 持续检测到条形码时每 0.5 秒写日志 + 即使名字没变也调用 config() 更新 tkinter，导致搜索药品时卡顿严重。修复：(1) 只在条形码名字变化时更新 GUI 和写日志，避免重复 tkinter 操作和日志刷屏；(2) 检测间隔从 0.5 秒增加到 1 秒，减少 I2C 压力
@@ -49,7 +64,6 @@ import traceback
 import urllib.request
 import urllib.error
 from pathlib import Path
-import uuid
 # HuskyLens 二哈识图：可选依赖，缺失时跳过人脸/条形码识别
 try:
     from dfrobot_huskylensv2 import *
@@ -785,10 +799,19 @@ def http_request(url, payload=None, timeout=None, headers=None):
             try:
                 result = json.loads(body)
                 # 检查业务状态码：status != "ok" 时返回错误标识，调用方需检查
-                if isinstance(result, dict) and result.get("status") and result.get("status") != "ok":
-                    error_msg = result.get("message", "Unknown error")
-                    log(f"HTTP 业务错误: {error_msg}", "WARNING")
-                    result["_error"] = True  # 标记为业务错误，调用方可检查
+                # 修复审查：同时检查 status 字段和 message/error 字段，覆盖更多错误格式
+                if isinstance(result, dict):
+                    status = result.get("status")
+                    message = result.get("message")
+                    error = result.get("error")
+                    if status and status != "ok":
+                        error_msg = message or error or "Unknown error"
+                        log(f"HTTP 业务错误: {error_msg}", "WARNING")
+                        result["_error"] = True  # 标记为业务错误，调用方可检查
+                    elif message and isinstance(message, str) and message and not status:
+                        # 部分接口可能直接返回 message 字段表示错误
+                        log(f"HTTP 响应含错误消息: {message}", "WARNING")
+                        result["_error"] = True
                 return result
             except (json.JSONDecodeError, ValueError):
                 # 非 JSON 响应（如纯文本）
@@ -834,6 +857,44 @@ def http_request(url, payload=None, timeout=None, headers=None):
         return None
 
 
+def _build_device_payload():
+    """构建设备注册/心跳通用的 payload，避免重复代码
+    
+    修复审查：抽取公共函数供 register_device 和 send_heartbeat 复用，
+    消除代码重复，提高可维护性。
+    """
+    return {
+        "device_id": DEVICE_ID,
+        "device_name": None,
+    }
+
+
+def _handle_register_response(resp, operation_name):
+    """处理设备注册/心跳的统一响应逻辑
+    
+    修复审查：抽取公共响应处理逻辑，register_device 和 send_heartbeat 复用，
+    保持错误处理一致性。
+    
+    Args:
+        resp: http_request 返回的响应
+        operation_name: 操作名称（注册/心跳），用于日志
+    Returns:
+        bool: 成功返回 True，失败返回 False
+    """
+    if resp is None:
+        log(f"{operation_name}失败：无响应", "ERROR")
+        return False
+    if not isinstance(resp, dict):
+        log(f"{operation_name}响应格式错误: {resp}", "ERROR")
+        return False
+    # 检查业务错误标记（http_request 已设置 _error）
+    if resp.get("_error"):
+        error_msg = resp.get("message") or resp.get("error") or "未知错误"
+        log(f"{operation_name}业务错误: {error_msg}", "ERROR")
+        return False
+    return True
+
+
 def register_device():
     """设备注册（新版 API），成功后保存 device_token
 
@@ -841,36 +902,33 @@ def register_device():
     服务端据此区分：
     - 无 token / token 不匹配 → 重新生成并返回新 token（设备本地 token 丢失恢复）
     - token 匹配 → 仅更新心跳，不返回 token（正常心跳）
+    
+    修复审查：使用 _build_device_payload 和 _handle_register_response 消除重复代码。
     """
-    payload = {
-        "device_id": DEVICE_ID,
-        "device_name": None,
-    }
+    payload = _build_device_payload()
     try:
         resp = http_request(API_REGISTER, payload)
     except Exception as e:
         log(f"设备注册异常: {e}", "ERROR")
         return False
 
-    if resp is None:
-        log("设备注册失败：无响应", "ERROR")
+    if not _handle_register_response(resp, "设备注册"):
         return False
 
-    if not isinstance(resp, dict):
-        log(f"设备注册响应格式错误: {resp}", "ERROR")
-        return False
+    # _handle_register_response 已验证 resp 为 dict 且非业务错误
+    status = resp.get("status")
+    token = resp.get("device_token")
 
-    if resp.get("status") == "ok":
-        token = resp.get("device_token")
+    if status == "ok":
         if token:
-            # 修复：首次注册或 token 恢复情况，保存新 token
+            # 首次注册或 token 恢复情况，保存新 token
             _set_device_token(token)
             save_device_token(token)
             log("设备注册成功，已获取 device_token")
             return True
         else:
             # 服务端未返回 token：设备已注册且携带的 token 匹配（心跳模式）
-            # 修复：检查本地是否已有 token，如果有则确认成功，否则视为失败
+            # 检查本地是否已有 token，如果有则确认成功，否则视为失败
             existing_token = _get_device_token()
             if existing_token:
                 log("设备已注册（心跳模式），token 有效")
@@ -891,33 +949,26 @@ def send_heartbeat():
     - token 匹配 → 仅更新心跳，不返回 token（正常心跳）
     - 无 token / token 不匹配 → 重新生成并返回新 token（token 丢失恢复）
     
-    修复 v2.37.0：简化逻辑分支，移除永远不会执行的 elif 分支，
-    直接在 status != "ok" 时检查 _error 标记。
+    修复审查：使用 _build_device_payload 和 _handle_register_response 消除重复代码，
+    增强业务错误检测逻辑，确保心跳失败时正确返回 False。
     """
-    payload = {
-        "device_id": DEVICE_ID,
-        "device_name": None,
-    }
+    payload = _build_device_payload()
     try:
         resp = http_request(API_REGISTER, payload)
     except Exception as e:
         log(f"心跳异常: {e}", "ERROR")
         return False
 
-    if resp is None:
-        log("心跳请求无响应（网络可能已断开）", "WARNING")
+    if not _handle_register_response(resp, "心跳"):
         return False
 
-    if not isinstance(resp, dict):
-        log(f"心跳响应格式异常: {type(resp).__name__}", "ERROR")
-        return False
-
-    # 检查业务状态码
+    # _handle_register_response 已验证 resp 为 dict 且非业务错误
     status = resp.get("status")
+    token = resp.get("device_token")
+
     if status == "ok":
         # token 匹配时服务端不返回 token（心跳模式）
         # 无 token 或 token 不匹配时服务端返回新 token（恢复模式）
-        token = resp.get("device_token")
         if token:
             _set_device_token(token)
             save_device_token(token)
@@ -925,11 +976,12 @@ def send_heartbeat():
         else:
             log("心跳发送成功", "INFO")
         return True
-    
-    # status != "ok" 或存在业务错误标记
-    error_msg = resp.get("message", "未知错误")
-    log(f"心跳业务错误: {error_msg}", "ERROR")
-    return False
+    else:
+        # status != "ok" 的情况（虽然 _handle_register_response 已处理 _error，
+        # 但 status 字段的独立检查作为兜底）
+        error_msg = resp.get("message") or resp.get("error") or "未知错误"
+        log(f"心跳业务错误: {error_msg}", "ERROR")
+        return False
 
 
 def save_device_token(token):
@@ -1866,12 +1918,14 @@ def alert_loop(tid):
         # 搜索药品模式下暂停提醒循环（不检测人脸、不播报）
         # 修复 v2.37.0：搜索药品暂停时使用独立的 pause_count 计数器
         # 不再递增 retry_count，避免在搜索期间过早超时
+        # 修复审查：搜索药品暂停不应消耗 MAX_ALERT_RETRIES 配额，
+        # 用户搜索药品时提醒应一直等待直到搜索结束或用户确认
         if _searching_medicine.is_set():
             _alert_interrupt_event.wait(timeout=2.0)
             pause_count += 1
-            # 暂停次数达到 MAX_ALERT_RETRIES 时超时（保持原有超时行为）
-            if pause_count >= MAX_ALERT_RETRIES:
-                log(f"提醒 {tid} 在搜索药品模式下已达最大等待次数，自动停止", "WARNING")
+            # 搜索药品暂停超过 30 分钟（900次*2秒）才超时，避免正常搜索导致提醒被终止
+            if pause_count >= 900:
+                log(f"提醒 {tid} 在搜索药品模式下等待过久（{pause_count}次），自动停止", "WARNING")
                 with lock:
                     state["active_alerts"].pop(tid, None)
                 update_gui_home()
@@ -2158,16 +2212,17 @@ def low_stock_alert(medicine):
     # ALERT_TIMEOUT 秒后自动恢复状态显示（避免一直停留在告警界面）
     # 修复 v2.38.0：仅在当前仍为告警 status 模式时恢复到之前的界面
     # 如果用户在告警期间切换到其他界面（搜索药品、提醒），则不恢复
+    # 修复审查：将 prev_mode 作为参数传递给闭包，避免潜在的变量引用失效风险
     try:
-        def _restore_status():
+        def _restore_status(saved_prev_mode=prev_mode):
             # 检查当前 GUI 模式，只有仍为 status（告警模式）时才恢复
             with _gui_lock:
                 current_mode = _gui_mode
             # 修复 v2.38.0：仅在 status 告警模式下恢复，恢复到告警前的模式
             if current_mode == "status":
-                if prev_mode == "home":
+                if saved_prev_mode == "home":
                     update_gui_home()
-                elif prev_mode == "reminder":
+                elif saved_prev_mode == "reminder":
                     # 告警前为提醒模式，仅当有活跃提醒时恢复
                     with lock:
                         has_active = bool(state.get("active_alerts"))
@@ -3403,6 +3458,8 @@ def main_loop():
             if check_network():
                 _set_online(True)
                 reconnect_fail_count = 0
+                # 修复审查：网络恢复成功时重置心跳失败计数，避免历史计数影响下次判断
+                heartbeat_fail_count = 0
                 # 修复：使用锁保护读取 _gui_mode，避免并发竞态条件
                 with _gui_lock:
                     current_gui_mode = _gui_mode

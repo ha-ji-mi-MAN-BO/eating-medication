@@ -253,7 +253,7 @@ m10.py
 | 项目 | 值 |
 |------|-----|
 | 服务端基础路径 | `/eating-medication/server` |
-| API 版本 | v2.28.0（当前修复版：v2.37.1） |
+| API 版本 | v2.28.0（当前修复版：v2.38.1） |
 | 认证方式 | 设备注册后返回 `device_token`，后续请求通过 `X-Device-Token` Header 校验 |
 | 限流 | 设备端基于 IP 限流；部分接口需 `device_token` |
 
@@ -522,6 +522,18 @@ m10.py
 | 13 | 🟢 | OCR 引擎加载失败后无法重置，需重启设备 | 新增 `reset_ocr_engine()` 函数，支持运行时重置 |
 | 14 | 🟢 | `_get_ocr_engine()` 缺少文档说明 | 添加详细 docstring，说明返回值和异常情况 |
 | 15 | 🟢 | `flush_local_logs()` 的 `_flush_in_progress` 事件可能因异常未释放 | 添加 finally 块确保事件清理 |
+
+### 已完成的 Bug 修复（v2.38.1，共 7 项，涵盖逻辑正确性、代码可维护性、健壮性）
+
+| # | 严重度 | 描述 | 修复方案 |
+|---|--------|------|----------|
+| 1 | 🔴 | `alert_loop()` 搜索药品暂停时 `pause_count` 达到 `MAX_ALERT_RETRIES`（20次/40秒）会强制终止提醒，影响正常搜索药品流程 | 搜索药品暂停超时改为 30 分钟（900次 * 2秒），避免正常搜索导致提醒被意外终止 |
+| 2 | 🔴 | `main_loop()` 网络恢复成功后 `heartbeat_fail_count` 未重置，导致下次心跳一次失败就误判设备离线 | 网络恢复成功时将 `heartbeat_fail_count` 重置为 0 |
+| 3 | 🟡 | `http_request()` 业务错误检测仅检查 `status` 字段，部分接口可能返回无 `status` 但有 `message`/`error` 的错误响应 | 增加对 `message` 和 `error` 字段的检查，覆盖更多错误格式 |
+| 4 | 🟡 | `register_device()` 和 `send_heartbeat()` 存在大量重复的 payload 构建和响应处理逻辑 | 抽取 `_build_device_payload()` 和 `_handle_register_response()` 公共函数，消除代码重复 |
+| 5 | 🟡 | `send_heartbeat()` 业务错误时未检查 `_error` 标记，逻辑不完整 | 使用公共响应处理函数，增强业务错误检测逻辑 |
+| 6 | 🟢 | `import uuid` 未使用，存在死导入 | 移除未使用的 `import uuid` |
+| 7 | 🟢 | `low_stock_alert()` 中 `threading.Timer` 闭包使用外部变量 `prev_mode` 存在潜在引用风险 | 将 `prev_mode` 作为默认参数传递给闭包，确保引用安全 |
 
 ### 已完成的 Bug 修复（v2.38.0，共 10 项，涵盖致命缺陷修复、逻辑正确性、并发安全、安全性）
 
