@@ -10,10 +10,13 @@ UniHiker M10 智能服药提醒终端主程序
 项目地址适配: https://my-website.ccwu.cc/eating-medication/server/
 设备配对码: 2AIDMUNIHIKER13
 API 版本: v2.28.0（对应 openapi.json）
-当前代码版本: v2.48.1
+当前代码版本: v2.48.2
 
 本程序使用 Python 标准库 + UniHiker 原生 API (unihiker/pinpong) + pyttsx3 TTS,
 不依赖 cv2、requests、schedule 等第三方库。
+
+v2.48.2 修复记录（共 1 项致命 bug 修复，涵盖条形码识别模式切换错误）：
+- 【致命】ALGORITHM_BARCODE_RECOGNITION 常量值错误（v2.48.1 改为 254），导致 switchAlgorithm(254) 被二哈当作无效值回退到人脸识别模式。修复：优先从 dfrobot_huskylensv2 库导入算法常量（库中定义了正确值），导入失败时使用手动定义的正确值 11（参考 HuskyLens V2 协议算法编号：1=人脸识别, 2=物体追踪, 3=物体识别, ..., 11=条形码识别）
 
 v2.48.1 修复记录（共 2 项致命 bug 修复，涵盖搜索药品功能）：
 - 【致命】ALGORITHM_BARCODE_RECOGNITION 常量值错误（原值 2 对应"物体追踪"而非"条形码识别"），导致按搜索药品按钮后二哈切换到物品识别而非条形码识别。修复：改为正确的算法编号 254（参考 dfrobot_huskylensv2 官方库算法编号：1=人脸识别, 2=物体追踪, 3=物体识别, 254=条形码识别）
@@ -60,17 +63,19 @@ try:
     # 修复 v2.41.0：从通配符导入改为显式导入具体类，避免命名冲突
     from dfrobot_huskylensv2 import HuskylensV2_I2C
     _HUSKYLENS_AVAILABLE = True
-    # 修复审查：补充人脸识别与条形码识别算法常量
-    # 原通配符导入依赖这些常量，改为显式导入后需手动定义
-    # 参考 dfrobot_huskylensv2 官方库算法编号：
-    #   1=人脸识别, 2=物体追踪, 3=物体识别, 4=线追踪, 5=颜色识别,
-    #   6=标签识别, 7=物体分类, 254=条形码识别
-    ALGORITHM_FACE_RECOGNITION = 1
-    ALGORITHM_BARCODE_RECOGNITION = 254
+    # 修复 v2.48.2：优先从库导入算法常量，失败时手动定义正确值
+    # 参考 HuskyLens V2 协议算法编号（pyhuskylens 库源码）：
+    #   0=菜单, 1=人脸识别, 2=物体追踪, 3=物体识别, 4=巡线, 5=颜色识别,
+    #   6=标签识别, 7=物体分类, 8=OCR, 9=车牌识别, 10=二维码识别, 11=条形码识别
+    try:
+        from dfrobot_huskylensv2 import ALGORITHM_FACE_RECOGNITION, ALGORITHM_BARCODE_RECOGNITION
+    except ImportError:
+        ALGORITHM_FACE_RECOGNITION = 1
+        ALGORITHM_BARCODE_RECOGNITION = 11
 except ImportError:
     _HUSKYLENS_AVAILABLE = False
     ALGORITHM_FACE_RECOGNITION = 1
-    ALGORITHM_BARCODE_RECOGNITION = 254
+    ALGORITHM_BARCODE_RECOGNITION = 11
 
 
 
@@ -125,7 +130,7 @@ DEVICE_ID = "m10_" + PAIR_CODE
 # User-Agent 常量，避免 Cloudflare 1010 拦截（urllib 默认 UA 被封禁）
 USER_AGENT = "Mozilla/5.0 (compatible; M10MedicationChecker/1.0)"
 
-# API 端点（v2.28.0，对应 openapi.json，m10.py 当前版本 v2.48.1）
+# API 端点（v2.28.0，对应 openapi.json，m10.py 当前版本 v2.48.2）
 API_REGISTER = f"{SERVER_BASE_URL}/api/v1/public/device/register"
 API_SCHEDULE = f"{SERVER_BASE_URL}/api/v1/public/device/schedule/{DEVICE_ID}"
 API_MESSAGE = f"{SERVER_BASE_URL}/api/v1/public/device/message"
