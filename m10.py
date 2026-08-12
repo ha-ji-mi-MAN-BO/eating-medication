@@ -10,10 +10,14 @@ UniHiker M10 智能服药提醒终端主程序
 项目地址适配: https://my-website.ccwu.cc/eating-medication/server/
 设备配对码: 2AIDMUNIHIKER13
 API 版本: v2.28.0（对应 openapi.json）
-当前代码版本: v2.48.0
+当前代码版本: v2.48.1
 
 本程序使用 Python 标准库 + UniHiker 原生 API (unihiker/pinpong) + pyttsx3 TTS,
 不依赖 cv2、requests、schedule 等第三方库。
+
+v2.48.1 修复记录（共 2 项致命 bug 修复，涵盖搜索药品功能）：
+- 【致命】ALGORITHM_BARCODE_RECOGNITION 常量值错误（原值 2 对应"物体追踪"而非"条形码识别"），导致按搜索药品按钮后二哈切换到物品识别而非条形码识别。修复：改为正确的算法编号 254（参考 dfrobot_huskylensv2 官方库算法编号：1=人脸识别, 2=物体追踪, 3=物体识别, 254=条形码识别）
+- 【致命】_enter_search_medicine_impl() 的 finally 块在正常执行完后也会运行，检查到 _searching_medicine 被 set 且 _search_medicine_stop_event 未 set 时错误地清除了搜索状态，导致后续按"返回"按钮时 exit_search_medicine() 检查到未 set 而忽略退出调用（日志报"不在搜索药品模式中，忽略退出调用"）。修复：移除 finally 块，改为仅在异常分支中清除状态，正常流程保持搜索状态
 
 v2.48.0 修复记录（共 6 项 bug 修复/优化，涵盖版本一致性、数据持久化、代码复用、并发安全、性能优化、日志健壮性）：
 - 【致命】版本号不一致：文件头为 v2.47.0，但 API 端点注释仍为 v2.45.0，造成版本追踪混乱
@@ -58,13 +62,15 @@ try:
     _HUSKYLENS_AVAILABLE = True
     # 修复审查：补充人脸识别与条形码识别算法常量
     # 原通配符导入依赖这些常量，改为显式导入后需手动定义
-    # 参考 dfrobot_huskylensv2 官方库：ALGORITHM_FACE_RECOGNITION=1, ALGORITHM_BARCODE_RECOGNITION=2
+    # 参考 dfrobot_huskylensv2 官方库算法编号：
+    #   1=人脸识别, 2=物体追踪, 3=物体识别, 4=线追踪, 5=颜色识别,
+    #   6=标签识别, 7=物体分类, 254=条形码识别
     ALGORITHM_FACE_RECOGNITION = 1
-    ALGORITHM_BARCODE_RECOGNITION = 2
+    ALGORITHM_BARCODE_RECOGNITION = 254
 except ImportError:
     _HUSKYLENS_AVAILABLE = False
     ALGORITHM_FACE_RECOGNITION = 1
-    ALGORITHM_BARCODE_RECOGNITION = 2
+    ALGORITHM_BARCODE_RECOGNITION = 254
 
 
 
@@ -119,7 +125,7 @@ DEVICE_ID = "m10_" + PAIR_CODE
 # User-Agent 常量，避免 Cloudflare 1010 拦截（urllib 默认 UA 被封禁）
 USER_AGENT = "Mozilla/5.0 (compatible; M10MedicationChecker/1.0)"
 
-# API 端点（v2.28.0，对应 openapi.json，m10.py 当前版本 v2.48.0）
+# API 端点（v2.28.0，对应 openapi.json，m10.py 当前版本 v2.48.1）
 API_REGISTER = f"{SERVER_BASE_URL}/api/v1/public/device/register"
 API_SCHEDULE = f"{SERVER_BASE_URL}/api/v1/public/device/schedule/{DEVICE_ID}"
 API_MESSAGE = f"{SERVER_BASE_URL}/api/v1/public/device/message"
@@ -3342,16 +3348,12 @@ def enter_search_medicine():
 
 def _enter_search_medicine_impl():
     """进入搜索药品模式的实际实现（在后台线程执行）
-    
-    修复 v2.36.0：将日志移到锁内执行，确保日志输出使用的是加锁读取的一致值，
-    防止与 _exit_search_medicine_impl 中的读取操作竞态。
-    
-    修复 v2.37.0：添加异常保护，确保异常发生时状态能正确恢复，
-    防止 _searching_medicine 被 set 但未被 clear 导致状态不一致。
-    使用可中断等待替代 time.sleep，支持优雅退出。
-    
-    修复 v2.42.0：使用 finally 块确保异常时也能清除 _searching_medicine 状态，
-    防止异常导致人脸检测永久暂停。
+
+    修复 v2.37.1：移除 finally 块中错误清除 _searching_medicine 状态的逻辑。
+    原实现中 finally 块在正常执行完后也会运行，检查到 _searching_medicine 被 set
+    且 _search_medicine_stop_event 未 set 时会错误地清除搜索状态，导致后续
+    exit_search_medicine() 检查到未 set 而忽略退出调用。
+    现改为仅在异常分支中清除状态，正常流程保持搜索状态。
     """
     global _previous_gui_mode
     try:
@@ -3370,10 +3372,12 @@ def _enter_search_medicine_impl():
             # 检查程序全局停止事件
             if _main_loop_stop_event.is_set():
                 log("搜索药品模式因程序退出而中断", "INFO")
+                _searching_medicine.clear()
                 return
             # 检查搜索药品专用退出事件（用户点击返回按钮）
             if _search_medicine_stop_event.is_set():
                 log("搜索药品模式因用户退出而中断", "INFO")
+                _searching_medicine.clear()
                 return
             time.sleep(0.1)
         # 切换到条形码识别
@@ -3386,27 +3390,17 @@ def _enter_search_medicine_impl():
         if switch_ok:
             _barcode_thread_stop.clear()
             threading.Thread(target=_barcode_detect_thread, daemon=True).start()
+        # 正常完成，保持 _searching_medicine 为 set 状态，等待用户点击返回按钮
+        log("搜索药品模式已就绪，等待用户操作", "DEBUG")
     except Exception as e:
         log(f"进入搜索药品模式异常: {e}", "ERROR")
         # 异常时确保状态恢复：清除搜索模式标志
-        # 注意：此时 _searching_medicine 可能已被 set，需要在退出时清除
-        # 但我们保持 set 状态，让 _exit_search_medicine_impl 负责恢复
-        # 如果是严重异常，直接调用退出逻辑
+        _searching_medicine.clear()
+        log("搜索药品模式因异常已清除状态", "DEBUG")
         try:
             _exit_search_medicine_impl()
         except Exception as e2:
             log(f"异常恢复失败: {e2}", "ERROR")
-    finally:
-        # 修复 v2.46.0：finally 块确保异常时也能清除 _searching_medicine 状态
-        # S1修复：始终检查 _searching_medicine 是否被 set，若已 set 则清除
-        # 不再依赖 _searching_set 变量，直接检查事件状态
-        if _searching_medicine.is_set():
-            # 检查是否已经调用过退出逻辑（通过 _search_medicine_stop_event 判断）
-            # 如果退出逻辑未处理，则确保清除状态
-            if not _search_medicine_stop_event.is_set():
-                # 没有用户退出事件，可能是异常导致的，确保清除状态
-                _searching_medicine.clear()
-                log("搜索药品模式状态已在 finally 中清除", "DEBUG")
 
 
 def exit_search_medicine():
