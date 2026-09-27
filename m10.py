@@ -2252,6 +2252,11 @@ def trigger_alert(reminder):
         log("trigger_alert: reminder 缺少 id 字段", "ERROR")
         return
     with lock:
+        # 同一 tid 已在活跃提醒中时，不要重复启动 alert_loop 线程，
+        # 否则会出现多个线程同时蜂鸣/播报，音量叠加且无法通过一次确认全部停止。
+        if tid in state["active_alerts"]:
+            log(f"提醒已在进行中，忽略重复触发: {tid}")
+            return
         state["active_alerts"][tid] = {
             "started_at": datetime.datetime.now(),
             "volume": VOLUME_INITIAL,
