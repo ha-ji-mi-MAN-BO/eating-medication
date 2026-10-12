@@ -1,10 +1,10 @@
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 import datetime
 
 from m10 import (
     state, check_fixed_reminders, trigger_alert, confirm_take,
-    FIXED_REMINDER_TIMES, reset_fixed_trigger_if_new_day
+    reset_fixed_trigger_if_new_day
 )
 
 class TestReminders(unittest.TestCase):

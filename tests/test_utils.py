@@ -2,7 +2,6 @@ import unittest
 from unittest.mock import patch, MagicMock
 import os
 import tempfile
-import sys
 
 from m10 import (
     capture_photo, image_to_base64, set_system_volume,
