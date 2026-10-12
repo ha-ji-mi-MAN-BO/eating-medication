@@ -1,3 +1,5 @@
+import os
+import tempfile
 import unittest
 from unittest.mock import patch, MagicMock
 import datetime
@@ -51,7 +53,7 @@ class TestReminders(unittest.TestCase):
     @patch('m10.tts_speak')
     @patch('m10.update_stock')
     def test_confirm_take(self, mock_stock, mock_tts, mock_home, mock_upload, mock_photo):
-        mock_photo.return_value = "/tmp/photo.jpg"
+        mock_photo.return_value = os.path.join(tempfile.gettempdir(), "photo.jpg")
         reminder = {
             "id": "t1",
             "user_name": "张三",
