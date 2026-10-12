@@ -908,6 +908,11 @@ def http_request(url, payload=None, timeout=None, headers=None):
     """
     if timeout is None:
         timeout = HTTP_REQUEST_TIMEOUT
+    # 安全校验：仅允许 http(s) 协议，防止 file:// 等 scheme 滥用 (CWE-22)
+    from urllib.parse import urlparse
+    _scheme = urlparse(url).scheme.lower()
+    if _scheme not in ("http", "https"):
+        return {"status": "error", "message": f"不允许的 URL scheme: {_scheme}"}
     try:
         hdrs = _auth_headers(headers)
         data = None

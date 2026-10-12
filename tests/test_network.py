@@ -1,11 +1,15 @@
 import unittest
-from unittest.mock import patch, MagicMock, mock_open, ANY
-import json
+from unittest.mock import ANY, MagicMock, mock_open, patch
 
 from m10 import (
-    http_request, register_device, sync_reminders,
-    API_REGISTER, API_REMINDERS, state, flush_local_logs
+    API_REGISTER,
+    flush_local_logs,
+    http_request,
+    register_device,
+    state,
+    sync_reminders,
 )
+
 
 class TestNetwork(unittest.TestCase):
     def setUp(self):

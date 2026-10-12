@@ -1,13 +1,17 @@
-import unittest
-from unittest.mock import patch, MagicMock
 import os
 import tempfile
-import sys
+import unittest
+from unittest.mock import MagicMock, patch
 
 from m10 import (
-    capture_photo, image_to_base64, set_system_volume,
-    detect_volume_control, log, ensure_dirs
+    capture_photo,
+    detect_volume_control,
+    ensure_dirs,
+    image_to_base64,
+    log,
+    set_system_volume,
 )
+
 
 class TestUtils(unittest.TestCase):
     def setUp(self):
