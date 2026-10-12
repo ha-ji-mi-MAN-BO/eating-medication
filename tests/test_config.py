@@ -1,10 +1,11 @@
-import os
 import json
+import os
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from m10 import load_config, save_config, CONFIG_FILE
+from m10 import CONFIG_FILE, load_config, save_config
+
 
 class TestConfig(unittest.TestCase):
     def setUp(self):
