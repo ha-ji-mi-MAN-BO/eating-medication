@@ -1,6 +1,8 @@
 import unittest
 from unittest.mock import MagicMock, patch
-import m10   # 导入整个模块，通过 m10. 访问全局变量
+
+import m10  # 导入整个模块，通过 m10. 访问全局变量
+
 
 class TestGUI(unittest.TestCase):
     def setUp(self):
